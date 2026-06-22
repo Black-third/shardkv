@@ -13,22 +13,30 @@ import (
 const replBackoff = time.Second
 
 // handleSync turns the calling connection into a replication feed. It registers
-// the connection as a replica, ships a snapshot of the current dataset, then
-// streams every subsequent write command until the replica disconnects or the
-// server shuts down.
+// the connection as a replica and takes a snapshot of the current dataset under
+// propMu, then ships the snapshot and streams every subsequent write until the
+// replica disconnects or the server shuts down.
 //
-// Consistency note: the replica is registered before the snapshot is taken, so a
-// write that races the snapshot may appear both in the snapshot and the live
-// stream (applied twice). Replication is therefore asynchronous and eventually
-// consistent; a production system would use a fork/copy-on-write snapshot or a
-// replication offset/backlog to make initial sync exact.
+// Because write commands also hold propMu across their mutation+propagation,
+// holding it here makes the snapshot a consistent point-in-time cut: no write
+// can interleave, and every write after this point is enqueued to the new
+// replica exactly once. The initial sync is therefore exact (no double-apply),
+// not merely eventually consistent.
+//
+// One narrow window remains: a master started without -aof only flips
+// propagating to true here, so a write already in flight on the fast path at the
+// instant of the very first PSYNC may be missed. Running a replicated master
+// with -aof (propagating from startup) closes it.
 func (s *Server) handleSync(ctx context.Context, w *resp.Writer) {
 	rc := &replicaConn{ch: make(chan [][]byte, 1024)}
 
+	s.propagating.Store(true)
+	s.propMu.Lock()
 	s.mu.Lock()
 	s.replicas[rc] = struct{}{}
 	snapshot := s.store.Dump()
 	s.mu.Unlock()
+	s.propMu.Unlock()
 	defer s.removeReplica(rc)
 
 	for _, cmd := range snapshot {

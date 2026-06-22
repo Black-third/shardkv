@@ -63,6 +63,16 @@ type Server struct {
 
 	aof *aof.Log // nil if persistence is disabled
 
+	// propagating becomes true once durability or replication is active (AOF
+	// attached or a replica connected). While it is true, write commands are
+	// serialized through propMu across the store mutation AND the propagation, so
+	// the order applied to memory is the exact order written to the AOF and the
+	// replica stream. A point-in-time snapshot is taken under propMu, so an
+	// initial replica sync sees a consistent cut with no double-apply. When it is
+	// false (pure single-node cache), writes stay sharded-concurrent.
+	propagating atomic.Bool
+	propMu      sync.Mutex
+
 	mu         sync.Mutex
 	role       string // "master" or "replica"
 	masterAddr string
@@ -78,9 +88,10 @@ type Server struct {
 	totalCmds  atomic.Int64
 }
 
-// New returns a master Server backed by st.
+// New returns a master Server backed by st. It must be called before the
+// store's janitor goroutine starts, since it registers the store removal hook.
 func New(st *store.Store) *Server {
-	return &Server{
+	s := &Server{
 		store:     st,
 		role:      "master",
 		replicas:  make(map[*replicaConn]struct{}),
@@ -88,10 +99,29 @@ func New(st *store.Store) *Server {
 		baseCtx:   context.Background(),
 		startTime: time.Now(),
 	}
+	st.SetRemovalHook(s.onKeyRemoved)
+	return s
 }
 
-// AttachAOF wires an append-only log so write commands are persisted.
-func (s *Server) AttachAOF(log *aof.Log) { s.aof = log }
+// onKeyRemoved propagates a synthetic DEL when the store expires or evicts a key
+// on its own, so the AOF and replicas converge, and invalidates any WATCH on
+// that key. Invoked by the store with no shard lock held.
+func (s *Server) onKeyRemoved(key string) {
+	args := [][]byte{[]byte("DEL"), []byte(key)}
+	s.touchWatchers(args)
+	if s.propagating.Load() {
+		s.propMu.Lock()
+		s.propagate(args)
+		s.propMu.Unlock()
+	}
+}
+
+// AttachAOF wires an append-only log so write commands are persisted. Enabling
+// persistence also turns on write serialization (propagating).
+func (s *Server) AttachAOF(log *aof.Log) {
+	s.aof = log
+	s.propagating.Store(true)
+}
 
 // ReplayCommands applies a recorded command stream (e.g. from the AOF) to the
 // store without persisting or propagating it. Used once at startup.
@@ -220,10 +250,25 @@ func (s *Server) dispatch(w *resp.Writer, args [][]byte) {
 		w.WriteError("READONLY You can't write against a read only replica.")
 		return
 	}
+	if !cmd.write {
+		cmd.fn(s, w, args)
+		return
+	}
+	// Write command. When propagation is active, serialize the mutation and its
+	// propagation under propMu so memory, AOF, and replica order all agree.
+	if s.propagating.Load() {
+		s.propMu.Lock()
+		dirty := cmd.fn(s, w, args)
+		if dirty {
+			s.touchWatchers(args)
+			s.propagate(args)
+		}
+		s.propMu.Unlock()
+		return
+	}
 	dirty := cmd.fn(s, w, args)
-	if cmd.write && dirty {
-		s.touchWatchers(args) // abort any transaction WATCHing an affected key
-		s.propagate(args)
+	if dirty {
+		s.touchWatchers(args) // WATCH still works without propagation
 	}
 }
 

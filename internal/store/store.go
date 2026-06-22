@@ -102,6 +102,13 @@ type Store struct {
 
 	maxKeys atomic.Int64 // 0 = unbounded; else the approximate live-key cap (global)
 	evicted atomic.Int64
+
+	// onRemoved, if set, is called after a key is removed by the store itself
+	// (TTL expiration or LRU eviction) rather than by a client command. It is
+	// always invoked without any shard lock held, so the callback may take
+	// other locks. The server uses it to propagate a DEL to the AOF/replicas and
+	// invalidate WATCHers. Set once before serving begins.
+	onRemoved func(key string)
 }
 
 // New returns a Store with at least numShards shards, rounded up to the next
@@ -127,6 +134,16 @@ func (s *Store) SetMaxKeys(maxKeys int) {
 		maxKeys = 0
 	}
 	s.maxKeys.Store(int64(maxKeys))
+}
+
+// SetRemovalHook registers a callback invoked when the store removes a key on
+// its own (expiration or eviction). It must be set before serving starts.
+func (s *Store) SetRemovalHook(fn func(key string)) { s.onRemoved = fn }
+
+func (s *Store) notifyRemoved(key string) {
+	if s.onRemoved != nil {
+		s.onRemoved(key)
+	}
 }
 
 // Evicted reports how many keys have been removed by the eviction policy.
@@ -210,6 +227,7 @@ func (s *Store) evictOneLRU() bool {
 		delete(sh.data, victim)
 		sh.mu.Unlock()
 		s.evicted.Add(1)
+		s.notifyRemoved(victim) // outside the shard lock
 		return true
 	}
 	return false
@@ -412,10 +430,15 @@ func (s *Store) Incr(key string, delta int64) (int64, error) {
 
 func (s *Store) dropIfExpired(sh *shard, key string) {
 	sh.mu.Lock()
+	removed := false
 	if e, ok := sh.data[key]; ok && e.expired(s.clock()) {
 		delete(sh.data, key)
+		removed = true
 	}
 	sh.mu.Unlock()
+	if removed {
+		s.notifyRemoved(key)
+	}
 }
 
 // --- background expiration ----------------------------------------------------
@@ -439,13 +462,18 @@ func (s *Store) Janitor(ctx context.Context, interval time.Duration) {
 
 func (s *Store) sweep() {
 	now := s.clock()
+	var removed []string
 	for _, sh := range s.shards {
 		sh.mu.Lock()
 		for k, e := range sh.data {
 			if e.expired(now) {
 				delete(sh.data, k)
+				removed = append(removed, k)
 			}
 		}
 		sh.mu.Unlock()
+	}
+	for _, k := range removed {
+		s.notifyRemoved(k) // outside the shard lock
 	}
 }
