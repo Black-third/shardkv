@@ -11,6 +11,7 @@ package server
 import (
 	"context"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -246,7 +247,11 @@ func (s *Server) applyCommand(w *resp.Writer, args [][]byte) {
 // behind and can resync).
 func (s *Server) propagate(args [][]byte) {
 	if s.aof != nil {
-		s.aof.Append(args)
+		if err := s.aof.Append(args); err != nil {
+			// The write was already acked to the client; surface the durability
+			// failure rather than swallowing it.
+			log.Printf("shardkv: AOF append failed (write not persisted): %v", err)
+		}
 	}
 	s.mu.Lock()
 	for rc := range s.replicas {

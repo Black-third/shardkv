@@ -4,7 +4,11 @@
 package aof
 
 import (
+	"errors"
+	"io"
+	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -32,6 +36,7 @@ type Log struct {
 	w      *resp.Writer
 	policy SyncPolicy
 	closed bool
+	logf   func(string, ...any) // surfaces background durability failures
 }
 
 // Open opens (creating if needed) the AOF at path for appending.
@@ -40,11 +45,18 @@ func Open(path string, policy SyncPolicy) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{path: path, f: f, w: resp.NewWriter(f), policy: policy}
+	l := &Log{path: path, f: f, w: resp.NewWriter(f), policy: policy, logf: log.Printf}
 	if policy == SyncEverySec {
 		go l.syncLoop()
 	}
 	return l, nil
+}
+
+// SetLogger overrides where background errors are reported (used in tests).
+func (l *Log) SetLogger(logf func(string, ...any)) {
+	l.mu.Lock()
+	l.logf = logf
+	l.mu.Unlock()
 }
 
 // Append serializes a command and writes it to the log, applying the configured
@@ -76,8 +88,11 @@ func (l *Log) syncLoop() {
 			l.mu.Unlock()
 			return
 		}
-		l.w.Flush()
-		l.f.Sync()
+		if err := l.w.Flush(); err != nil {
+			l.logf("aof: background flush failed, data may be unpersisted: %v", err)
+		} else if err := l.f.Sync(); err != nil {
+			l.logf("aof: background fsync failed, data may be unpersisted: %v", err)
+		}
 		l.mu.Unlock()
 	}
 }
@@ -98,6 +113,10 @@ func (l *Log) Close() error {
 // Rewrite atomically replaces the log with a compacted snapshot: it writes the
 // given commands to a temp file and renames it over the current log, discarding
 // the (potentially large) command history. Appends continue to the new file.
+//
+// The live file descriptor is kept valid until the new one is successfully
+// opened, so a failure during the swap leaves the log usable rather than
+// stranded on a closed descriptor.
 func (l *Log) Rewrite(snapshot [][][]byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -114,37 +133,64 @@ func (l *Log) Rewrite(snapshot [][][]byte) error {
 	for _, cmd := range snapshot {
 		if err := tw.WriteCommand(cmd); err != nil {
 			tf.Close()
+			os.Remove(tmp)
 			return err
 		}
 	}
 	if err := tw.Flush(); err != nil {
 		tf.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := tf.Sync(); err != nil {
 		tf.Close()
+		os.Remove(tmp)
 		return err
 	}
 	tf.Close()
 
-	// Swap files: flush current buffer, rename atomically, reopen for append.
-	l.w.Flush()
-	l.f.Close()
+	// Atomically replace the live file. On Rename failure the old descriptor is
+	// untouched and the log keeps working.
 	if err := os.Rename(tmp, l.path); err != nil {
+		os.Remove(tmp)
 		return err
 	}
-	f, err := os.OpenFile(l.path, os.O_WRONLY|os.O_APPEND, 0o644)
+	syncDir(l.path) // make the rename itself durable
+
+	newF, err := os.OpenFile(l.path, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		// The compacted data is safely on disk; we just can't reopen for append.
+		// Disable further appends rather than write to a stale descriptor.
+		l.w.Flush()
+		l.f.Close()
+		l.closed = true
+		l.logf("aof: reopen after rewrite failed, persistence disabled: %v", err)
 		return err
 	}
-	l.f = f
-	l.w = resp.NewWriter(f)
+	// The old buffer's contents are already captured in the snapshot, so discard
+	// the old file and switch to the new one.
+	l.f.Close()
+	l.f = newF
+	l.w = resp.NewWriter(newF)
 	return nil
+}
+
+// syncDir fsyncs the directory containing path so a rename survives a crash.
+// Best effort: errors (e.g. on platforms that disallow directory fsync) are
+// ignored.
+func syncDir(path string) {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
 }
 
 // Load replays the AOF at path and returns the recorded commands. A missing file
 // yields no commands and no error (fresh start). A torn final record from a
-// crash simply ends replay early.
+// crash ends replay quietly; any other malformed record mid-file ends replay but
+// logs a warning, since later valid commands are being dropped.
 func Load(path string) ([][][]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -160,6 +206,9 @@ func Load(path string) ([][][]byte, error) {
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Printf("aof: stopped replay at a malformed record after %d commands: %v", len(cmds), err)
+			}
 			break
 		}
 		if len(args) > 0 {
