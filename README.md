@@ -45,29 +45,44 @@ of goroutines and TCP clients — passes under the Go race detector.
   policy: `always` / `everysec` / `no`) and replayed on startup. Supports
   compacting rewrite.
 - **Primary–replica replication** — a replica issues `PSYNC`, receives a
-  snapshot, then applies the master's live write stream; replicas are read-only.
+  consistent point-in-time snapshot, then applies the master's live write
+  stream; replicas are read-only and can be chained.
+- **Consistent durability** — when persistence/replication is active, writes are
+  totally ordered, so the memory state, the AOF, and every replica stream share
+  one order (no divergence under concurrent writes); the initial sync is exact
+  (no double-apply). Expirations and evictions propagate as `DEL`, and relative
+  TTLs are rewritten to absolute deadlines so a replica or an AOF replay
+  reconstructs the same expiry instant.
 - **Transactions** — `MULTI`/`EXEC`/`DISCARD` command batching, with
   `WATCH`/`UNWATCH` optimistic locking: `EXEC` aborts if a watched key was
-  modified by another client.
+  modified — or expired — between `WATCH` and `EXEC`.
+- **Cursor iteration & pipelining** — `SCAN` walks the keyspace incrementally
+  (with `MATCH`/`COUNT`) instead of the O(n) `KEYS`; pipelined requests are
+  served with a single coalesced flush.
 - **Approximate-LRU eviction** — an optional `maxkeys` cap; a background pass
   samples keys and evicts the least-recently-used, Redis-style.
 - **TTL expiration** — lazy on read plus a background janitor that reclaims
   memory.
+- **Hardened** — the RESP parser bounds the multibulk count and bulk length
+  before allocating (a crafted header can't overflow or OOM the server);
+  `INCR`/`DECR` reject int64 overflow; AOF rewrites survive a failed swap and
+  surface write/fsync errors instead of silently losing durability.
 - **Self-registering command table** — each command declares an arity and a
   `write` flag; the `write` flag is what automatically drives both AOF
   persistence and replica propagation, so new mutating commands wire themselves
   into durability and replication.
-- **Observability** — `INFO` (role, uptime, connections, commands, keyspace),
-  `DBSIZE`, `TYPE`.
-- **Tested hard** — unit + integration tests under `-race`, plus a Go **fuzz
-  test** for the RESP parser.
+- **Observability** — `INFO` (role, uptime, connections, commands, evictions,
+  keyspace), `DBSIZE`, `TYPE`.
+- **Tested hard** — unit + integration tests under `-race` (master/replica
+  convergence, expiry-propagation, transactions, AOF crash/rewrite), plus a Go
+  **fuzz test** for the RESP parser.
 
 ## Commands
 
 | Group   | Commands |
 | ------- | -------- |
-| Strings | `SET key val [EX s\|PX ms]` · `GET` · `INCR` · `DECR` · `MSET` · `MGET` |
-| Keys    | `DEL` · `EXISTS` · `EXPIRE` · `TTL` · `TYPE` · `KEYS` |
+| Strings | `SET key val [EX s\|PX ms\|PXAT ms]` · `GET` · `GETSET` · `GETDEL` · `SETNX` · `APPEND` · `STRLEN` · `INCR` · `DECR` · `INCRBY` · `DECRBY` · `MSET` · `MGET` |
+| Keys    | `DEL` · `EXISTS` · `EXPIRE` · `PEXPIRE` · `EXPIREAT` · `PEXPIREAT` · `PERSIST` · `TTL` · `PTTL` · `TYPE` · `RENAME` · `KEYS` · `SCAN cursor [MATCH p] [COUNT n]` |
 | Lists   | `LPUSH` · `RPUSH` · `LPOP` · `RPOP` · `LRANGE` · `LLEN` |
 | Hashes  | `HSET` · `HGET` · `HDEL` · `HGETALL` · `HLEN` |
 | Sets    | `SADD` · `SREM` · `SMEMBERS` · `SISMEMBER` · `SCARD` |
@@ -113,17 +128,29 @@ go run ./cmd/shardkv -addr :6380
 go run ./cmd/shardkv -addr :6381 -replicaof 127.0.0.1:6380
 ```
 
-The replica connects, receives a snapshot of the master's current dataset, then
-applies the master's live write stream. Replicas reject client writes
-(`READONLY`). Replication can also be toggled at runtime with `REPLICAOF host
-port` / `REPLICAOF NO ONE`.
+The replica connects, receives a point-in-time snapshot of the master's
+dataset, then applies the master's live write stream. Replicas reject client
+writes (`READONLY`), re-propagate the stream to their own AOF and downstream
+replicas (chaining), and can be toggled at runtime with `REPLICAOF host port` /
+`REPLICAOF NO ONE`.
 
-**Consistency model.** Replication is asynchronous and eventually consistent.
-The replica is registered for the live stream before the initial snapshot is
-taken, so a write that races the snapshot may be applied twice — fine for
-idempotent operations. Making initial sync exact would require a
-copy-on-write snapshot or a replication offset/backlog (as real Redis does);
-that trade-off is called out deliberately rather than hidden.
+**Consistency model.** When persistence or replication is active, write commands
+are totally ordered through a single lock that spans the store mutation *and* its
+propagation, so the order applied to memory is exactly the order written to the
+AOF and shipped to replicas — concurrent writes to the same key can no longer
+make a master and its replica/AOF diverge. The `PSYNC` snapshot is taken under
+that same lock, making it a consistent cut: every write is in either the snapshot
+or the live stream, never both, so the initial sync is exact (no double-apply of
+`INCR`/`RPUSH`). A pure single-node cache (no AOF, no replicas) keeps writes
+sharded-concurrent and pays none of this. One narrow window remains: a master
+started *without* `-aof` only begins serializing writes at the first `PSYNC`, so
+a write already in flight at that instant may be missed by that first replica —
+run a replicated master with `-aof` to close it.
+
+**Known limitation.** A `MULTI`/`EXEC` transaction is propagated as its
+individual commands rather than wrapped in `MULTI`/`EXEC`, so a crash that
+truncates the AOF mid-transaction can replay a prefix. Wrapping transactions for
+atomic replay is the next step (see roadmap).
 
 ## Transactions
 
@@ -167,9 +194,19 @@ pays nothing on the read path. `INFO` reports `evicted_keys`.
   slice over thousands of randomized operations.
 - **Command table + `write` flag.** Commands self-register with an arity and a
   `write` flag. Dispatch checks arity, rejects writes on replicas, and — only
-  when a write actually modified state — propagates the verbatim command to the
-  AOF and replicas. Durability and replication are therefore a property of the
-  table, not scattered through handlers.
+  when a write actually modified state — propagates the command to the AOF and
+  replicas. Durability and replication are therefore a property of the table,
+  not scattered through handlers.
+- **Sharded reads, ordered writes.** Reads scale across shards (per-shard
+  `RWMutex`). Writes also take the shard lock, but when propagation is active
+  they additionally pass through one ordering lock spanning mutation + AOF append
+  + replica enqueue — the single-writer model real systems use to keep copies in
+  agreement. That lock is skipped entirely for a pure cache, so the default
+  config keeps concurrent-write throughput.
+- **Absolute deadlines on the wire.** Relative-TTL writes are rewritten to
+  absolute (`PEXPIREAT`, `SET ... PXAT`) before they reach the AOF/replicas, and
+  the master synthesizes a `DEL` when it expires/evicts a key, so replicas and
+  replayed AOFs don't drift on TTL boundaries.
 - **Optimistic locking, not a global lock.** `WATCH` registers a key→sessions
   map; any write that modifies an affected key marks watching sessions dirty
   (via an atomic flag), so `EXEC` can detect a conflict without serializing the
@@ -189,9 +226,9 @@ Apple Silicon, `go test -bench`, 8 logical cores:
 
 | Operation         | ns/op | allocs/op | throughput     |
 | ----------------- | ----- | --------- | -------------- |
-| `GET` (parallel)  | ~55   | 1         | ~18 M ops/sec  |
-| `SET`             | ~250  | 3         | ~4 M ops/sec   |
-| `INCR` (parallel) | ~180  | 3         | ~5 M ops/sec   |
+| `GET` (parallel)  | ~28   | 2         | ~35 M ops/sec  |
+| `SET`             | ~115  | 3         | ~9 M ops/sec   |
+| `INCR` (parallel) | ~77   | 3         | ~13 M ops/sec  |
 
 ```bash
 go test -bench=. -benchmem ./internal/store
@@ -209,9 +246,10 @@ go test -fuzz=FuzzReadCommand -fuzztime=30s ./internal/resp   # fuzz the protoco
 go vet ./...
 ```
 
-The suite includes a master/replica convergence test, an AOF round-trip and
-rewrite test, a skip-list fuzz-against-sort cross-check, and concurrency tests
-that drive shared keys from many goroutines and TCP clients.
+The suite includes master/replica convergence, expiry-propagation, transaction
+(`MULTI`/`EXEC`/`WATCH`), eviction, `SCAN`, AOF round-trip / torn-tail / rewrite,
+RESP adversarial-input, and a skip-list fuzz-against-sort cross-check, plus
+concurrency tests that drive shared keys from many goroutines and TCP clients.
 
 ## Layout
 
@@ -225,10 +263,10 @@ internal/aof       append-only-file persistence: append, fsync policy, replay   
 
 ## Roadmap
 
-- Replication offsets + partial resync for exact initial sync
+- Wrap `MULTI`/`EXEC` for atomic AOF/replica replay (see known limitation)
+- Replication offsets + backlog for partial resync (`PSYNC` continuation)
 - `sync.Pool` for entries to remove the write-path allocation
-- Pipelining throughput tuning; RESP3
-- Keyspace notifications
+- RESP3 (`HELLO`), keyspace notifications, `INCRBYFLOAT`/`COPY`
 
 ## License
 
