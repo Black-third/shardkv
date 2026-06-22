@@ -153,6 +153,13 @@ func (w *Writer) WriteNull() error {
 	return err
 }
 
+// WriteNullArray writes the null array: *-1\r\n. Redis uses this (not the null
+// bulk string) for an aborted EXEC.
+func (w *Writer) WriteNullArray() error {
+	_, err := w.w.WriteString("*-1\r\n")
+	return err
+}
+
 // WriteArrayHeader writes an array header: *<n>\r\n. The caller then writes n
 // elements.
 func (w *Writer) WriteArrayHeader(n int) error {

@@ -46,6 +46,11 @@ of goroutines and TCP clients — passes under the Go race detector.
   compacting rewrite.
 - **Primary–replica replication** — a replica issues `PSYNC`, receives a
   snapshot, then applies the master's live write stream; replicas are read-only.
+- **Transactions** — `MULTI`/`EXEC`/`DISCARD` command batching, with
+  `WATCH`/`UNWATCH` optimistic locking: `EXEC` aborts if a watched key was
+  modified by another client.
+- **Approximate-LRU eviction** — an optional `maxkeys` cap; a background pass
+  samples keys and evicts the least-recently-used, Redis-style.
 - **TTL expiration** — lazy on read plus a background janitor that reclaims
   memory.
 - **Self-registering command table** — each command declares an arity and a
@@ -67,6 +72,7 @@ of goroutines and TCP clients — passes under the Go race detector.
 | Hashes  | `HSET` · `HGET` · `HDEL` · `HGETALL` · `HLEN` |
 | Sets    | `SADD` · `SREM` · `SMEMBERS` · `SISMEMBER` · `SCARD` |
 | Sorted  | `ZADD` · `ZSCORE` · `ZRANK` · `ZRANGE [WITHSCORES]` · `ZREM` · `ZCARD` |
+| Tx      | `MULTI` · `EXEC` · `DISCARD` · `WATCH` · `UNWATCH` |
 | Server  | `PING` · `INFO` · `DBSIZE` · `FLUSHALL` · `REPLICAOF` · `COMMAND` |
 
 ## Quick start
@@ -119,6 +125,37 @@ idempotent operations. Making initial sync exact would require a
 copy-on-write snapshot or a replication offset/backlog (as real Redis does);
 that trade-off is called out deliberately rather than hidden.
 
+## Transactions
+
+```bash
+redis-cli -p 6380 <<'EOF'
+WATCH balance
+MULTI
+DECRBY balance 10
+INCR transfers
+EXEC
+EOF
+```
+
+`MULTI` begins a batch; subsequent commands reply `QUEUED` and are validated for
+arity/existence (a bad command makes the whole `EXEC` fail with `EXECABORT`).
+`EXEC` runs the batch and returns the array of replies; `DISCARD` throws it away.
+`WATCH` adds optimistic locking: if any watched key is modified — by this client
+or another — between `WATCH` and `EXEC`, `EXEC` aborts and returns a null array,
+the basis for lock-free check-and-set patterns.
+
+## Eviction
+
+```bash
+go run ./cmd/shardkv -maxkeys 100000
+```
+
+With `-maxkeys` set, a background pass keeps the store near the cap by evicting
+approximately-least-recently-used keys: it samples up to 16 keys from a random
+shard and removes the oldest, repeating until under the cap. Access time is
+tracked only when eviction is enabled, so the default (unbounded) configuration
+pays nothing on the read path. `INFO` reports `evicted_keys`.
+
 ## Design notes
 
 - **Why sharding.** One global mutex makes the lock the bottleneck: every
@@ -133,6 +170,14 @@ that trade-off is called out deliberately rather than hidden.
   when a write actually modified state — propagates the verbatim command to the
   AOF and replicas. Durability and replication are therefore a property of the
   table, not scattered through handlers.
+- **Optimistic locking, not a global lock.** `WATCH` registers a key→sessions
+  map; any write that modifies an affected key marks watching sessions dirty
+  (via an atomic flag), so `EXEC` can detect a conflict without serializing the
+  whole keyspace.
+- **Pointer entries for LRU.** Values are stored as `*entry` so a key's access
+  time can be updated atomically on the read path, under a shared read lock,
+  without upgrading to an exclusive lock. The cost is one allocation per write;
+  a `sync.Pool` or arena would remove it if write throughput dominated.
 - **Value copies.** Stored bytes are copied in and out so callers can never
   mutate state through an aliased slice.
 - **Injectable clock.** The store reads time from a function field, so TTL logic
@@ -144,13 +189,17 @@ Apple Silicon, `go test -bench`, 8 logical cores:
 
 | Operation         | ns/op | allocs/op | throughput     |
 | ----------------- | ----- | --------- | -------------- |
-| `GET` (parallel)  | ~35   | 1         | ~28 M ops/sec  |
-| `SET`             | ~83   | 2         | ~12 M ops/sec  |
-| `INCR` (parallel) | ~97   | 2         | ~10 M ops/sec  |
+| `GET` (parallel)  | ~55   | 1         | ~18 M ops/sec  |
+| `SET`             | ~250  | 3         | ~4 M ops/sec   |
+| `INCR` (parallel) | ~180  | 3         | ~5 M ops/sec   |
 
 ```bash
 go test -bench=. -benchmem ./internal/store
 ```
+
+The write-path allocation is the `*entry` that enables in-place LRU bookkeeping
+(see design notes); for a networked store the RESP/TCP path dominates these
+in-memory costs in practice.
 
 ## Testing
 
@@ -168,18 +217,18 @@ that drive shared keys from many goroutines and TCP clients.
 
 ```text
 cmd/shardkv        entrypoint: flags, signal handling, AOF/replication wiring
-internal/store     sharded store, typed values, skip-list sorted set, snapshot   (+ tests, benchmarks)
-internal/resp      RESP protocol reader/writer                                    (+ tests, fuzz)
-internal/server    TCP server, command table + handlers, replication             (+ tests)
-internal/aof       append-only-file persistence: append, fsync policy, replay     (+ tests)
+internal/store     sharded store, typed values, skip-list sorted set, LRU eviction, snapshot   (+ tests, benchmarks)
+internal/resp      RESP protocol reader/writer                                                  (+ tests, fuzz)
+internal/server    TCP server, command table + handlers, transactions, replication             (+ tests)
+internal/aof       append-only-file persistence: append, fsync policy, replay                   (+ tests)
 ```
 
 ## Roadmap
 
-- Approximate-LRU eviction under a `maxmemory` cap
-- `MULTI`/`EXEC` transactions and pipelining throughput tuning
 - Replication offsets + partial resync for exact initial sync
-- RESP3 and keyspace notifications
+- `sync.Pool` for entries to remove the write-path allocation
+- Pipelining throughput tuning; RESP3
+- Keyspace notifications
 
 ## License
 

@@ -66,13 +66,15 @@ func (s *Store) ZAdd(key string, member string, score float64) (int, error) {
 		return 0, ErrWrongType
 	}
 	if !live {
-		e = entry{kind: kindZSet, zset: newZSet()}
+		e = &entry{kind: kindZSet, zset: newZSet()}
 		sh.data[key] = e
 	}
+	added := 0
 	if e.zset.add(member, score) {
-		return 1, nil
+		added = 1
 	}
-	return 0, nil
+	s.touch(e, now)
+	return added, nil
 }
 
 // ZScore returns the score of member. ok is false if key or member is absent.

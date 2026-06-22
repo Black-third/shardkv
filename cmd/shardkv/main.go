@@ -34,9 +34,11 @@ func main() {
 	aofPath := flag.String("aof", "", "append-only file path for persistence (empty disables it)")
 	aofSync := flag.String("aofsync", "everysec", "AOF sync policy: everysec|always|no")
 	replicaOf := flag.String("replicaof", "", "replicate from master at host:port (empty = master)")
+	maxKeys := flag.Int("maxkeys", 0, "approximate-LRU eviction cap on live keys (0 = unbounded)")
 	flag.Parse()
 
 	st := store.New(*shards)
+	st.SetMaxKeys(*maxKeys)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

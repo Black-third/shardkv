@@ -59,6 +59,9 @@ func readReply(t *testing.T, br *bufio.Reader) string {
 		return string(buf[:n])
 	case '*':
 		n, _ := strconv.Atoi(line[1:])
+		if n < 0 {
+			return "(nil)" // null array (e.g. aborted EXEC)
+		}
 		parts := make([]string, 0, n)
 		for i := 0; i < n; i++ {
 			parts = append(parts, readReply(t, br))
