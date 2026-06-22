@@ -68,6 +68,9 @@ type Server struct {
 	replicas   map[*replicaConn]struct{}
 	replCancel context.CancelFunc // cancels the active replication loop, if any
 
+	watchMu  sync.Mutex
+	watchers map[string]map[*session]struct{} // key -> sessions WATCHing it
+
 	baseCtx    context.Context // lifetime ctx for replication started via REPLICAOF
 	startTime  time.Time
 	totalConns atomic.Int64
@@ -80,6 +83,7 @@ func New(st *store.Store) *Server {
 		store:     st,
 		role:      "master",
 		replicas:  make(map[*replicaConn]struct{}),
+		watchers:  make(map[string]map[*session]struct{}),
 		baseCtx:   context.Background(),
 		startTime: time.Now(),
 	}
@@ -176,6 +180,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 
 	r := resp.NewReader(conn)
 	w := resp.NewWriter(conn)
+	sess := &session{}
+	defer s.unwatchAll(sess) // release any WATCHes on disconnect
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
@@ -190,7 +196,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			s.handleSync(ctx, w)
 			return
 		}
-		s.dispatch(w, args)
+		s.execute(sess, w, args)
 		if err := w.Flush(); err != nil {
 			return
 		}
@@ -215,6 +221,7 @@ func (s *Server) dispatch(w *resp.Writer, args [][]byte) {
 	}
 	dirty := cmd.fn(s, w, args)
 	if cmd.write && dirty {
+		s.touchWatchers(args) // abort any transaction WATCHing an affected key
 		s.propagate(args)
 	}
 }

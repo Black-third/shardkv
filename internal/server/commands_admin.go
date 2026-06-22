@@ -47,6 +47,7 @@ func cmdInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 	fmt.Fprintf(&b, "total_connections_received:%d\r\n", s.totalConns.Load())
 	fmt.Fprintf(&b, "\r\n# Stats\r\n")
 	fmt.Fprintf(&b, "total_commands_processed:%d\r\n", s.totalCmds.Load())
+	fmt.Fprintf(&b, "evicted_keys:%d\r\n", s.store.Evicted())
 	fmt.Fprintf(&b, "\r\n# Keyspace\r\n")
 	fmt.Fprintf(&b, "db_keys:%d\r\n", s.store.Len())
 	fmt.Fprintf(&b, "\r\n# Replication\r\n")

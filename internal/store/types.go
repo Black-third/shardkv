@@ -89,7 +89,7 @@ func (s *Store) listPush(key string, left bool, vals [][]byte) (int, error) {
 		return 0, ErrWrongType
 	}
 	if !live {
-		e = entry{kind: kindList, list: newDeque()}
+		e = &entry{kind: kindList, list: newDeque()}
 		sh.data[key] = e
 	}
 	for _, v := range vals {
@@ -99,6 +99,7 @@ func (s *Store) listPush(key string, left bool, vals [][]byte) (int, error) {
 			e.list.rpush(copyBytes(v))
 		}
 	}
+	s.touch(e, now)
 	return e.list.len(), nil
 }
 
@@ -131,6 +132,8 @@ func (s *Store) listPop(key string, left bool) ([]byte, bool, error) {
 	}
 	if e.list.len() == 0 {
 		delete(sh.data, key)
+	} else {
+		s.touch(e, now)
 	}
 	return v, ok, nil
 }
@@ -149,6 +152,7 @@ func (s *Store) LRange(key string, start, stop int) ([][]byte, error) {
 	if e.kind != kindList {
 		return nil, ErrWrongType
 	}
+	s.touch(e, now)
 	return e.list.rangeIdx(start, stop), nil
 }
 
@@ -184,7 +188,7 @@ func (s *Store) HSet(key string, pairs ...[2][]byte) (int, error) {
 		return 0, ErrWrongType
 	}
 	if !live {
-		e = entry{kind: kindHash, dict: make(map[string][]byte)}
+		e = &entry{kind: kindHash, dict: make(map[string][]byte)}
 		sh.data[key] = e
 	}
 	created := 0
@@ -195,6 +199,7 @@ func (s *Store) HSet(key string, pairs ...[2][]byte) (int, error) {
 		}
 		e.dict[field] = copyBytes(p[1])
 	}
+	s.touch(e, now)
 	return created, nil
 }
 
@@ -212,6 +217,7 @@ func (s *Store) HGet(key, field string) ([]byte, bool, error) {
 	if e.kind != kindHash {
 		return nil, false, ErrWrongType
 	}
+	s.touch(e, now)
 	v, ok := e.dict[field]
 	if !ok {
 		return nil, false, nil
@@ -242,6 +248,8 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 	}
 	if len(e.dict) == 0 {
 		delete(sh.data, key)
+	} else {
+		s.touch(e, now)
 	}
 	return removed, nil
 }
@@ -261,6 +269,7 @@ func (s *Store) HGetAll(key string) ([][]byte, error) {
 	if e.kind != kindHash {
 		return nil, ErrWrongType
 	}
+	s.touch(e, now)
 	out := make([][]byte, 0, len(e.dict)*2)
 	for f, v := range e.dict {
 		out = append(out, []byte(f), copyBytes(v))
@@ -300,7 +309,7 @@ func (s *Store) SAdd(key string, members ...string) (int, error) {
 		return 0, ErrWrongType
 	}
 	if !live {
-		e = entry{kind: kindSet, set: make(map[string]struct{})}
+		e = &entry{kind: kindSet, set: make(map[string]struct{})}
 		sh.data[key] = e
 	}
 	added := 0
@@ -310,6 +319,7 @@ func (s *Store) SAdd(key string, members ...string) (int, error) {
 			added++
 		}
 	}
+	s.touch(e, now)
 	return added, nil
 }
 
@@ -336,6 +346,8 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 	}
 	if len(e.set) == 0 {
 		delete(sh.data, key)
+	} else {
+		s.touch(e, now)
 	}
 	return removed, nil
 }
@@ -354,6 +366,7 @@ func (s *Store) SMembers(key string) ([]string, error) {
 	if e.kind != kindSet {
 		return nil, ErrWrongType
 	}
+	s.touch(e, now)
 	out := make([]string, 0, len(e.set))
 	for m := range e.set {
 		out = append(out, m)
