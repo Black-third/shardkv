@@ -36,16 +36,18 @@ func cmdZAdd(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 
 	added := 0
+	dirty := false
 	for j, i := 0, 2; i < len(args); j, i = j+1, i+2 {
-		n, err := s.store.ZAdd(key, string(args[i+1]), scores[j])
+		n, changed, err := s.store.ZAdd(key, string(args[i+1]), scores[j])
 		if err != nil {
 			writeStoreErr(w, err)
-			return added > 0
+			return dirty
 		}
 		added += n
+		dirty = dirty || changed
 	}
 	w.WriteInt(int64(added))
-	return true
+	return dirty
 }
 
 func cmdZScore(s *Server, w *resp.Writer, args [][]byte) bool {

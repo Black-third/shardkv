@@ -104,6 +104,22 @@ func TestIncr(t *testing.T) {
 	}
 }
 
+func TestIncrOverflow(t *testing.T) {
+	s := New(4)
+	s.Set("max", []byte("9223372036854775807"), 0) // math.MaxInt64
+	if _, err := s.Incr("max", 1); err != ErrOverflow {
+		t.Fatalf("Incr at MaxInt64 = %v; want ErrOverflow", err)
+	}
+	// The value must be left unchanged after a rejected overflow.
+	if v, _ := s.Get("max"); string(v) != "9223372036854775807" {
+		t.Fatalf("value mutated after overflow: %q", v)
+	}
+	s.Set("min", []byte("-9223372036854775808"), 0) // math.MinInt64
+	if _, err := s.Incr("min", -1); err != ErrOverflow {
+		t.Fatalf("Decr at MinInt64 = %v; want ErrOverflow", err)
+	}
+}
+
 // TestConcurrentIncr is the core race-safety test: many goroutines hammering a
 // single hot key must produce an exact total. Run with `go test -race`.
 func TestConcurrentIncr(t *testing.T) {

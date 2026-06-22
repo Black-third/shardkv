@@ -115,7 +115,7 @@ func TestWrongType(t *testing.T) {
 	if _, err := s.HSet("k", [2][]byte{[]byte("f"), []byte("v")}); err != ErrWrongType {
 		t.Fatalf("HSet on string = %v; want ErrWrongType", err)
 	}
-	if _, err := s.ZAdd("k", "m", 1); err != ErrWrongType {
+	if _, _, err := s.ZAdd("k", "m", 1); err != ErrWrongType {
 		t.Fatalf("ZAdd on string = %v; want ErrWrongType", err)
 	}
 	// And the reverse: GET on a list returns not-ok.
