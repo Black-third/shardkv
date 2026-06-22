@@ -50,9 +50,10 @@ of goroutines and TCP clients — passes under the Go race detector.
 - **Consistent durability** — when persistence/replication is active, writes are
   totally ordered, so the memory state, the AOF, and every replica stream share
   one order (no divergence under concurrent writes); the initial sync is exact
-  (no double-apply). Expirations and evictions propagate as `DEL`, and relative
-  TTLs are rewritten to absolute deadlines so a replica or an AOF replay
-  reconstructs the same expiry instant.
+  (no double-apply); and a `MULTI`/`EXEC` transaction is propagated wrapped in
+  `MULTI`/`EXEC`, so a crash that truncates the AOF mid-transaction replays none
+  of it. Relative TTLs are rewritten to absolute deadlines (so a replica or AOF
+  replay reconstructs the same expiry instant) and evictions propagate as `DEL`.
 - **Transactions** — `MULTI`/`EXEC`/`DISCARD` command batching, with
   `WATCH`/`UNWATCH` optimistic locking: `EXEC` aborts if a watched key was
   modified — or expired — between `WATCH` and `EXEC`.
@@ -147,10 +148,10 @@ started *without* `-aof` only begins serializing writes at the first `PSYNC`, so
 a write already in flight at that instant may be missed by that first replica —
 run a replicated master with `-aof` to close it.
 
-**Known limitation.** A `MULTI`/`EXEC` transaction is propagated as its
-individual commands rather than wrapped in `MULTI`/`EXEC`, so a crash that
-truncates the AOF mid-transaction can replay a prefix. Wrapping transactions for
-atomic replay is the next step (see roadmap).
+**Transactions on the wire.** An `EXEC`'d transaction is shipped to the AOF and
+replicas wrapped in `MULTI`/`EXEC`; replay and replica-apply buffer the group and
+commit it only on `EXEC`, so a crash that truncates the AOF mid-transaction (no
+`EXEC`) replays none of it — all-or-nothing.
 
 ## Transactions
 
@@ -263,7 +264,6 @@ internal/aof       append-only-file persistence: append, fsync policy, replay   
 
 ## Roadmap
 
-- Wrap `MULTI`/`EXEC` for atomic AOF/replica replay (see known limitation)
 - Replication offsets + backlog for partial resync (`PSYNC` continuation)
 - `sync.Pool` for entries to remove the write-path allocation
 - RESP3 (`HELLO`), keyspace notifications, `INCRBYFLOAT`/`COPY`

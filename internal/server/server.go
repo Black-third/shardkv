@@ -103,13 +103,17 @@ func New(st *store.Store) *Server {
 	return s
 }
 
-// onKeyRemoved propagates a synthetic DEL when the store expires or evicts a key
-// on its own, so the AOF and replicas converge, and invalidates any WATCH on
-// that key. Invoked by the store with no shard lock held.
-func (s *Server) onKeyRemoved(key string) {
+// onKeyRemoved handles a key the store removed on its own. It always invalidates
+// any WATCH on the key. For an eviction it also propagates a synthetic DEL so
+// replicas/AOF converge (an evicted key has no TTL, so they cannot drop it
+// themselves); an expiration needs no DEL because its absolute deadline was
+// already propagated, so replicas and AOF replay expire it independently. The
+// expiration path therefore never touches propMu, which keeps it safe to fire
+// from a read evaluated while a transaction holds propMu.
+func (s *Server) onKeyRemoved(key string, evicted bool) {
 	args := [][]byte{[]byte("DEL"), []byte(key)}
 	s.touchWatchers(args)
-	if s.propagating.Load() {
+	if evicted && s.propagating.Load() {
 		s.propMu.Lock()
 		s.propagate(args)
 		s.propMu.Unlock()
@@ -124,11 +128,51 @@ func (s *Server) AttachAOF(log *aof.Log) {
 }
 
 // ReplayCommands applies a recorded command stream (e.g. from the AOF) to the
-// store without persisting or propagating it. Used once at startup.
+// store without persisting or propagating it. Used once at startup. A
+// transaction is applied atomically: a MULTI..EXEC group is buffered and only
+// applied on EXEC, so a crash that truncated the AOF mid-transaction (no EXEC)
+// replays none of it.
 func (s *Server) ReplayCommands(cmds [][][]byte) {
-	dw := resp.NewWriter(io.Discard)
+	a := &txApplier{s: s, w: resp.NewWriter(io.Discard)}
 	for _, cmd := range cmds {
-		s.applyCommand(dw, cmd)
+		a.feed(cmd)
+	}
+}
+
+// txApplier applies a command stream with MULTI/EXEC awareness: commands between
+// a MULTI and its EXEC are buffered and applied together; if the stream ends (or
+// a DISCARD arrives) before EXEC, the buffer is dropped, giving all-or-nothing
+// transaction replay.
+type txApplier struct {
+	s       *Server
+	w       *resp.Writer
+	inMulti bool
+	buf     [][][]byte
+}
+
+func (a *txApplier) feed(args [][]byte) {
+	if len(args) == 0 {
+		return
+	}
+	switch strings.ToUpper(string(args[0])) {
+	case "MULTI":
+		a.inMulti = true
+		a.buf = a.buf[:0]
+	case "EXEC":
+		for _, c := range a.buf {
+			a.s.applyCommand(a.w, c)
+		}
+		a.inMulti = false
+		a.buf = a.buf[:0]
+	case "DISCARD":
+		a.inMulti = false
+		a.buf = a.buf[:0]
+	default:
+		if a.inMulti {
+			a.buf = append(a.buf, args)
+		} else {
+			a.s.applyCommand(a.w, args)
+		}
 	}
 }
 
@@ -291,13 +335,11 @@ func (s *Server) applyCommand(w *resp.Writer, args [][]byte) {
 	w.Flush()
 }
 
-// propagate persists a write to the AOF and streams it to all connected
-// replicas. Slow replicas whose buffers are full are skipped (they will fall
-// behind and can resync).
-func (s *Server) propagate(args [][]byte) {
-	// Rewrite relative TTLs to absolute deadlines so the AOF and replicas
-	// reconstruct the same expiry instant regardless of when they apply it.
-	args = propagationForm(args, time.Now())
+// shipRaw appends an already-formed command to the AOF and streams it to all
+// connected replicas. Slow replicas whose buffers are full are skipped (they
+// fall behind and can resync). Callers hold propMu so AOF order == replica
+// order == applied order.
+func (s *Server) shipRaw(args [][]byte) {
 	if s.aof != nil {
 		if err := s.aof.Append(args); err != nil {
 			// The write was already acked to the client; surface the durability
@@ -315,20 +357,31 @@ func (s *Server) propagate(args [][]byte) {
 	s.mu.Unlock()
 }
 
+// propagate ships a single client write, rewriting relative TTLs to absolute
+// deadlines so the AOF and replicas reconstruct the same expiry instant.
+func (s *Server) propagate(args [][]byte) {
+	s.shipRaw(propagationForm(args, time.Now()))
+}
+
 // forward ships an already-propagation-formed command (e.g. one received from a
-// master) to this server's AOF and downstream replicas without re-rewriting it.
-func (s *Server) forward(args [][]byte) {
-	if s.aof != nil {
-		if err := s.aof.Append(args); err != nil {
-			log.Printf("shardkv: AOF append failed (replicated write not persisted): %v", err)
-		}
+// master) downstream without re-rewriting it.
+func (s *Server) forward(args [][]byte) { s.shipRaw(args) }
+
+// propagateBatch ships a transaction's writes wrapped in MULTI ... EXEC so a
+// crash that truncates the AOF mid-transaction, or a replica, never applies a
+// partial transaction. A single-write batch needs no framing. Each command is
+// already in propagation (absolute-TTL) form. Caller holds propMu.
+func (s *Server) propagateBatch(cmds [][][]byte) {
+	if len(cmds) == 0 {
+		return
 	}
-	s.mu.Lock()
-	for rc := range s.replicas {
-		select {
-		case rc.ch <- args:
-		default:
-		}
+	if len(cmds) == 1 {
+		s.shipRaw(cmds[0])
+		return
 	}
-	s.mu.Unlock()
+	s.shipRaw([][]byte{[]byte("MULTI")})
+	for _, c := range cmds {
+		s.shipRaw(c)
+	}
+	s.shipRaw([][]byte{[]byte("EXEC")})
 }

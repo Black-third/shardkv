@@ -12,7 +12,7 @@ func TestRemovalHookOnJanitorExpiry(t *testing.T) {
 	s.clock = func() time.Time { return cur }
 
 	var removed []string
-	s.SetRemovalHook(func(k string) { removed = append(removed, k) })
+	s.SetRemovalHook(func(k string, _ bool) { removed = append(removed, k) })
 
 	s.Set("k", []byte("v"), 5*time.Second)
 	cur = cur.Add(10 * time.Second) // k is now expired
@@ -29,7 +29,7 @@ func TestRemovalHookOnLazyExpiry(t *testing.T) {
 	s.clock = func() time.Time { return cur }
 
 	var removed []string
-	s.SetRemovalHook(func(k string) { removed = append(removed, k) })
+	s.SetRemovalHook(func(k string, _ bool) { removed = append(removed, k) })
 
 	s.Set("k", []byte("v"), 5*time.Second)
 	cur = cur.Add(10 * time.Second)
@@ -44,7 +44,7 @@ func TestRemovalHookOnEviction(t *testing.T) {
 	s := New(1)
 	s.SetMaxKeys(2)
 	var removed []string
-	s.SetRemovalHook(func(k string) { removed = append(removed, k) })
+	s.SetRemovalHook(func(k string, _ bool) { removed = append(removed, k) })
 
 	for i := 0; i < 5; i++ {
 		s.Set("k"+strconv.Itoa(i), []byte("v"), 0)
