@@ -25,19 +25,22 @@ func newZSet() *zset {
 	}
 }
 
-func (z *zset) add(member string, score float64) bool {
+// add inserts or updates member. added is true only for a newly-created member
+// (for the ZADD reply count); changed is true if the set was modified at all
+// (new member or a different score) so callers can avoid propagating a no-op.
+func (z *zset) add(member string, score float64) (added, changed bool) {
 	if old, ok := z.dict[member]; ok {
 		if old == score {
-			return false
+			return false, false
 		}
 		z.sl.delete(member, old)
 		z.sl.insert(member, score)
 		z.dict[member] = score
-		return false
+		return false, true
 	}
 	z.dict[member] = score
 	z.sl.insert(member, score)
-	return true
+	return true, true
 }
 
 func (z *zset) remove(member string) bool {
@@ -52,9 +55,10 @@ func (z *zset) remove(member string) bool {
 
 // --- store-level sorted-set operations ---------------------------------------
 
-// ZAdd adds or updates member with the given score and returns the number of
-// newly-added members (updates of existing members count as 0).
-func (s *Store) ZAdd(key string, member string, score float64) (int, error) {
+// ZAdd adds or updates member with the given score. added is the number of
+// newly-created members (0 or 1); changed reports whether the set was modified
+// (false for a same-score no-op, so the caller can skip propagation).
+func (s *Store) ZAdd(key string, member string, score float64) (added int, changed bool, err error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -63,18 +67,18 @@ func (s *Store) ZAdd(key string, member string, score float64) (int, error) {
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
 	if live && e.kind != kindZSet {
-		return 0, ErrWrongType
+		return 0, false, ErrWrongType
 	}
 	if !live {
 		e = &entry{kind: kindZSet, zset: newZSet()}
 		sh.data[key] = e
 	}
-	added := 0
-	if e.zset.add(member, score) {
+	isNew, didChange := e.zset.add(member, score)
+	if isNew {
 		added = 1
 	}
 	s.touch(e, now)
-	return added, nil
+	return added, didChange, nil
 }
 
 // ZScore returns the score of member. ok is false if key or member is absent.
