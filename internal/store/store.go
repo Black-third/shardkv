@@ -337,6 +337,41 @@ func (s *Store) Keys() []string {
 	return keys
 }
 
+// Scan iterates the keyspace incrementally. Starting from cursor 0, it returns a
+// batch of live keys and the next cursor; a returned cursor of 0 means iteration
+// is complete. It walks whole shards at a time, accumulating until at least
+// count keys are gathered, which gives SCAN's guarantee that a key present for
+// the entire iteration is returned at least once, without ever blocking the
+// whole store. count <= 0 defaults to 10.
+func (s *Store) Scan(cursor uint64, count int) (keys []string, next uint64) {
+	if count <= 0 {
+		count = 10
+	}
+	now := s.clock()
+	idx := int(cursor)
+	if idx < 0 || idx >= len(s.shards) {
+		return nil, 0
+	}
+	for idx < len(s.shards) {
+		sh := s.shards[idx]
+		sh.mu.RLock()
+		for k, e := range sh.data {
+			if !e.expired(now) {
+				keys = append(keys, k)
+			}
+		}
+		sh.mu.RUnlock()
+		idx++
+		if len(keys) >= count {
+			break
+		}
+	}
+	if idx >= len(s.shards) {
+		return keys, 0 // wrapped: iteration complete
+	}
+	return keys, uint64(idx)
+}
+
 // FlushAll removes every key from every shard.
 func (s *Store) FlushAll() {
 	for _, sh := range s.shards {

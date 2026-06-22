@@ -228,8 +228,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			return
 		}
 		s.execute(sess, w, args)
-		if err := w.Flush(); err != nil {
-			return
+		// Coalesce replies for pipelined clients: only flush once the input is
+		// drained, so a batch of pipelined commands costs one write syscall.
+		if r.Buffered() == 0 {
+			if err := w.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -299,6 +303,24 @@ func (s *Server) propagate(args [][]byte) {
 			// The write was already acked to the client; surface the durability
 			// failure rather than swallowing it.
 			log.Printf("shardkv: AOF append failed (write not persisted): %v", err)
+		}
+	}
+	s.mu.Lock()
+	for rc := range s.replicas {
+		select {
+		case rc.ch <- args:
+		default:
+		}
+	}
+	s.mu.Unlock()
+}
+
+// forward ships an already-propagation-formed command (e.g. one received from a
+// master) to this server's AOF and downstream replicas without re-rewriting it.
+func (s *Server) forward(args [][]byte) {
+	if s.aof != nil {
+		if err := s.aof.Append(args); err != nil {
+			log.Printf("shardkv: AOF append failed (replicated write not persisted): %v", err)
 		}
 	}
 	s.mu.Lock()
