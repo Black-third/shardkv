@@ -1,13 +1,16 @@
-// Command shardkv runs the sharded in-memory key-value server.
+// Command shardkv runs the sharded in-memory data-structure server.
 //
 // Usage:
 //
 //	shardkv [-addr :6380] [-shards 256] [-sweep 1s]
+//	        [-aof dump.aof] [-aofsync everysec|always|no]
+//	        [-replicaof host:port]
 //
 // It speaks RESP, so any Redis client works:
 //
 //	redis-cli -p 6380 set foo bar
-//	redis-cli -p 6380 get foo
+//	redis-cli -p 6380 zadd board 100 alice 200 bob
+//	redis-cli -p 6380 zrange board 0 -1 withscores
 package main
 
 import (
@@ -19,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Black-third/shardkv/internal/aof"
 	"github.com/Black-third/shardkv/internal/server"
 	"github.com/Black-third/shardkv/internal/store"
 )
@@ -27,24 +31,62 @@ func main() {
 	addr := flag.String("addr", ":6380", "TCP address to listen on")
 	shards := flag.Int("shards", 256, "number of lock shards (rounded up to a power of two)")
 	sweep := flag.Duration("sweep", time.Second, "interval between active expiration sweeps")
+	aofPath := flag.String("aof", "", "append-only file path for persistence (empty disables it)")
+	aofSync := flag.String("aofsync", "everysec", "AOF sync policy: everysec|always|no")
+	replicaOf := flag.String("replicaof", "", "replicate from master at host:port (empty = master)")
 	flag.Parse()
 
 	st := store.New(*shards)
 
-	// Cancel on Ctrl-C / SIGTERM for a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go st.Janitor(ctx, *sweep)
 
 	srv := server.New(st)
+
+	// Persistence: replay an existing AOF, then attach the log for new writes.
+	if *aofPath != "" {
+		cmds, err := aof.Load(*aofPath)
+		if err != nil {
+			log.Fatalf("shardkv: loading AOF: %v", err)
+		}
+		if len(cmds) > 0 {
+			srv.ReplayCommands(cmds)
+			log.Printf("shardkv: replayed %d commands from %s", len(cmds), *aofPath)
+		}
+		logf, err := aof.Open(*aofPath, parseSyncPolicy(*aofSync))
+		if err != nil {
+			log.Fatalf("shardkv: opening AOF: %v", err)
+		}
+		defer logf.Close()
+		srv.AttachAOF(logf)
+	}
+
 	if err := srv.Listen(*addr); err != nil {
 		log.Fatalf("shardkv: %v", err)
 	}
-	log.Printf("shardkv listening on %s", srv.Addr())
+	log.Printf("shardkv %s listening on %s", "0.2.0", srv.Addr())
+
+	// Replication: start as a replica if requested.
+	if *replicaOf != "" {
+		srv.ReplicaOf(ctx, *replicaOf)
+		log.Printf("shardkv: replicating from %s", *replicaOf)
+	}
 
 	if err := srv.Serve(ctx); err != nil {
 		log.Fatalf("shardkv: %v", err)
 	}
 	log.Println("shardkv: shut down cleanly")
+}
+
+func parseSyncPolicy(s string) aof.SyncPolicy {
+	switch s {
+	case "always":
+		return aof.SyncAlways
+	case "no":
+		return aof.SyncNo
+	default:
+		return aof.SyncEverySec
+	}
 }
