@@ -3,6 +3,7 @@ package server
 import (
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Black-third/shardkv/internal/resp"
 )
@@ -119,9 +120,30 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 		return
 	}
 
+	// When propagation is active, hold propMu across the whole batch so the
+	// transaction applies and propagates as an atomic, totally-ordered unit
+	// (other writers cannot interleave), and ship it framed in MULTI...EXEC.
+	propagating := s.propagating.Load()
+	if propagating {
+		s.propMu.Lock()
+		defer s.propMu.Unlock()
+	}
+
 	w.WriteArrayHeader(len(queued))
+	var batch [][][]byte
 	for _, cmd := range queued {
-		s.dispatch(w, cmd)
+		name := strings.ToUpper(string(cmd[0]))
+		c := commandTable[name] // validated when queued
+		dirty := c.fn(s, w, cmd)
+		if c.write && dirty {
+			s.touchWatchers(cmd)
+			if propagating {
+				batch = append(batch, propagationForm(cmd, time.Now()))
+			}
+		}
+	}
+	if propagating {
+		s.propagateBatch(batch)
 	}
 }
 

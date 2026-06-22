@@ -104,11 +104,12 @@ type Store struct {
 	evicted atomic.Int64
 
 	// onRemoved, if set, is called after a key is removed by the store itself
-	// (TTL expiration or LRU eviction) rather than by a client command. It is
-	// always invoked without any shard lock held, so the callback may take
-	// other locks. The server uses it to propagate a DEL to the AOF/replicas and
-	// invalidate WATCHers. Set once before serving begins.
-	onRemoved func(key string)
+	// rather than by a client command: evicted is true for an LRU eviction and
+	// false for a TTL expiration. It is always invoked without any shard lock
+	// held, so the callback may take other locks. The server uses it to
+	// invalidate WATCHers (both cases) and to propagate a DEL for evictions
+	// (expired keys converge via their absolute deadlines). Set before serving.
+	onRemoved func(key string, evicted bool)
 }
 
 // New returns a Store with at least numShards shards, rounded up to the next
@@ -138,11 +139,11 @@ func (s *Store) SetMaxKeys(maxKeys int) {
 
 // SetRemovalHook registers a callback invoked when the store removes a key on
 // its own (expiration or eviction). It must be set before serving starts.
-func (s *Store) SetRemovalHook(fn func(key string)) { s.onRemoved = fn }
+func (s *Store) SetRemovalHook(fn func(key string, evicted bool)) { s.onRemoved = fn }
 
-func (s *Store) notifyRemoved(key string) {
+func (s *Store) notifyRemoved(key string, evicted bool) {
 	if s.onRemoved != nil {
-		s.onRemoved(key)
+		s.onRemoved(key, evicted)
 	}
 }
 
@@ -227,7 +228,7 @@ func (s *Store) evictOneLRU() bool {
 		delete(sh.data, victim)
 		sh.mu.Unlock()
 		s.evicted.Add(1)
-		s.notifyRemoved(victim) // outside the shard lock
+		s.notifyRemoved(victim, true) // eviction: outside the shard lock
 		return true
 	}
 	return false
@@ -472,7 +473,7 @@ func (s *Store) dropIfExpired(sh *shard, key string) {
 	}
 	sh.mu.Unlock()
 	if removed {
-		s.notifyRemoved(key)
+		s.notifyRemoved(key, false) // lazy expiration
 	}
 }
 
@@ -509,6 +510,6 @@ func (s *Store) sweep() {
 		sh.mu.Unlock()
 	}
 	for _, k := range removed {
-		s.notifyRemoved(k) // outside the shard lock
+		s.notifyRemoved(k, false) // janitor expiration: outside the shard lock
 	}
 }

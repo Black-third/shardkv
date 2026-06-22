@@ -124,15 +124,17 @@ func (s *Server) replicationLoop(ctx context.Context, addr string) {
 		hw.Flush()
 
 		r := resp.NewReader(conn)
+		applier := &txApplier{s: s, w: discard}
 		for {
 			args, err := r.ReadCommand()
 			if err != nil {
 				break
 			}
-			s.applyCommand(discard, args)
-			// Re-propagate to our own replicas / AOF so chained replicas and a
-			// replica's own append-only file stay in sync. The stream is already
-			// in absolute/effect form, so it is forwarded verbatim.
+			// Apply with MULTI/EXEC awareness (atomic transactions), and forward
+			// the raw stream — including the MULTI/EXEC markers — to our own
+			// replicas/AOF so chained replicas and replica-side persistence keep
+			// the same framing. The stream is already absolute/effect form.
+			applier.feed(args)
 			if s.propagating.Load() {
 				s.propMu.Lock()
 				s.forward(args)
