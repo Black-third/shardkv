@@ -30,6 +30,47 @@ func (c *txConn) cmd(s string) string {
 
 func (c *txConn) close() { c.conn.Close() }
 
+func TestMoreStringAndKeyCommands(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	cases := []struct{ cmd, want string }{
+		{"SETNX k v1", ":1"},
+		{"SETNX k v2", ":0"}, // already exists
+		{"GET k", "v1"},
+		{"GETSET k v2", "v1"},
+		{"GET k", "v2"},
+		{"APPEND k !", ":3"},
+		{"GET k", "v2!"},
+		{"STRLEN k", ":3"},
+		{"INCRBY c 5", ":5"},
+		{"DECRBY c 2", ":3"},
+		{"GETDEL k", "v2!"},
+		{"EXISTS k", ":0"},
+		// expiry family
+		{"SET p hello", "+OK"},
+		{"EXPIRE p 100", ":1"},
+		{"PERSIST p", ":1"},
+		{"PERSIST p", ":0"}, // nothing left to persist
+		{"TTL p", ":-1"},
+		{"PEXPIREAT p 99999999999999", ":1"},
+		{"PERSIST p", ":1"},
+		// rename
+		{"SET a 1", "+OK"},
+		{"RENAME a b", "+OK"},
+		{"GET b", "1"},
+		{"EXISTS a", ":0"},
+		{"RENAME missing x", "-ERR no such key"},
+	}
+	for _, tc := range cases {
+		if got := c.cmd(tc.cmd); got != tc.want {
+			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
+		}
+	}
+}
+
 func TestTransactionExec(t *testing.T) {
 	addr, stop := startTestServer(t)
 	defer stop()

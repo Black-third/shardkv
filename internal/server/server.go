@@ -291,6 +291,9 @@ func (s *Server) applyCommand(w *resp.Writer, args [][]byte) {
 // replicas. Slow replicas whose buffers are full are skipped (they will fall
 // behind and can resync).
 func (s *Server) propagate(args [][]byte) {
+	// Rewrite relative TTLs to absolute deadlines so the AOF and replicas
+	// reconstruct the same expiry instant regardless of when they apply it.
+	args = propagationForm(args, time.Now())
 	if s.aof != nil {
 		if err := s.aof.Append(args); err != nil {
 			// The write was already acked to the client; surface the durability
