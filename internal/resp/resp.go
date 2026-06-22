@@ -161,3 +161,18 @@ func (w *Writer) WriteArrayHeader(n int) error {
 	_, err := w.w.WriteString("\r\n")
 	return err
 }
+
+// WriteCommand encodes args as a client command: a RESP array of bulk strings.
+// This is the form ReadCommand consumes, so it is used to persist commands to
+// the AOF and to stream them to replicas.
+func (w *Writer) WriteCommand(args [][]byte) error {
+	if err := w.WriteArrayHeader(len(args)); err != nil {
+		return err
+	}
+	for _, a := range args {
+		if err := w.WriteBulk(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -1,5 +1,6 @@
-// Package store implements a sharded, concurrency-safe in-memory key-value
-// store with per-key TTL expiration.
+// Package store implements a sharded, concurrency-safe in-memory data store
+// supporting Redis-style data types: strings, lists, hashes, sets, and sorted
+// sets.
 //
 // The keyspace is partitioned across a fixed number of shards, each guarded by
 // its own sync.RWMutex. Because independent keys usually hash to different
@@ -16,12 +17,53 @@ import (
 	"time"
 )
 
-// ErrNotInteger is returned by Incr when the stored value is not a base-10
-// integer.
-var ErrNotInteger = errors.New("value is not an integer")
+// Sentinel errors returned by type-specific operations.
+var (
+	// ErrNotInteger is returned by Incr when a string value is not a base-10 int.
+	ErrNotInteger = errors.New("value is not an integer")
+	// ErrWrongType is returned when an operation is applied to a key holding a
+	// value of the wrong data type.
+	ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
+)
 
+type kind uint8
+
+const (
+	kindString kind = iota
+	kindList
+	kindHash
+	kindSet
+	kindZSet
+)
+
+func (k kind) String() string {
+	switch k {
+	case kindString:
+		return "string"
+	case kindList:
+		return "list"
+	case kindHash:
+		return "hash"
+	case kindSet:
+		return "set"
+	case kindZSet:
+		return "zset"
+	default:
+		return "none"
+	}
+}
+
+// entry is a single stored value. Exactly one of the type fields is populated
+// according to kind. The list/dict/set/zset fields are reference types, so a
+// handler can fetch the entry once and mutate the referenced structure in place
+// without re-storing it.
 type entry struct {
-	value    []byte
+	kind     kind
+	str      []byte
+	list     *deque
+	dict     map[string][]byte
+	set      map[string]struct{}
+	zset     *zset
 	expireAt time.Time // zero means the key never expires
 }
 
@@ -34,8 +76,7 @@ type shard struct {
 	data map[string]entry
 }
 
-// Store is a sharded key-value store safe for concurrent use by many
-// goroutines.
+// Store is a sharded data store safe for concurrent use by many goroutines.
 type Store struct {
 	shards []*shard
 	mask   uint64           // numShards-1; numShards is always a power of two
@@ -87,57 +128,18 @@ func (s *Store) getShard(key string) *shard {
 	return s.shards[fnv1a(key)&s.mask]
 }
 
-// Get returns a copy of the value stored at key. ok is false if the key is
-// missing or has expired. Expired keys encountered here are removed lazily.
-func (s *Store) Get(key string) (value []byte, ok bool) {
-	sh := s.getShard(key)
-	now := s.clock()
-
-	sh.mu.RLock()
-	e, found := sh.data[key]
-	sh.mu.RUnlock()
-
-	if !found {
-		return nil, false
-	}
-	if !e.expired(now) {
-		// Return a copy so callers cannot mutate the stored bytes.
-		out := make([]byte, len(e.value))
-		copy(out, e.value)
-		return out, true
-	}
-
-	// Expired: delete under the write lock, re-checking in case another
-	// goroutine refreshed the key in the meantime.
-	sh.mu.Lock()
-	if e2, ok := sh.data[key]; ok && e2.expired(s.clock()) {
-		delete(sh.data, key)
-	}
-	sh.mu.Unlock()
-	return nil, false
+func copyBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }
 
-// Set stores value at key. A ttl of zero means the key never expires. The
-// value is copied so the caller's buffer can be reused safely.
-func (s *Store) Set(key string, value []byte, ttl time.Duration) {
-	var expireAt time.Time
-	if ttl > 0 {
-		expireAt = s.clock().Add(ttl)
-	}
-	v := make([]byte, len(value))
-	copy(v, value)
-
-	sh := s.getShard(key)
-	sh.mu.Lock()
-	sh.data[key] = entry{value: v, expireAt: expireAt}
-	sh.mu.Unlock()
-}
+// --- generic key operations (any type) ---------------------------------------
 
 // Del removes key and reports whether a live key was actually removed.
 func (s *Store) Del(key string) bool {
 	sh := s.getShard(key)
 	now := s.clock()
-
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, found := sh.data[key]
@@ -145,57 +147,38 @@ func (s *Store) Del(key string) bool {
 		return false
 	}
 	delete(sh.data, key)
-	return !e.expired(now) // report true only if it had not already expired
+	return !e.expired(now)
 }
 
 // Exists reports whether key is present and unexpired.
 func (s *Store) Exists(key string) bool {
 	sh := s.getShard(key)
 	now := s.clock()
-
 	sh.mu.RLock()
 	e, found := sh.data[key]
 	sh.mu.RUnlock()
 	return found && !e.expired(now)
 }
 
-// Incr atomically adds delta to the integer value at key and returns the
-// result. A missing or expired key is treated as 0. Any existing TTL is
-// preserved. Returns ErrNotInteger if the current value is not a base-10 int.
-func (s *Store) Incr(key string, delta int64) (int64, error) {
+// Type returns the data-type name of key (string/list/hash/set/zset) or
+// ("none", false) if the key is missing or expired.
+func (s *Store) Type(key string) (string, bool) {
 	sh := s.getShard(key)
 	now := s.clock()
-
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
+	sh.mu.RLock()
 	e, found := sh.data[key]
-	live := found && !e.expired(now)
-
-	var n int64
-	if live {
-		parsed, err := strconv.ParseInt(string(e.value), 10, 64)
-		if err != nil {
-			return 0, ErrNotInteger
-		}
-		n = parsed
+	sh.mu.RUnlock()
+	if !found || e.expired(now) {
+		return "none", false
 	}
-	n += delta
-
-	expireAt := time.Time{}
-	if live {
-		expireAt = e.expireAt // keep the original deadline
-	}
-	sh.data[key] = entry{value: []byte(strconv.FormatInt(n, 10)), expireAt: expireAt}
-	return n, nil
+	return e.kind.String(), true
 }
 
-// Expire sets a new TTL on an existing live key. It reports false if the key is
+// Expire sets a new TTL on an existing live key. Reports false if the key is
 // missing or already expired.
 func (s *Store) Expire(key string, ttl time.Duration) bool {
 	sh := s.getShard(key)
 	now := s.clock()
-
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, found := sh.data[key]
@@ -212,11 +195,9 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 func (s *Store) TTL(key string) (remaining time.Duration, hasTTL, ok bool) {
 	sh := s.getShard(key)
 	now := s.clock()
-
 	sh.mu.RLock()
 	e, found := sh.data[key]
 	sh.mu.RUnlock()
-
 	if !found || e.expired(now) {
 		return 0, false, false
 	}
@@ -243,8 +224,7 @@ func (s *Store) Len() int {
 	return total
 }
 
-// Keys returns all live keys. Like Len it scans every shard and is meant for
-// diagnostics rather than the hot path.
+// Keys returns all live keys. Like Len it scans every shard.
 func (s *Store) Keys() []string {
 	now := s.clock()
 	var keys []string
@@ -268,6 +248,87 @@ func (s *Store) FlushAll() {
 		sh.mu.Unlock()
 	}
 }
+
+// --- string operations -------------------------------------------------------
+
+// Get returns a copy of the string value at key. ok is false if the key is
+// missing, expired, or holds a non-string type. Expired keys are removed
+// lazily.
+func (s *Store) Get(key string) (value []byte, ok bool) {
+	sh := s.getShard(key)
+	now := s.clock()
+
+	sh.mu.RLock()
+	e, found := sh.data[key]
+	sh.mu.RUnlock()
+
+	if !found {
+		return nil, false
+	}
+	if e.expired(now) {
+		s.dropIfExpired(sh, key)
+		return nil, false
+	}
+	if e.kind != kindString {
+		return nil, false
+	}
+	return copyBytes(e.str), true
+}
+
+// Set stores a string value at key, replacing any existing value of any type. A
+// ttl of zero means the key never expires.
+func (s *Store) Set(key string, value []byte, ttl time.Duration) {
+	var expireAt time.Time
+	if ttl > 0 {
+		expireAt = s.clock().Add(ttl)
+	}
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	sh.data[key] = entry{kind: kindString, str: copyBytes(value), expireAt: expireAt}
+	sh.mu.Unlock()
+}
+
+// Incr atomically adds delta to the integer string at key and returns the
+// result. A missing/expired key is treated as 0; any existing TTL is preserved.
+// Returns ErrWrongType if the key holds a non-string, ErrNotInteger if the
+// string is not a base-10 integer.
+func (s *Store) Incr(key string, delta int64) (int64, error) {
+	sh := s.getShard(key)
+	now := s.clock()
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, found := sh.data[key]
+	live := found && !e.expired(now)
+	if live && e.kind != kindString {
+		return 0, ErrWrongType
+	}
+
+	var n int64
+	expireAt := time.Time{}
+	if live {
+		parsed, err := strconv.ParseInt(string(e.str), 10, 64)
+		if err != nil {
+			return 0, ErrNotInteger
+		}
+		n = parsed
+		expireAt = e.expireAt
+	}
+	n += delta
+	sh.data[key] = entry{kind: kindString, str: []byte(strconv.FormatInt(n, 10)), expireAt: expireAt}
+	return n, nil
+}
+
+func (s *Store) dropIfExpired(sh *shard, key string) {
+	sh.mu.Lock()
+	if e, ok := sh.data[key]; ok && e.expired(s.clock()) {
+		delete(sh.data, key)
+	}
+	sh.mu.Unlock()
+}
+
+// --- background expiration ----------------------------------------------------
 
 // Janitor periodically reclaims memory held by expired keys until ctx is
 // canceled. Lazy expiration on read already keeps results correct; the janitor
