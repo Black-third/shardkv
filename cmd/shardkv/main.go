@@ -43,8 +43,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go st.Janitor(ctx, *sweep)
-
+	// Create the server (which registers the store's removal hook) before
+	// starting the janitor that may invoke it.
 	srv := server.New(st)
 
 	// Persistence: replay an existing AOF, then attach the log for new writes.
@@ -64,6 +64,9 @@ func main() {
 		defer logf.Close()
 		srv.AttachAOF(logf)
 	}
+
+	// Start background expiration/eviction now that the removal hook is wired.
+	go st.Janitor(ctx, *sweep)
 
 	if err := srv.Listen(*addr); err != nil {
 		log.Fatalf("shardkv: %v", err)
