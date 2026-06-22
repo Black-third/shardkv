@@ -34,6 +34,12 @@ type Reader struct {
 
 func NewReader(r io.Reader) *Reader { return &Reader{r: bufio.NewReader(r)} }
 
+// Buffered reports how many bytes are already buffered and available without a
+// read syscall. The server uses it to coalesce replies for a pipelined client:
+// it keeps processing while more input is buffered and flushes once the buffer
+// drains.
+func (r *Reader) Buffered() int { return r.r.Buffered() }
+
 // ReadCommand reads one command and returns its arguments. The first element is
 // the command name. It returns io.EOF when the client disconnects.
 func (r *Reader) ReadCommand() ([][]byte, error) {

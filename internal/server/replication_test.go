@@ -42,6 +42,28 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for: %s", what)
 }
 
+func TestReplicaHandlesUnreachableMaster(t *testing.T) {
+	replica, addr, stop := startServer(t, store.New(8))
+	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replica.ReplicaOf(ctx, "127.0.0.1:1") // nothing listening here
+
+	c := dialTx(t, addr)
+	defer c.close()
+
+	// The replica must stay alive and read-only while it retries the master.
+	waitFor(t, "replica role", func() bool {
+		return contains(c.cmd("INFO"), "role:replica")
+	})
+	if got := c.cmd("GET missing"); got != "(nil)" {
+		t.Fatalf("replica GET = %q; want (nil)", got)
+	}
+	if got := c.cmd("SET x y"); !contains(got, "READONLY") {
+		t.Fatalf("replica SET = %q; want READONLY", got)
+	}
+}
+
 func TestReplication(t *testing.T) {
 	// Master with some pre-existing data (exercises the snapshot path).
 	_, masterAddr, stopM := startServer(t, store.New(8))

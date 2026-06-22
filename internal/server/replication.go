@@ -130,6 +130,14 @@ func (s *Server) replicationLoop(ctx context.Context, addr string) {
 				break
 			}
 			s.applyCommand(discard, args)
+			// Re-propagate to our own replicas / AOF so chained replicas and a
+			// replica's own append-only file stay in sync. The stream is already
+			// in absolute/effect form, so it is forwarded verbatim.
+			if s.propagating.Load() {
+				s.propMu.Lock()
+				s.forward(args)
+				s.propMu.Unlock()
+			}
 		}
 
 		close(connDone)
