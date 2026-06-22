@@ -24,6 +24,23 @@ func TestReadCommandArray(t *testing.T) {
 	}
 }
 
+func TestReadCommandRejectsHugeHeaders(t *testing.T) {
+	// These previously caused an overflow panic (bulk length near MaxInt64) or a
+	// multi-GB allocation. They must now be rejected as protocol errors without
+	// allocating.
+	cases := []string{
+		"*1\r\n$9223372036854775806\r\n", // length+2 overflows to negative
+		"*2000000000\r\n",                // ~48GB of slice headers
+		"*1\r\n$2000000000\r\n",          // ~2GB bulk
+	}
+	for _, in := range cases {
+		_, err := NewReader(strings.NewReader(in)).ReadCommand()
+		if err != ErrProtocol {
+			t.Errorf("ReadCommand(%q) err = %v; want ErrProtocol", in, err)
+		}
+	}
+}
+
 func TestReadCommandInline(t *testing.T) {
 	args, err := NewReader(strings.NewReader("PING hello\r\n")).ReadCommand()
 	if err != nil {

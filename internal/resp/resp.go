@@ -17,6 +17,16 @@ import (
 // ErrProtocol indicates a malformed client request.
 var ErrProtocol = errors.New("resp: protocol error")
 
+// Protocol limits matching Redis's defaults, enforced before any allocation so a
+// tiny crafted header (e.g. "$9223372036854775806\r\n" or "*2000000000\r\n")
+// cannot drive a huge/overflowing allocation and OOM or panic the server.
+const (
+	// MaxMultiBulk caps the number of elements in a command array.
+	MaxMultiBulk = 1 << 20 // 1,048,576
+	// MaxBulkLen caps the byte length of a single bulk string (512 MiB).
+	MaxBulkLen = 512 << 20
+)
+
 // Reader parses client commands from a connection.
 type Reader struct {
 	r *bufio.Reader
@@ -40,10 +50,12 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 	}
 
 	n, err := strconv.Atoi(string(line[1:]))
-	if err != nil || n < 0 {
+	if err != nil || n < 0 || n > MaxMultiBulk {
 		return nil, ErrProtocol
 	}
-	args := make([][]byte, 0, n)
+	// Cap the initial capacity so a large-but-undelivered count can't force a
+	// big up-front allocation; append grows it as real elements arrive.
+	args := make([][]byte, 0, min(n, 64))
 	for i := 0; i < n; i++ {
 		hdr, err := r.readLine()
 		if err != nil {
@@ -53,7 +65,7 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 			return nil, ErrProtocol
 		}
 		length, err := strconv.Atoi(string(hdr[1:]))
-		if err != nil || length < 0 {
+		if err != nil || length < 0 || length > MaxBulkLen {
 			return nil, ErrProtocol
 		}
 		buf := make([]byte, length+2) // payload + trailing CRLF

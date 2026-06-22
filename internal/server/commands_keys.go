@@ -59,7 +59,8 @@ func cmdTTL(s *Server, w *resp.Writer, args [][]byte) bool {
 	case !hasTTL:
 		w.WriteInt(-1) // exists, no expiry
 	default:
-		w.WriteInt(int64(d / time.Second))
+		// Round to the nearest second, as Redis does, rather than truncating.
+		w.WriteInt(int64((d + 500*time.Millisecond) / time.Second))
 	}
 	return false
 }

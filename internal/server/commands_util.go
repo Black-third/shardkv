@@ -14,6 +14,8 @@ func writeStoreErr(w *resp.Writer, err error) {
 		w.WriteError(err.Error())
 	case store.ErrNotInteger:
 		w.WriteError("ERR value is not an integer or out of range")
+	case store.ErrOverflow:
+		w.WriteError("ERR increment or decrement would overflow")
 	default:
 		w.WriteError("ERR " + err.Error())
 	}

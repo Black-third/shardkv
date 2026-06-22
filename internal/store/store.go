@@ -31,6 +31,8 @@ var (
 	// ErrWrongType is returned when an operation is applied to a key holding a
 	// value of the wrong data type.
 	ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
+	// ErrOverflow is returned by Incr when the result would exceed int64 range.
+	ErrOverflow = errors.New("increment or decrement would overflow")
 )
 
 type kind uint8
@@ -82,7 +84,7 @@ func (e *entry) expired(now time.Time) bool {
 // eviction is disabled, so the default (unbounded) configuration keeps the read
 // path free of the extra atomic write.
 func (s *Store) touch(e *entry, now time.Time) {
-	if s.maxKeys > 0 {
+	if s.maxKeys.Load() > 0 {
 		e.atime.Store(now.UnixNano())
 	}
 }
@@ -98,7 +100,7 @@ type Store struct {
 	mask   uint64           // numShards-1; numShards is always a power of two
 	clock  func() time.Time // injectable so tests can control time
 
-	maxKeys int // 0 = unbounded; else the approximate live-key cap (global)
+	maxKeys atomic.Int64 // 0 = unbounded; else the approximate live-key cap (global)
 	evicted atomic.Int64
 }
 
@@ -124,7 +126,7 @@ func (s *Store) SetMaxKeys(maxKeys int) {
 	if maxKeys < 0 {
 		maxKeys = 0
 	}
-	s.maxKeys = maxKeys
+	s.maxKeys.Store(int64(maxKeys))
 }
 
 // Evicted reports how many keys have been removed by the eviction policy.
@@ -170,10 +172,11 @@ func copyBytes(b []byte) []byte {
 // It is invoked by the janitor; it locks one shard at a time (never two at
 // once), so it composes safely with concurrent operations.
 func (s *Store) EvictToLimit() {
-	if s.maxKeys <= 0 {
+	maxKeys := int(s.maxKeys.Load())
+	if maxKeys <= 0 {
 		return
 	}
-	excess := s.Len() - s.maxKeys
+	excess := s.Len() - maxKeys
 	for i := 0; i < excess; i++ {
 		if !s.evictOneLRU() {
 			break
@@ -395,6 +398,10 @@ func (s *Store) Incr(key string, delta int64) (int64, error) {
 		}
 		n = parsed
 		expireAt = e.expireAt
+	}
+	// Reject signed overflow rather than silently wrapping (Redis semantics).
+	if (delta > 0 && n > math.MaxInt64-delta) || (delta < 0 && n < math.MinInt64-delta) {
+		return 0, ErrOverflow
 	}
 	n += delta
 	ne := &entry{kind: kindString, str: []byte(strconv.FormatInt(n, 10)), expireAt: expireAt}

@@ -22,7 +22,7 @@ func cmdSet(s *Server, w *resp.Writer, args [][]byte) bool {
 	case 3:
 	case 5:
 		n, ok := parseInt(args[4])
-		if !ok || n < 0 {
+		if !ok || n <= 0 { // Redis rejects a non-positive expire on SET
 			w.WriteError("ERR invalid expire time in 'set' command")
 			return false
 		}
