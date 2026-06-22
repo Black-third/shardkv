@@ -3,11 +3,9 @@ package store
 import "strconv"
 
 // Dump returns a sequence of write commands that, when replayed against an empty
-// store, reconstruct the current dataset. It is used to seed a replica and to
-// compact the append-only file.
-//
-// TTLs are not currently captured in the snapshot; replayed keys are persistent.
-// (Live expirations still propagate as DEL via the command stream.)
+// store, reconstruct the current dataset, including TTLs (emitted as a trailing
+// PEXPIREAT per key). It is used to seed a replica and to compact the
+// append-only file.
 func (s *Store) Dump() [][][]byte {
 	now := s.clock()
 	var cmds [][][]byte
@@ -53,6 +51,12 @@ func (s *Store) Dump() [][][]byte {
 					node = node.next[0].forward
 				}
 				cmds = append(cmds, cmd)
+			}
+			// Preserve the TTL as an absolute deadline so a rewrite/replica seed
+			// does not silently make a volatile key permanent.
+			if !e.expireAt.IsZero() {
+				ms := strconv.FormatInt(e.expireAt.UnixMilli(), 10)
+				cmds = append(cmds, [][]byte{[]byte("PEXPIREAT"), key, []byte(ms)})
 			}
 		}
 		sh.mu.RUnlock()

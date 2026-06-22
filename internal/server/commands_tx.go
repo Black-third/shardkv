@@ -202,6 +202,11 @@ func affectedKeys(name string, args [][]byte) []string {
 			ks = append(ks, string(k))
 		}
 		return ks
+	case "RENAME":
+		if len(args) == 3 {
+			return []string{string(args[1]), string(args[2])}
+		}
+		return nil
 	default:
 		if len(args) >= 2 {
 			return []string{string(args[1])}
