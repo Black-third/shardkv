@@ -34,6 +34,39 @@ func (s *Store) SetNX(key string, val []byte) bool {
 	return true
 }
 
+// MSetNX sets every pair only if *none* of the keys already exists, reporting whether
+// it did. Either all of them are written or none is.
+//
+// The all-or-nothing guarantee is the whole command, so the existence check and the
+// writes have to happen under one acquisition of every shard involved -- checking first
+// and writing after would let a concurrent SET land in between and turn "none existed"
+// into "one did" without the caller ever being told. lockKeys orders the shards by index
+// so two MSETNX calls with the keys in opposite orders cannot deadlock, and it handles
+// two keys that hash to the same shard.
+func (s *Store) MSetNX(pairs [][2][]byte) bool {
+	keys := make([]string, len(pairs))
+	for i, p := range pairs {
+		keys[i] = string(p[0])
+	}
+	unlock := s.lockKeys(keys...)
+	defer unlock()
+
+	now := s.clock()
+	for _, key := range keys {
+		sh := s.getShard(key)
+		if e, found := sh.data[key]; found && !e.expired(now) {
+			return false
+		}
+	}
+	for _, p := range pairs {
+		key := string(p[0])
+		ne := &entry{kind: kindString, str: copyBytes(p[1])}
+		s.touch(ne, now)
+		s.getShard(key).data[key] = ne
+	}
+	return true
+}
+
 // GetSet sets key to val and returns the previous string value (clearing any
 // TTL, as Redis does). old is invalid when oldOK is false.
 func (s *Store) GetSet(key string, val []byte) (old []byte, oldOK bool, err error) {
@@ -93,7 +126,9 @@ func (s *Store) Append(key string, suffix []byte) (int, error) {
 	nv := make([]byte, 0, len(base)+len(suffix))
 	nv = append(nv, base...)
 	nv = append(nv, suffix...)
-	ne := &entry{kind: kindString, str: nv, expireAt: expireAt}
+	// An appended value is a plain buffer from here on, whatever its bytes read as: see
+	// entry.rawString and OBJECT ENCODING.
+	ne := &entry{kind: kindString, str: nv, rawString: true, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return len(nv), nil

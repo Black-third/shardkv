@@ -97,15 +97,28 @@ func (k kind) String() string {
 // according to kind. Entries are always referenced by pointer and never copied
 // (atime is an atomic that must not be copied).
 type entry struct {
-	kind     kind
-	str      []byte
-	list     *deque
-	dict     map[string][]byte
-	set      map[string]struct{}
-	zset     *zset
-	stream   *stream
-	expireAt time.Time    // zero means the key never expires
-	atime    atomic.Int64 // last-access time (unix nanos) for LRU eviction
+	kind kind
+	str  []byte
+	// rawString marks a string whose bytes were produced by appending to or writing
+	// into an existing value (APPEND, SETRANGE, GETRANGE's siblings) rather than by
+	// storing a whole value.
+	//
+	// It exists so OBJECT ENCODING can report the *representation* rather than
+	// re-deriving an answer from the content. Redis tries an integer encoding when a
+	// value is stored whole and does not re-encode one it has appended to, so
+	// `SET k 1` then `APPEND k 2` leaves a value that reads "12" but is still a plain
+	// buffer: Redis answers `int` then `raw`. Deriving the encoding from the content
+	// instead answers `int` both times, which is wrong in a way that matters --
+	// `assert_encoding` runs throughout Redis's own test suite, and memory-analysis
+	// tools read the field to decide how a value is stored.
+	rawString bool
+	list      *deque
+	dict      map[string][]byte
+	set       map[string]struct{}
+	zset      *zset
+	stream    *stream
+	expireAt  time.Time    // zero means the key never expires
+	atime     atomic.Int64 // last-access time (unix nanos) for LRU eviction
 }
 
 func (e *entry) expired(now time.Time) bool {
@@ -134,6 +147,10 @@ type Store struct {
 
 	maxKeys atomic.Int64 // 0 = unbounded; else the approximate live-key cap (global)
 	evicted atomic.Int64
+
+	// activeExpire gates the janitor's expiry sweep. It defaults to on; see
+	// SetActiveExpire for why anything would turn it off.
+	activeExpire atomic.Bool
 
 	// keyspaceHits and keyspaceMisses count how many key lookups made by *read* paths
 	// found a live value and how many did not. They back INFO's keyspace_hits and
@@ -166,6 +183,7 @@ func New(numShards int) *Store {
 	for i := range s.shards {
 		s.shards[i] = &shard{data: make(map[string]*entry)}
 	}
+	s.activeExpire.Store(true)
 	return s
 }
 
@@ -714,11 +732,27 @@ func (s *Store) Janitor(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.sweep()
+			if s.activeExpire.Load() {
+				s.sweep()
+			}
 			s.EvictToLimit()
 		}
 	}
 }
+
+// SetActiveExpire turns the janitor's expiry sweep on or off. Eviction is
+// unaffected.
+//
+// It exists for testing lazy expiration deterministically: with the sweep running, a
+// key that has passed its deadline may be reclaimed by the background pass before a
+// test can observe that a *read* is what removed it, so the two mechanisms cannot be
+// told apart. Redis exposes the same switch as DEBUG SET-ACTIVE-EXPIRE, and its test
+// suite relies on it. Turning it off never makes a stale value visible: correctness
+// comes from the lazy check on every read, and the sweep only reclaims memory.
+func (s *Store) SetActiveExpire(on bool) { s.activeExpire.Store(on) }
+
+// ActiveExpire reports whether the janitor's sweep is enabled.
+func (s *Store) ActiveExpire() bool { return s.activeExpire.Load() }
 
 func (s *Store) sweep() {
 	now := s.clock()

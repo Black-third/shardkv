@@ -37,6 +37,7 @@ const RedisCompatVersion = "7.4.0"
 func init() {
 	register("PING", -1, false, cmdPing)
 	register("ECHO", 2, false, cmdEcho)
+	register("TIME", 1, false, cmdTime)
 	register("INFO", -1, false, cmdInfo)
 	register("SCRIPT", -2, false, cmdScript)
 	register("FUNCTION", -2, false, cmdFunction)
@@ -57,6 +58,20 @@ func cmdPing(s *Server, w *resp.Writer, args [][]byte) bool {
 	} else {
 		w.WriteSimple("PONG")
 	}
+	return false
+}
+
+// cmdTime returns the server's clock as a two-element array of unix seconds and the
+// microseconds within that second, as Redis does.
+//
+// It reads the store's clock rather than time.Now, like every other server-side "now":
+// under an injected clock a test that compares TIME against a TTL it just set has to see
+// one timeline, not two.
+func cmdTime(s *Server, w *resp.Writer, args [][]byte) bool {
+	now := s.store.Now()
+	w.WriteArrayHeader(2)
+	w.WriteBulk([]byte(strconv.FormatInt(now.Unix(), 10)))
+	w.WriteBulk([]byte(strconv.FormatInt(int64(now.Nanosecond()/1000), 10)))
 	return false
 }
 

@@ -49,7 +49,7 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 - **Six data types** — strings, lists, hashes, sets, **sorted sets backed by a
   hand-written skip list** with O(log n) insertion, deletion and rank queries, and
-  **streams** with consumer groups. 196 commands, including the set algebra
+  **streams** with consumer groups. 198 commands, including the set algebra
   (`SINTER`/`SUNION`/`SDIFF` and their `*STORE` forms), score and rank range
   queries, the positional list operations, and the cursor iterators for every
   collection. Lexicographic *ranges* (`ZRANGEBYLEX` and its family) and the sorted-set
@@ -242,7 +242,7 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 ## Commands
 
-193 commands, with Redis's replies, error strings, and edge-case behaviour
+198 commands, with Redis's replies, error strings, and edge-case behaviour
 (missing keys, empty collections, negative indexes, wrong-type errors). Every
 reply is available in both RESP2 and RESP3; where the two differ, the RESP3 shape
 is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
@@ -270,6 +270,70 @@ is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
 | Replication | `REPLICAOF host port\|NO ONE` · `SLAVEOF` · `PSYNC replid offset` · `REPLCONF listening-port\|ACK` · `WAIT numreplicas timeout` |
 | Cluster | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` · `CLUSTER ADDSLOTS slot...\|DELSLOTS\|ADDSLOTSRANGE start end...\|DELSLOTSRANGE` · `CLUSTER SETSLOT slot IMPORTING\|MIGRATING\|STABLE\|NODE id` · `CLUSTER COUNTKEYSINSLOT slot\|GETKEYSINSLOT slot count` · `CLUSTER MEET ip port [bus-port]\|FORGET id\|REPLICATE id\|RESET [HARD\|SOFT]` · `ASKING` · `READONLY` · `READWRITE` |
 | Migration | `DUMP key` · `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]` · `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH pw\|AUTH2 user pw] [KEYS key...]` |
+
+## Install
+
+Five ways in. Pick by what you already have: a Go toolchain, `brew`, Docker, or nothing
+but `curl`.
+
+**From source, with Go.** The module has no third-party dependencies, so this reaches the
+network for the toolchain's module proxy and nothing else — there is no dependency tree to
+audit:
+
+```bash
+go install github.com/Black-third/shardkv/cmd/shardkv@latest
+shardkv -addr :6380
+```
+
+**A release binary.** Cross-compiled for linux and darwin on amd64 and arm64, with a
+`checksums.txt` covering every archive. Verify it — the whole point of publishing that file
+is that somebody checks it:
+
+```bash
+VERSION=0.3.0 OS=darwin ARCH=arm64
+BASE="https://github.com/Black-third/shardkv/releases/download/v$VERSION"
+curl -fsSLO "$BASE/shardkv_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "$BASE/checksums.txt"
+shasum -a 256 --check --ignore-missing checksums.txt   # sha256sum -c on linux
+tar xzf "shardkv_${VERSION}_${OS}_${ARCH}.tar.gz"
+./shardkv -addr :6380
+```
+
+**Homebrew**, from the tap:
+
+```bash
+brew tap black-third/tap
+brew install shardkv
+brew install --HEAD shardkv     # or build the branch from source
+```
+
+**The container image**, multi-arch (`linux/amd64` and `linux/arm64`), built from the
+`Dockerfile` in this repository and published with OCI annotations, build provenance and an
+SBOM:
+
+```bash
+docker run --rm -p 6380:6380 -v shardkv-data:/data ghcr.io/black-third/shardkv:latest
+```
+
+It runs as a non-root user whose only writable directory is `/data`, and it carries a
+`HEALTHCHECK` that sends a real `PING` over the socket — so `docker ps` reports healthy
+only once the server is answering commands, not merely holding the port open.
+
+**Compose**, for the three shapes worth trying. Each is one command, and each file's header
+comment says exactly how to talk to what it started:
+
+```bash
+docker compose -f deploy/docker-compose.single.yml  up -d --build   # one node + AOF
+docker compose -f deploy/docker-compose.replica.yml up -d --build   # primary + replica
+docker compose -f deploy/docker-compose.cluster.yml up -d --build   # three-node cluster
+```
+
+The cluster file is the one to read before running. There is no cluster bus here, so slots
+do not assign themselves and configuration does not gossip: an `init` sidecar runs
+`CLUSTER ADDSLOTSRANGE` on each node and then `CLUSTER MEET` for every ordered pair, and it
+is idempotent — a second `up` finds the slot map already in `nodes.conf` and leaves it
+alone. `docker compose -f deploy/docker-compose.cluster.yml logs init` shows what it did.
+See [Cluster](#cluster) for the boundary of what that mode does and does not implement.
 
 ## Quick start
 
@@ -1720,6 +1784,30 @@ from the server, `memtier_benchmark` rather than a single-threaded driver, and s
 runs with the variance reported alongside the median. Until that exists, the honest
 statement is that end-to-end performance relative to Redis is **unmeasured**.
 
+The harness for doing it is here, so that the missing number is a matter of hardware
+rather than of tooling:
+
+```bash
+make bench-vs-redis              # ./test/bench/vs-redis.sh
+REPS=5 PROFILES="baseline pipelined" make bench-vs-redis
+```
+
+It starts shardkv and a real `redis:7-alpine` on one Docker network, with persistence off
+on both — an AOF against an RDB would be comparing two different durability contracts, not
+two servers — drives them with `redis-benchmark` out of the same image, and covers six
+profiles: a request at a time, deep pipelining (`-P 16`), a fan of 500 connections, 4 KiB
+values, the collection types, and `XADD`. Every profile is repeated, and the repetitions
+are **interleaved** between the two servers rather than run in blocks, so that load
+drifting during the run is shared instead of handed to one of them. It records the CPU,
+core count, container runtime and both server versions into the report, because a
+benchmark without its hardware is an anecdote.
+
+The part that matters most: it computes a coefficient of variation across the repetitions
+of each cell and **refuses to print a ratio above 10%**, reporting the observed spread
+instead and exiting non-zero. On the machine this was developed on it refuses nearly
+everything, which is the correct answer — the tool declining to compare is the finding,
+and it is why there is no table above.
+
 ## Compatibility: what is missing
 
 This server speaks the Redis wire protocol and reports `redis_version:7.4.0` for the
@@ -1756,6 +1844,98 @@ cannot load an existing Redis dataset into this server**, and `redis-cli --rdb`,
 **No connection ceiling.** There is no `maxclients`, no idle timeout and no per-client
 read deadline; each accepted connection gets a goroutine. A client that opens
 connections without closing them will exhaust memory.
+
+**Two introspection replies differ deliberately.** Both are cosmetic, both would cost
+real state or a fiction to "fix", and both are named here rather than left to surprise
+someone reading `OBJECT`:
+
+- `OBJECT REFCOUNT` answers 1 for every key. Redis answers 2147483647 for integers in
+  0–9999 because they come from a shared object pool; there is no such pool here, and a
+  sentinel refcount would describe an implementation that does not exist. Redis's own
+  suite uses `assert_refcount_morethan` in a few places, which this cannot satisfy.
+- `OBJECT ENCODING` names the representation for the cases that matter — a value that has
+  been appended to, written into with `SETRANGE`, used as a bitmap, or built as a
+  HyperLogLog reports `raw`, as in Redis, rather than being re-derived from whether its
+  bytes happen to parse as a number. The one case still derived from content is a value
+  produced by `INCRBYFLOAT`: it reports `int` where Redis reports `embstr`, because Redis
+  does not re-encode an arithmetic result and distinguishing that from `raw` would need a
+  third state carried on every string purely for this reply.
+
+### How the list above is established
+
+Everything on it was found by running real client libraries against this server — not by
+reading the protocol specification, and not with `redis-cli`. The distinction is the whole
+point. `redis-cli` prints whatever comes back; a client library *parses* it. It negotiates
+with `HELLO`, labels the connection with `CLIENT SETINFO`, decides which exception class to
+raise by matching the **text** of an error reply, checks that a RESP3 map arrived as a map
+rather than as an array, and in cluster mode builds a slot-to-node table out of
+`CLUSTER SLOTS`/`SHARDS` and follows `MOVED` and `ASK` on its own. None of that is
+exercised by typing commands at a prompt.
+
+```bash
+make compat            # the four client libraries
+make compat-tcl        # Redis's own test suite, external mode
+```
+
+`test/compat/` runs each library in its own container — `redis-py` (with the stricter
+hiredis parser), `ioredis`, `node-redis`, `go-redis`, plus each one's *cluster* client
+against a three-node cluster — and then **runs every check a second time against a real
+`redis:7-alpine`, under the same code**. That second column is what makes the result
+evidence rather than an assertion: a check that fails against both servers is a bug in the
+check or a quirk of the library, and only one that passes against Redis and fails here is
+an incompatibility. The harness reports the pair, and only the second kind sets its exit
+status.
+
+That design earned its keep immediately. Three of the first failures were the harness's
+own fault, not the server's — including an expected `CLUSTER KEYSLOT` value taken from the
+Redis documentation's example that turned out to be wrong, where shardkv had been right all
+along. A suite without a reference column would have recorded that as a server bug.
+
+The other half is `test/compat/tcl/`, which points **Redis's own TCL test suite** at this
+server in external mode (`--host`/`--port`). This is the highest-authority signal available
+to anything claiming Redis compatibility: assertions written by the people who define the
+behaviour, checking exact replies and exact error strings, with no idea they are not talking
+to Redis. It is pinned to the 7.4 release rather than tracking `unstable`, because measuring
+against a moving target reports the distance to it as failure. Each file runs in its own
+invocation — the suite aborts a whole file on the first unsupported command, so per-file
+runs turn "one missing command" into one lost file instead of one lost run — and the same
+files run against a real Redis so the assertion counts have a baseline to sit beside.
+
+Four bugs came out of that suite that none of this project's own tests had found, and the
+first was the serious one:
+
+- **`INCRBYFLOAT` formatted large results in scientific notation** (`1.71798691855e+10`
+  where Redis gives `17179869185.5`). Go's `strconv` `'g'` format switches to an exponent
+  far earlier than Redis does. That was not a cosmetic reply difference: `INCRBYFLOAT`
+  propagates its *effect* as `SET key <result>`, so the exponent notation was what reached
+  the AOF and every replica. Fixed at all four call sites that share the formatter
+  (`INCRBYFLOAT`, `HINCRBYFLOAT`, `ZINCRBY`, `ZSCORE`), against output measured from a real
+  Redis rather than from memory — including that Redis emits unpadded exponents (`1e-7`)
+  where Go emits `1e-07`.
+- **`INCRBYFLOAT inf` returned the wrong error.** The operand was being rejected during
+  parsing (`ERR value is not a valid float`) when Redis accepts infinite *operands* and
+  rejects the infinite *result* (`ERR increment would produce NaN or Infinity`). The error
+  now names what actually went wrong.
+- **`CLIENT SETINFO` did not exist**, and modern `redis-py`, `node-redis` and `go-redis`
+  all send two of them, unprompted, on every connect.
+- **`ECHO` did not exist**, which is worth singling out because it is part of
+  StackExchange.Redis's handshake — so the entire .NET ecosystem could not connect at all.
+
+Two differences found this way are **deliberately not fixed**, because fixing them would
+mean lying about the implementation:
+
+- **`OBJECT REFCOUNT` of a small integer returns 1**, where Redis returns 2147483647
+  because integers 0-9999 come from a shared object pool. There is no such pool here, and a
+  sentinel refcount would describe an optimisation that does not exist.
+- **`OBJECT ENCODING` reports the encoding implied by the value, not its representation
+  history.** After `SET foo 1` then `APPEND foo 2`, Redis reports `raw` (the value now lives
+  in a plain buffer and Redis does not re-encode it) and this server reports `int`. Matching
+  Redis would mean carrying a per-entry "how did this value get here" bit purely for an
+  introspection reply.
+
+Both cost assertions in Redis's suite (`assert_encoding` and `assert_refcount_morethan` run
+throughout its type files), which is the honest price of the choice rather than a reason to
+hide it.
 
 ## Testing
 

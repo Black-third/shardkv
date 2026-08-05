@@ -492,7 +492,7 @@ func (s *Store) PFAdd(key string, elements [][]byte) (updated bool, err error) {
 	}
 	// Re-encode rather than patch. See the note at the top of the file: the format is
 	// Redis's, the byte sequence is the canonical encoding of the registers.
-	ne := &entry{kind: kindString, str: encodeHLL(regs)}
+	ne := &entry{kind: kindString, str: encodeHLL(regs), rawString: true}
 	if e != nil {
 		ne.expireAt = e.expireAt
 	}
@@ -600,7 +600,7 @@ func (s *Store) PFMerge(dst string, srcs []string) (changed bool, err error) {
 	if e := dsh.liveEntry(dst, now); e != nil && string(e.str) == string(out) {
 		return false, nil
 	}
-	ne := &entry{kind: kindString, str: out, expireAt: expireAt}
+	ne := &entry{kind: kindString, str: out, rawString: true, expireAt: expireAt}
 	s.touch(ne, now)
 	dsh.data[dst] = ne
 	return true, nil

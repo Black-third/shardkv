@@ -19,6 +19,7 @@ func init() {
 	register("DECRBY", 3, true, cmdDecrBy)
 	registerEffect("INCRBYFLOAT", 3, cmdIncrByFloat)
 	register("MSET", -3, true, cmdMSet)
+	register("MSETNX", -3, true, cmdMSetNX)
 	register("MGET", -2, false, cmdMGet)
 	register("SETNX", 3, true, cmdSetNX)
 	register("SETEX", 4, true, cmdSetEx)
@@ -292,7 +293,12 @@ func cmdGetRange(s *Server, w *resp.Writer, args [][]byte) bool {
 // what keeps that rewrite honest -- the increment preserved the key's TTL, so the
 // SET standing in for it must not clear the replica's.
 func cmdIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
-	delta, ok := parseFloatStrict(args[2])
+	// An infinite *operand* parses -- "inf" is a valid float, and Redis's string2ld
+	// accepts it while rejecting NaN -- so the infinity is caught on the *result*, where
+	// the error names what actually went wrong ("increment would produce NaN or Infinity")
+	// rather than blaming the operand for being unparseable when it parsed fine.
+	// parseScore has precisely those semantics: infinities in, NaN out.
+	delta, ok := parseScore(args[2])
 	if !ok {
 		w.WriteError("ERR value is not a valid float")
 		return nil
@@ -448,6 +454,30 @@ func cmdMSet(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 	w.WriteSimple("OK")
 	return true
+}
+
+// cmdMSetNX sets every pair only if none of the keys exists, replying 1 when it wrote
+// and 0 when it did not.
+//
+// It is dirty only when it actually wrote, so a refused MSETNX propagates nothing --
+// and when it does write, it propagates itself rather than an effect: the command is
+// deterministic, and a replica applying the same MSETNX against the same dataset makes
+// the same decision.
+func cmdMSetNX(s *Server, w *resp.Writer, args [][]byte) bool {
+	if len(args)%2 != 1 {
+		w.WriteError("ERR wrong number of arguments for 'msetnx' command")
+		return false
+	}
+	pairs := make([][2][]byte, 0, (len(args)-1)/2)
+	for i := 1; i < len(args); i += 2 {
+		pairs = append(pairs, [2][]byte{args[i], args[i+1]})
+	}
+	if s.store.MSetNX(pairs) {
+		w.WriteInt(1)
+		return true
+	}
+	w.WriteInt(0)
+	return false
 }
 
 func cmdMGet(s *Server, w *resp.Writer, args [][]byte) bool {

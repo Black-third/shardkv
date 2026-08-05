@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -201,9 +202,34 @@ func TestVersionedWriters(t *testing.T) {
 // string and RESP3 after a comma, so a disagreement here would report two different
 // scores for one value.
 func TestFormatDouble(t *testing.T) {
+	// Every expectation below was read off redis:7.2 rather than reasoned about: these are
+	// ZSCORE replies for the same values. Go's 'g' verb disagrees with several of them --
+	// it renders 17179869185.5 as "1.71798691855e+10" and 1e-7 as "1e-07" -- and the
+	// disagreement is not cosmetic, because INCRBYFLOAT propagates its result as text via
+	// SET, so this formatting reaches the AOF and every replica.
 	cases := map[float64]string{
 		0: "0", 1: "1", 1.5: "1.5", -2.25: "-2.25",
 		math.Inf(1): "inf", math.Inf(-1): "-inf",
+
+		// Fixed notation, which is where Go's 'g' broke first.
+		17179869185.5:    "17179869185.5",
+		3.1415926535:     "3.1415926535",
+		0.005:            "0.005",
+		3.0e-5:           "0.00003",
+		1.0e-6:           "0.000001",
+		1.0e17:           "100000000000000000",
+		1.0e18:           "1000000000000000000",
+		3479099956230698: "3479099956230698", // a 52-bit geohash score
+		200:              "200",
+
+		// Outside the fixed range Redis uses an exponent, unpadded.
+		1.0e19:  "1e+19",
+		1.0e20:  "1e+20",
+		1.0e30:  "1e+30",
+		1.0e100: "1e+100",
+		1.0e-7:  "1e-7",
+		1.0e-10: "1e-10",
+		1.5e300: "1.5e+300",
 		3.0e300: "3e+300",
 	}
 	for in, want := range cases {
@@ -213,5 +239,13 @@ func TestFormatDouble(t *testing.T) {
 	}
 	if got := FormatDouble(math.NaN()); got != "nan" {
 		t.Errorf("FormatDouble(NaN) = %q; want %q", got, "nan")
+	}
+	// Whatever the notation, the text has to read back as the same float. A formatter that
+	// round-trips is the property that actually matters for propagation.
+	for _, f := range []float64{17179869185.5, 3.1415926535, 1e-7, 1e19, 1.5e300, 0.005} {
+		back, err := strconv.ParseFloat(FormatDouble(f), 64)
+		if err != nil || back != f {
+			t.Errorf("FormatDouble(%v) = %q does not round-trip (%v, %v)", f, FormatDouble(f), back, err)
+		}
 	}
 }

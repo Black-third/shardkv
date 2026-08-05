@@ -27,19 +27,7 @@ func writeStoreErr(w *resp.Writer, err error) {
 	}
 }
 
-// parseFloatStrict parses a float operand that has to be finite. Go's parser
-// accepts "inf" and "nan", but the increment family rejects them outright rather
-// than storing a value no later increment could recover from, and a NaN score would
-// have no place in the sorted set's ordering at all.
-func parseFloatStrict(b []byte) (float64, bool) {
-	f, ok := parseFloat(b)
-	if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, false
-	}
-	return f, true
-}
-
-// parseScore parses a sorted-set score. Unlike parseFloatStrict it admits the
+// parseScore parses a sorted-set score. It admits the
 // infinities, which Redis uses as the extreme scores, but still rejects NaN: the
 // skip list orders by score, and a NaN compares false against everything.
 func parseScore(b []byte) (float64, bool) {

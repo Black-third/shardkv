@@ -188,7 +188,10 @@ func cmdHIncrBy(s *Server, w *resp.Writer, args [][]byte) bool {
 // cannot drift, while replaying an addition relies on the replica reproducing the
 // master's floating-point arithmetic exactly.
 func cmdHIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
-	delta, ok := parseFloatStrict(args[3])
+	// Infinities in, NaN out -- see cmdIncrByFloat: an infinite operand parses, so the
+	// infinity is reported against the result it produces rather than against an operand
+	// that was well formed.
+	delta, ok := parseScore(args[3])
 	if !ok {
 		w.WriteError("ERR value is not a valid float")
 		return nil

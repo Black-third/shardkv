@@ -1,6 +1,12 @@
 package server
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/Black-third/shardkv/internal/store"
+)
 
 const wrongType = "-WRONGTYPE Operation against a key holding the wrong kind of value"
 
@@ -195,7 +201,6 @@ func TestIncrByFloat(t *testing.T) {
 		{"INCRBYFLOAT s 1", "-ERR value is not a valid float"},
 		{"INCRBYFLOAT f abc", "-ERR value is not a valid float"},
 		{"INCRBYFLOAT f nan", "-ERR value is not a valid float"},
-		{"INCRBYFLOAT f inf", "-ERR value is not a valid float"},
 		{"INCRBYFLOAT f", "-ERR wrong number of arguments for 'incrbyfloat' command"},
 		// A result that leaves the finite range is refused, value untouched.
 		{"SET big 1e308", "+OK"},
@@ -205,6 +210,17 @@ func TestIncrByFloat(t *testing.T) {
 		{"SETEX tf 100 1", "+OK"},
 		{"INCRBYFLOAT tf 1", "2"},
 		{"TTL tf", ":100"},
+		// An infinite *operand* parses -- "inf" is a valid float, and Redis's string2ld
+		// accepts it while rejecting NaN -- so the error names the result that cannot be
+		// represented rather than blaming an operand that was well formed. Verified against
+		// redis:7.2, which answers exactly this.
+		{"SET inf1 1", "+OK"},
+		{"INCRBYFLOAT inf1 inf", "-ERR increment would produce NaN or Infinity"},
+		{"GET inf1", "1"},
+		{"INCRBYFLOAT inf1 -inf", "-ERR increment would produce NaN or Infinity"},
+		// NaN is refused at parse time, as Redis refuses it.
+		{"INCRBYFLOAT inf1 nan", "-ERR value is not a valid float"},
+		{"INCRBYFLOAT inf1 notanumber", "-ERR value is not a valid float"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {
@@ -215,5 +231,105 @@ func TestIncrByFloat(t *testing.T) {
 	c.cmd("RPUSH wl a")
 	if got := c.cmd("INCRBYFLOAT wl 1"); got != wrongType {
 		t.Errorf("INCRBYFLOAT on a list = %q; want %q", got, wrongType)
+	}
+}
+
+// TestMSetNX covers the all-or-nothing guarantee, which is the whole command: a single
+// existing key has to refuse the entire batch, leaving every other key untouched.
+func TestMSetNX(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	cases := []struct{ cmd, want string }{
+		{"MSETNX a 1 b 2", ":1"},
+		{"GET a", "1"},
+		{"GET b", "2"},
+		// One key already present refuses the batch, and c must not have been written.
+		{"MSETNX b 22 c 3", ":0"},
+		{"GET b", "2"},
+		{"GET c", "(nil)"},
+		{"MSETNX c 3 d 4", ":1"},
+		{"GET c", "3"},
+		{"MSETNX x 1 y", "-ERR wrong number of arguments for 'msetnx' command"},
+	}
+	for _, tc := range cases {
+		if got := c.cmd(tc.cmd); got != tc.want {
+			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
+		}
+	}
+	// An expired key does not count as existing.
+	c.cmd("SET gone v PX 1")
+	waitFor(t, "the key to expire", func() bool { return c.cmd("GET gone") == "(nil)" })
+	if got := c.cmd("MSETNX gone fresh"); got != ":1" {
+		t.Errorf("MSETNX over an expired key = %q; want :1", got)
+	}
+}
+
+// TestMSetNXIsWatchedOnEveryKey covers invariant 7 for a command that writes several
+// keys: WATCH has to see a conflict on any of them, not just the first.
+func TestMSetNXIsWatchedOnEveryKey(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	watcher := dialTx(t, addr)
+	defer watcher.close()
+	writer := dialTx(t, addr)
+	defer writer.close()
+
+	watcher.cmd("WATCH second")
+	watcher.cmd("MULTI")
+	watcher.cmd("SET other 1")
+	// The write lands on the *second* key of the MSETNX, which is the one a
+	// first-argument-only key extraction would miss.
+	if got := writer.cmd("MSETNX first 1 second 2"); got != ":1" {
+		t.Fatalf("MSETNX = %q; want :1", got)
+	}
+	if got := watcher.cmd("EXEC"); got != "(nil)" {
+		t.Errorf("EXEC = %q; want a null array: MSETNX changed a watched key", got)
+	}
+}
+
+// TestTimeReadsTheStoreClock covers TIME, and that it shares the clock every other
+// server-side "now" reads -- under an injected clock a client comparing TIME against a
+// TTL it just set must see one timeline.
+func TestTimeReadsTheStoreClock(t *testing.T) {
+	st := store.New(8)
+	fixed := time.Date(2030, 3, 4, 5, 6, 7, 891011000, time.UTC)
+	st.SetClock(func() time.Time { return fixed })
+	_, addr, stop := startServer(t, st)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	got := c.cmd("TIME")
+	want := "[" + strconv.FormatInt(fixed.Unix(), 10) + " 891011]"
+	if got != want {
+		t.Errorf("TIME = %q; want %q", got, want)
+	}
+}
+
+// TestDebugSetActiveExpire covers the switch Redis's own test suite needs to observe
+// lazy expiration deterministically. Turning the sweep off must not make a stale value
+// readable: the lazy check on every read is what enforces the deadline.
+func TestDebugSetActiveExpire(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	if got := c.cmd("DEBUG SET-ACTIVE-EXPIRE 0"); got != "+OK" {
+		t.Fatalf("DEBUG SET-ACTIVE-EXPIRE 0 = %q", got)
+	}
+	c.cmd("SET k v PX 1")
+	waitFor(t, "the key to read as gone", func() bool { return c.cmd("GET k") == "(nil)" })
+	if got := c.cmd("EXISTS k"); got != ":0" {
+		t.Errorf("EXISTS on an expired key with the sweep off = %q; want :0", got)
+	}
+	if got := c.cmd("DEBUG SET-ACTIVE-EXPIRE 1"); got != "+OK" {
+		t.Errorf("DEBUG SET-ACTIVE-EXPIRE 1 = %q", got)
+	}
+	if got := c.cmd("DEBUG SET-ACTIVE-EXPIRE 2"); !contains(got, "Invalid argument") {
+		t.Errorf("DEBUG SET-ACTIVE-EXPIRE 2 = %q; want an argument error", got)
 	}
 }
