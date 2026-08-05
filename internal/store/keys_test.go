@@ -1,0 +1,250 @@
+package store
+
+import (
+	"strconv"
+	"testing"
+	"time"
+)
+
+// TestExpireAtCond is the table for the conditional expire flags, including the
+// combinations Redis allows together. The asymmetry worth pinning is that a
+// persistent key counts as expiring infinitely far out, so GT can never beat it and
+// LT always can.
+func TestExpireAtCond(t *testing.T) {
+	cur := time.Unix(1000, 0)
+	early, late := cur.Add(time.Minute), cur.Add(time.Hour)
+
+	cases := []struct {
+		name     string
+		startTTL time.Duration // 0 = a persistent key
+		deadline time.Time
+		cond     ExpireCond
+		want     bool
+	}{
+		{"no condition, persistent", 0, late, ExpireAlways, true},
+		{"no condition, volatile", time.Minute, late, ExpireAlways, true},
+		{"NX on a persistent key", 0, late, ExpireNX, true},
+		{"NX on a volatile key", time.Minute, late, ExpireNX, false},
+		{"XX on a persistent key", 0, late, ExpireXX, false},
+		{"XX on a volatile key", time.Minute, late, ExpireXX, true},
+		{"GT with a later deadline", time.Minute, late, ExpireGT, true},
+		{"GT with an earlier deadline", time.Hour, early, ExpireGT, false},
+		{"GT with the same deadline", time.Minute, cur.Add(time.Minute), ExpireGT, false},
+		{"GT on a persistent key", 0, late, ExpireGT, false},
+		{"LT with an earlier deadline", time.Hour, early, ExpireLT, true},
+		{"LT with a later deadline", time.Minute, late, ExpireLT, false},
+		{"LT on a persistent key", 0, late, ExpireLT, true},
+		{"XX GT together, both hold", time.Minute, late, ExpireXX | ExpireGT, true},
+		{"XX GT together, GT fails", time.Hour, early, ExpireXX | ExpireGT, false},
+		{"XX GT on a persistent key", 0, late, ExpireXX | ExpireGT, false},
+	}
+	for _, tc := range cases {
+		s := New(4)
+		s.SetClock(func() time.Time { return cur })
+		s.Set("k", []byte("v"), tc.startTTL)
+
+		if got := s.ExpireAtCond("k", tc.deadline, tc.cond); got != tc.want {
+			t.Errorf("%s: ExpireAtCond = %v; want %v", tc.name, got, tc.want)
+			continue
+		}
+		// When it applied, the stored deadline is the one asked for; when it did not,
+		// the original TTL is untouched.
+		ms, hasTTL, _ := s.TTLMillis("k")
+		switch {
+		case tc.want:
+			if want := tc.deadline.UnixMilli() - cur.UnixMilli(); !hasTTL || ms != want {
+				t.Errorf("%s: remaining = %d (hasTTL %v); want %d", tc.name, ms, hasTTL, want)
+			}
+		case tc.startTTL == 0:
+			if hasTTL {
+				t.Errorf("%s: a refused expire made the key volatile", tc.name)
+			}
+		default:
+			if want := int64(tc.startTTL / time.Millisecond); ms != want {
+				t.Errorf("%s: remaining = %d; want the original %d", tc.name, ms, want)
+			}
+		}
+	}
+
+	// A missing or already expired key is never touched.
+	s := New(4)
+	s.SetClock(func() time.Time { return cur })
+	if s.ExpireAtCond("ghost", late, ExpireAlways) {
+		t.Error("ExpireAtCond reported success on a missing key")
+	}
+	s.Set("gone", []byte("v"), time.Millisecond)
+	cur = cur.Add(time.Second)
+	if s.ExpireAtCond("gone", late, ExpireNX) {
+		t.Error("ExpireAtCond revived an expired key")
+	}
+}
+
+// TestRandomKey covers the arbitrary pick: nothing on an empty store, always a live
+// key otherwise, and never an expired one.
+func TestRandomKey(t *testing.T) {
+	cur := time.Unix(1000, 0)
+	s := New(8)
+	s.SetClock(func() time.Time { return cur })
+
+	if _, ok := s.RandomKey(); ok {
+		t.Error("RandomKey found a key in an empty store")
+	}
+
+	want := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		k := "k" + strconv.Itoa(i)
+		s.Set(k, []byte("v"), 0)
+		want[k] = true
+	}
+	// Every draw is one of the live keys, and over many draws more than one turns up.
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		k, ok := s.RandomKey()
+		if !ok {
+			t.Fatal("RandomKey found nothing in a populated store")
+		}
+		if !want[k] {
+			t.Fatalf("RandomKey returned %q, which is not in the store", k)
+		}
+		seen[k] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("RandomKey returned only %d distinct key(s) over 200 draws", len(seen))
+	}
+
+	// An expired key is not a candidate.
+	s2 := New(4)
+	s2.SetClock(func() time.Time { return cur })
+	s2.Set("gone", []byte("v"), time.Millisecond)
+	cur = cur.Add(time.Second)
+	if k, ok := s2.RandomKey(); ok {
+		t.Errorf("RandomKey returned the expired key %q", k)
+	}
+}
+
+// TestIdleSecondsTracksAccess covers OBJECT IDLETIME's source. Access times are only
+// recorded while eviction is enabled -- that is what keeps the default read path free
+// of an atomic write -- so an untracked key must report 0 rather than an age measured
+// from the epoch.
+func TestIdleSecondsTracksAccess(t *testing.T) {
+	cur := time.Unix(1_600_000_000, 0)
+
+	untracked := New(4)
+	untracked.SetClock(func() time.Time { return cur })
+	untracked.Set("k", []byte("v"), 0)
+	if idle, ok := untracked.IdleSeconds("k"); !ok || idle != 0 {
+		t.Errorf("IdleSeconds without eviction = %d, %v; want 0, true", idle, ok)
+	}
+
+	tracked := New(4)
+	tracked.SetClock(func() time.Time { return cur })
+	tracked.SetMaxKeys(1000) // turns access-time tracking on
+	tracked.Set("k", []byte("v"), 0)
+	cur = cur.Add(90 * time.Second)
+	if idle, ok := tracked.IdleSeconds("k"); !ok || idle != 90 {
+		t.Errorf("IdleSeconds after 90s = %d, %v; want 90, true", idle, ok)
+	}
+	// Reading the key resets the clock on it.
+	tracked.Get("k")
+	if idle, _ := tracked.IdleSeconds("k"); idle != 0 {
+		t.Errorf("IdleSeconds after a read = %d; want 0", idle)
+	}
+	if _, ok := tracked.IdleSeconds("ghost"); ok {
+		t.Error("IdleSeconds reported a missing key as present")
+	}
+}
+
+// TestEncodingThresholds covers OBJECT ENCODING's answers. The internals here are one
+// representation per type, so what the report promises is Redis's size and content
+// thresholds -- which is what a client asking the question is deciding on.
+func TestEncodingThresholds(t *testing.T) {
+	s := New(8)
+	long := make([]byte, 50)
+	for i := range long {
+		long[i] = 'x'
+	}
+
+	s.Set("int", []byte("12345"), 0)
+	s.Set("embstr", []byte("hello"), 0)
+	s.Set("raw", long, 0)
+	s.RPush("smalllist", []byte("a"))
+	s.HSet("smallhash", [2][]byte{[]byte("f"), []byte("v")})
+	s.HSet("bigvalhash", [2][]byte{[]byte("f"), append(long, long...)})
+	s.SAdd("intset", "1", "2", "3")
+	s.SAdd("strset", "a", "b")
+	s.ZAdd("smallzset", "m", 1)
+
+	for i := 0; i < 200; i++ {
+		v := strconv.Itoa(i)
+		s.RPush("biglist", []byte(v))
+		s.HSet("bighash", [2][]byte{[]byte(v), []byte(v)})
+		s.SAdd("bigset", "m"+v)
+		s.ZAdd("bigzset", "m"+v, float64(i))
+	}
+
+	cases := []struct{ key, want string }{
+		{"int", "int"},
+		{"embstr", "embstr"},
+		{"raw", "raw"},
+		{"smalllist", "listpack"},
+		{"biglist", "quicklist"},
+		{"smallhash", "listpack"},
+		{"bigvalhash", "hashtable"},
+		{"bighash", "hashtable"},
+		{"intset", "intset"},
+		{"strset", "listpack"},
+		{"bigset", "hashtable"},
+		{"smallzset", "listpack"},
+		{"bigzset", "skiplist"},
+	}
+	for _, tc := range cases {
+		got, ok := s.Encoding(tc.key)
+		if !ok {
+			t.Errorf("Encoding(%q) reported the key missing", tc.key)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Encoding(%q) = %q; want %q", tc.key, got, tc.want)
+		}
+	}
+	if _, ok := s.Encoding("ghost"); ok {
+		t.Error("Encoding reported a missing key as present")
+	}
+}
+
+// TestRenameNXAndTouch covers the remaining keyspace helpers.
+func TestRenameNXAndTouch(t *testing.T) {
+	s := New(8)
+	s.Set("a", []byte("1"), 0)
+	s.Set("b", []byte("2"), 0)
+
+	if renamed, found := s.RenameNX("a", "b"); renamed || !found {
+		t.Errorf("RenameNX onto an existing key = %v, %v; want false, true", renamed, found)
+	}
+	if v, _ := s.Get("b"); string(v) != "2" {
+		t.Errorf("destination was overwritten: %q", v)
+	}
+	if renamed, found := s.RenameNX("a", "c"); !renamed || !found {
+		t.Errorf("RenameNX = %v, %v; want true, true", renamed, found)
+	}
+	if s.Exists("a") {
+		t.Error("source survived the rename")
+	}
+	if _, found := s.RenameNX("ghost", "x"); found {
+		t.Error("RenameNX reported a missing source as found")
+	}
+	// Renaming onto itself is not an error, just nothing to do.
+	if renamed, found := s.RenameNX("b", "b"); renamed || !found {
+		t.Errorf("RenameNX onto itself = %v, %v; want false, true", renamed, found)
+	}
+	if v, _ := s.Get("b"); string(v) != "2" {
+		t.Errorf("value after a self-rename = %q; want 2", v)
+	}
+
+	if !s.Touch("b") {
+		t.Error("Touch reported a live key as absent")
+	}
+	if s.Touch("ghost") {
+		t.Error("Touch reported a missing key as present")
+	}
+}

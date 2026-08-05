@@ -27,7 +27,7 @@ func feedTx(a *txApplier, parts ...string) {
 // (as a crash would leave the AOF) applies nothing.
 func TestTxApplierAtomicReplay(t *testing.T) {
 	committed := New(store.New(8))
-	a := &txApplier{s: committed, w: resp.NewWriter(io.Discard)}
+	a := newTxApplier(committed, resp.NewWriter(io.Discard))
 	feedTx(a, "MULTI")
 	feedTx(a, "SET", "a", "1")
 	feedTx(a, "SET", "b", "2")
@@ -40,7 +40,7 @@ func TestTxApplierAtomicReplay(t *testing.T) {
 	}
 
 	truncated := New(store.New(8))
-	b := &txApplier{s: truncated, w: resp.NewWriter(io.Discard)}
+	b := newTxApplier(truncated, resp.NewWriter(io.Discard))
 	feedTx(b, "MULTI")
 	feedTx(b, "SET", "a", "1")
 	feedTx(b, "SET", "b", "2") // crash: no EXEC

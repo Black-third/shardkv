@@ -145,8 +145,8 @@ func (s *Store) LRange(key string, start, stop int) ([][]byte, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindList {
@@ -163,8 +163,8 @@ func (s *Store) LLen(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindList {
@@ -210,8 +210,8 @@ func (s *Store) HGet(key, field string) ([]byte, bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, false, nil
 	}
 	if e.kind != kindHash {
@@ -262,8 +262,8 @@ func (s *Store) HGetAll(key string) ([][]byte, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindHash {
@@ -284,8 +284,8 @@ func (s *Store) HLen(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindHash {
@@ -359,8 +359,8 @@ func (s *Store) SMembers(key string) ([]string, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindSet {
@@ -381,8 +381,8 @@ func (s *Store) SIsMember(key, member string) (bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return false, nil
 	}
 	if e.kind != kindSet {
@@ -399,8 +399,8 @@ func (s *Store) SCard(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindSet {

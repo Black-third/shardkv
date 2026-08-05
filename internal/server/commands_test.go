@@ -73,6 +73,44 @@ func TestDataTypeCommands(t *testing.T) {
 	}
 }
 
+// TestGetTypeHandling pins GET's replies across every value type. GET now answers
+// from one combined store lookup instead of a Type check followed by a Get, so the
+// wrong-type error and the value can no longer come from two different states; the
+// replies themselves must be unchanged.
+func TestGetTypeHandling(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	const wrongType = "-WRONGTYPE Operation against a key holding the wrong kind of value"
+	cases := []struct{ cmd, want string }{
+		{"SET str v", "+OK"},
+		{"GET str", "v"},
+		{"GET missing", "(nil)"},
+		{"RPUSH l a", ":1"},
+		{"GET l", wrongType},
+		{"HSET h f v", ":1"},
+		{"GET h", wrongType},
+		{"SADD s m", ":1"},
+		{"GET s", wrongType},
+		{"ZADD z 1 m", ":1"},
+		{"GET z", wrongType},
+		// MGET keeps reporting a wrong-type key as a plain nil, as Redis does.
+		{"MGET str l missing", "[v (nil) (nil)]"},
+		// An expired key reads as a miss, not as a type error.
+		{"SET gone v PX 1", "+OK"},
+	}
+	for _, tc := range cases {
+		if got := c.cmd(tc.cmd); got != tc.want {
+			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
+		}
+	}
+	waitFor(t, "the volatile key to expire", func() bool {
+		return c.cmd("GET gone") == "(nil)"
+	})
+}
+
 func TestInfoCommand(t *testing.T) {
 	addr, stop := startTestServer(t)
 	defer stop()

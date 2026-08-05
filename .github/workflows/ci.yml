@@ -7,16 +7,32 @@ on:
     branches: [main]
 
 jobs:
+  # The full gate, across the Go versions the module is expected to build on: the
+  # floor declared in go.mod, and whatever is current. Listing anything below the
+  # go.mod floor would prove nothing -- the toolchain would just fetch a newer one --
+  # so the matrix is exactly "the oldest we claim to support, and the newest there is".
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.26.4', 'stable']
+    name: test (go ${{ matrix.go-version }})
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version: ${{ matrix.go-version }}
           cache: true
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
 
       - name: Vet
         run: go vet ./...
@@ -27,5 +43,75 @@ jobs:
       - name: Test (race detector)
         run: go test -race -count=1 ./...
 
+      # The blocking commands and the protocol tests are the timing-sensitive part of
+      # the suite: real concurrent TCP clients, real wakeups, real timeouts. A single
+      # green run does not distinguish "correct" from "got lucky", and an intermittent
+      # failure discovered by a contributor weeks later is far more expensive than the
+      # half-minute this costs.
+      - name: Repeat the concurrency-sensitive tests
+        run: |
+          go test -race -count=3 \
+            -run 'TestBlocking|TestClientUnblock|TestRESP|TestDatabase|TestSwapDB|TestSelectFrames' \
+            ./internal/server
+
       - name: Fuzz the RESP parser (short)
         run: go test -run=^$ -fuzz=FuzzReadCommand -fuzztime=20s ./internal/resp
+
+  # golangci-lint is part of the gate the project holds itself to (make lint), so CI
+  # has to run it: a linter that only runs when someone remembers is a linter whose
+  # findings accumulate. It is a job of its own rather than a step in the matrix
+  # because its result does not depend on the Go version, and running it twice would
+  # only double the time to the same answer.
+  lint:
+    runs-on: ubuntu-latest
+    name: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  # Cross-compilation only: it costs one compile per target and is what catches a
+  # word-size or platform assumption (a 32-bit int truncating a millisecond deadline,
+  # say) without needing hardware to run the tests on.
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+      - name: Vet
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...

@@ -3,15 +3,58 @@
 //
 // Requests arrive as an array of bulk strings (the form every Redis client
 // sends); an inline space-separated fallback is also accepted for convenience
-// when poking at the server with a raw socket. Replies use the simple-string,
-// error, integer, bulk-string and array types.
+// when poking at the server with a raw socket. Requests are identical in RESP2
+// and RESP3, so only the reply side is version-aware.
+//
+// # Protocol versions
+//
+// A Writer serializes replies in either RESP2 or RESP3, selected per connection
+// by HELLO and stored on the Writer because the reply encoding is a property of
+// one socket and of nothing else. RESP2 is the default, so a connection that
+// never sends HELLO -- and every internal writer, such as the one an AOF replay
+// discards its replies into -- keeps the original encoding byte for byte.
+//
+// The RESP3 types are written by dedicated methods (WriteMapHeader,
+// WriteSetHeader, WriteDouble, WriteBool, WriteBigNumber, WriteVerbatim,
+// WritePushHeader) that fall back to the RESP2 encoding of the same value when
+// the connection speaks RESP2. Keeping the fallback inside the writer rather
+// than at every call site is what makes it impossible for a handler to emit a
+// RESP3 type to a RESP2 client: there is one place that decides, and it is the
+// place that knows the version.
+//
+// The one exception is the attribute type, which has no RESP2 encoding at all
+// (real Redis omits the attribute entirely for a RESP2 client). A caller must
+// therefore guard WriteAttributeHeader with a Proto() check, since only the
+// caller knows how to leave the attribute out.
+//
+// # Why the reply writers report no error
+//
+// The version-aware writers return nothing. Writes go into a bufio.Writer whose
+// error is sticky, so a failure part-way through a reply is reported by the
+// Flush the connection loop already checks -- there is nothing a handler could
+// do with an error here that the loop does not already do better, and a return
+// value every call site has to ignore is worse than no return value at all. The
+// streaming methods (WriteCommand, WriteRaw, Flush) do return errors, because
+// their callers -- a replica feed, a snapshot -- act on them by ending the
+// stream.
 package resp
 
 import (
 	"bufio"
 	"errors"
 	"io"
+	"math"
 	"strconv"
+)
+
+// Protocol versions a Writer can serialize replies in.
+const (
+	// ProtoRESP2 is the original protocol: simple strings, errors, integers,
+	// bulk strings and arrays, with $-1/*-1 for the nulls.
+	ProtoRESP2 = 2
+	// ProtoRESP3 adds the map, set, double, boolean, big-number, verbatim-string,
+	// null, push and attribute types.
+	ProtoRESP3 = 3
 )
 
 // ErrProtocol indicates a malformed client request.
@@ -30,6 +73,7 @@ const (
 // Reader parses client commands from a connection.
 type Reader struct {
 	r *bufio.Reader
+	n int64 // bytes consumed, for replication offset accounting
 }
 
 func NewReader(r io.Reader) *Reader { return &Reader{r: bufio.NewReader(r)} }
@@ -39,6 +83,34 @@ func NewReader(r io.Reader) *Reader { return &Reader{r: bufio.NewReader(r)} }
 // it keeps processing while more input is buffered and flushes once the buffer
 // drains.
 func (r *Reader) Buffered() int { return r.r.Buffered() }
+
+// Consumed reports how many bytes have been read and parsed so far, counting the
+// protocol framing. A replica needs it to report its replication offset: the offset
+// is a byte count over the master's stream, so it can only be derived from the bytes
+// actually taken off that stream, not from the number of commands applied.
+//
+// It counts consumed bytes, not buffered ones, which is why it is maintained here
+// rather than by wrapping the underlying reader -- a wrapper would count a whole
+// buffer fill as processed the moment it arrived.
+func (r *Reader) Consumed() int64 { return r.n }
+
+// WaitReadable blocks until at least one byte of input is available or the read
+// fails, and consumes nothing.
+//
+// It exists for the blocking commands. A blocked client's connection goroutine is
+// parked in the wait rather than in a read, so nothing would notice that client
+// hanging up; peeking is how the socket can be watched without taking a byte the
+// command loop will need afterwards. A successful return means input arrived (a
+// pipelined command, still there to be read), not that the connection is healthy in
+// any stronger sense.
+//
+// The caller must guarantee no other goroutine is using the Reader while this runs,
+// and must observe its return before reading again -- see watchClientGone, which
+// forces it to return with a read deadline and then waits for it.
+func (r *Reader) WaitReadable() error {
+	_, err := r.r.Peek(1)
+	return err
+}
 
 // ReadCommand reads one command and returns its arguments. The first element is
 // the command name. It returns io.EOF when the client disconnects.
@@ -78,13 +150,77 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 		if _, err := io.ReadFull(r.r, buf); err != nil {
 			return nil, err
 		}
+		r.n += int64(len(buf))
 		args = append(args, buf[:length])
 	}
 	return args, nil
 }
 
+// ReadStatus reads a single-line reply and returns its payload. A simple string
+// yields its text; an error reply is returned as a Go error carrying the server's
+// message. It exists for the replication handshake, which is the one place this
+// server acts as a client and has to read a reply rather than write one.
+func (r *Reader) ReadStatus() (string, error) {
+	line, err := r.readLine()
+	if err != nil {
+		return "", err
+	}
+	if len(line) == 0 {
+		return "", ErrProtocol
+	}
+	switch line[0] {
+	case '+':
+		return string(line[1:]), nil
+	case '-':
+		return "", errors.New(string(line[1:]))
+	}
+	return "", ErrProtocol
+}
+
+// ReadBulk reads a bulk-string reply and returns its payload, or nil for the null bulk
+// string. An error reply is returned as a Go error carrying the server's message, as
+// ReadStatus does.
+//
+// It is the companion ReadStatus needed once this server started acting as a client for
+// something other than the replication handshake: a node introducing itself to another
+// (CLUSTER MEET) reads that node's CLUSTER NODES table, which is a bulk string. A
+// general reply decoder is deliberately not offered -- the node-to-node conversations
+// this server has are a handful of statuses and one bulk string, and a decoder for
+// every RESP type would be a second protocol implementation to keep correct with no
+// caller that needs it.
+func (r *Reader) ReadBulk() ([]byte, error) {
+	line, err := r.readLine()
+	if err != nil {
+		return nil, err
+	}
+	if len(line) == 0 {
+		return nil, ErrProtocol
+	}
+	switch line[0] {
+	case '-':
+		return nil, errors.New(string(line[1:]))
+	case '$', '=':
+	default:
+		return nil, ErrProtocol
+	}
+	n, err := strconv.Atoi(string(line[1:]))
+	if err != nil || n < -1 || n > MaxBulkLen {
+		return nil, ErrProtocol
+	}
+	if n < 0 {
+		return nil, nil // the null bulk string
+	}
+	buf := make([]byte, n+2) // payload plus the trailing CRLF
+	if _, err := io.ReadFull(r.r, buf); err != nil {
+		return nil, err
+	}
+	r.n += int64(len(buf))
+	return buf[:n], nil
+}
+
 func (r *Reader) readLine() ([]byte, error) {
 	line, err := r.r.ReadBytes('\n')
+	r.n += int64(len(line)) // counted even on error: those bytes are gone from the stream
 	if err != nil {
 		return nil, err
 	}
@@ -119,11 +255,36 @@ func splitInline(line []byte) [][]byte {
 
 // Writer serializes replies to a connection. Callers must Flush after writing a
 // complete reply.
+//
+// proto is the protocol version this connection negotiated with HELLO. It is
+// touched only by the connection's own goroutine (HELLO sets it, that
+// connection's handlers read it), so it needs no synchronization -- the Pub/Sub
+// pump writes through the same Writer but only ever reads proto, and it cannot
+// run before the SUBSCRIBE that starts it has returned.
 type Writer struct {
-	w *bufio.Writer
+	w     *bufio.Writer
+	proto int
+	// errs counts the error replies written on this connection. It exists so the
+	// server's per-command statistics can report failed calls without every one of
+	// ~180 handlers having to say "I answered with an error": the caller reads the
+	// counter before and after running a command and compares. Like proto it is touched
+	// only by the connection's own goroutine.
+	errs int64
 }
 
-func NewWriter(w io.Writer) *Writer { return &Writer{w: bufio.NewWriter(w)} }
+func NewWriter(w io.Writer) *Writer {
+	return &Writer{w: bufio.NewWriter(w), proto: ProtoRESP2}
+}
+
+// SetProto selects the protocol version replies are encoded in. HELLO is the only
+// caller: a client asks for a version, and every later reply on that connection is
+// written in it.
+func (w *Writer) SetProto(v int) { w.proto = v }
+
+// Proto reports the connection's protocol version. Handlers consult it where the
+// two protocols differ by more than an encoding -- where RESP3 nests pairs a RESP2
+// reply flattens, or where a push replaces a reply entirely.
+func (w *Writer) Proto() int { return w.proto }
 
 func (w *Writer) Flush() error { return w.w.Flush() }
 
@@ -135,8 +296,14 @@ func (w *Writer) WriteSimple(s string) error {
 	return err
 }
 
+// ErrorsWritten reports how many error replies have been written on this
+// connection, which is what lets a caller tell whether the command it just ran
+// failed. See the errs field.
+func (w *Writer) ErrorsWritten() int64 { return w.errs }
+
 // WriteError writes an error reply: -<s>\r\n
 func (w *Writer) WriteError(s string) error {
+	w.errs++
 	w.w.WriteByte('-')
 	w.w.WriteString(s)
 	_, err := w.w.WriteString("\r\n")
@@ -165,15 +332,25 @@ func (w *Writer) WriteBulk(b []byte) error {
 	return err
 }
 
-// WriteNull writes the null bulk string: $-1\r\n
+// WriteNull writes a null: _\r\n in RESP3, the null bulk string $-1\r\n in RESP2.
 func (w *Writer) WriteNull() error {
+	if w.proto >= ProtoRESP3 {
+		_, err := w.w.WriteString("_\r\n")
+		return err
+	}
 	_, err := w.w.WriteString("$-1\r\n")
 	return err
 }
 
-// WriteNullArray writes the null array: *-1\r\n. Redis uses this (not the null
-// bulk string) for an aborted EXEC.
+// WriteNullArray writes a null where RESP2 spells it as the null *array* rather
+// than the null bulk string -- an aborted EXEC, a LPOP on a missing key with a
+// count, a BLPOP that timed out. RESP3 has a single null, so the distinction
+// disappears there, which is precisely the ambiguity RESP3 set out to remove.
 func (w *Writer) WriteNullArray() error {
+	if w.proto >= ProtoRESP3 {
+		_, err := w.w.WriteString("_\r\n")
+		return err
+	}
 	_, err := w.w.WriteString("*-1\r\n")
 	return err
 }
@@ -181,10 +358,185 @@ func (w *Writer) WriteNullArray() error {
 // WriteArrayHeader writes an array header: *<n>\r\n. The caller then writes n
 // elements.
 func (w *Writer) WriteArrayHeader(n int) error {
-	w.w.WriteByte('*')
+	w.writeLen('*', n)
+	return nil
+}
+
+// WriteMapHeader writes a map header for n key/value *pairs*: %<n>\r\n in RESP3,
+// and the flat array of 2n elements a RESP2 client receives instead. Either way the
+// caller writes 2n values, alternating key and value, so one code path serves both.
+func (w *Writer) WriteMapHeader(n int) {
+	if w.proto >= ProtoRESP3 {
+		w.writeLen('%', n)
+		return
+	}
+	w.writeLen('*', n*2)
+}
+
+// WriteSetHeader writes a set header: ~<n>\r\n in RESP3, an array in RESP2. The
+// type says the elements are unordered and distinct; the elements themselves are
+// encoded identically, so the RESP2 form is byte-for-byte the array it always was.
+func (w *Writer) WriteSetHeader(n int) {
+	if w.proto >= ProtoRESP3 {
+		w.writeLen('~', n)
+		return
+	}
+	w.writeLen('*', n)
+}
+
+// WritePushHeader writes an out-of-band push header: ><n>\r\n in RESP3.
+//
+// A push is what lets a RESP3 client stay subscribed and still issue ordinary
+// commands: pushes are tagged, so the client can route a delivered message to its
+// message handler instead of matching it against the reply it is waiting for. RESP2
+// has no such frame, which is the whole reason a RESP2 subscriber is restricted to
+// the subscribe family -- so for RESP2 this writes the plain array those clients
+// already demultiplex positionally.
+func (w *Writer) WritePushHeader(n int) {
+	if w.proto >= ProtoRESP3 {
+		w.writeLen('>', n)
+		return
+	}
+	w.writeLen('*', n)
+}
+
+// WriteAttributeHeader writes an attribute header (|<n>\r\n) introducing n
+// key/value pairs of out-of-band metadata that describe the reply that follows
+// rather than being part of it.
+//
+// It is RESP3-only and, unlike every other method here, has no RESP2 fallback:
+// there is nowhere in a RESP2 stream to put metadata a client is not expecting. A
+// caller must therefore check Proto() and skip the attribute (and its pairs)
+// entirely for a RESP2 client, which is what real Redis does.
+func (w *Writer) WriteAttributeHeader(n int) {
+	if w.proto < ProtoRESP3 {
+		return
+	}
+	w.writeLen('|', n)
+}
+
+func (w *Writer) writeLen(prefix byte, n int) {
+	w.w.WriteByte(prefix)
 	w.w.WriteString(strconv.Itoa(n))
-	_, err := w.w.WriteString("\r\n")
+	w.w.WriteString("\r\n")
+}
+
+// WriteBool writes a boolean: #t\r\n / #f\r\n in RESP3, :1 / :0 in RESP2.
+func (w *Writer) WriteBool(b bool) {
+	if w.proto < ProtoRESP3 {
+		if b {
+			w.WriteInt(1)
+			return
+		}
+		w.WriteInt(0)
+		return
+	}
+	if b {
+		w.w.WriteString("#t\r\n")
+		return
+	}
+	w.w.WriteString("#f\r\n")
+}
+
+// WriteDouble writes a double: ,<value>\r\n in RESP3, and the same text as a bulk
+// string in RESP2 -- which is the encoding every RESP2 client already parses scores
+// out of, so the bytes it sees do not change.
+func (w *Writer) WriteDouble(f float64) {
+	s := FormatDouble(f)
+	if w.proto < ProtoRESP3 {
+		w.WriteBulk([]byte(s))
+		return
+	}
+	w.w.WriteByte(',')
+	w.w.WriteString(s)
+	w.w.WriteString("\r\n")
+}
+
+// WriteBigNumber writes an integer too large for the int64 an integer reply
+// carries: (<digits>\r\n in RESP3, a bulk string in RESP2. digits must already be a
+// base-10 integer literal, optionally signed; the writer does not validate it,
+// because the only honest source of such a number is a value the server already
+// holds in that form.
+func (w *Writer) WriteBigNumber(digits string) {
+	if w.proto < ProtoRESP3 {
+		w.WriteBulk([]byte(digits))
+		return
+	}
+	w.w.WriteByte('(')
+	w.w.WriteString(digits)
+	w.w.WriteString("\r\n")
+}
+
+// WriteVerbatim writes a verbatim string: =<len>\r\n<format>:<payload>\r\n in
+// RESP3, a plain bulk string in RESP2.
+//
+// The format is a three-character hint ("txt", "mkd") telling the client the
+// payload is meant to be displayed as-is rather than quoted and escaped. INFO is
+// the reason it exists: a bulk string full of \r\n renders as one long escaped line
+// in redis-cli, while a verbatim string renders as the report an operator wanted.
+func (w *Writer) WriteVerbatim(format string, payload []byte) {
+	if w.proto < ProtoRESP3 {
+		w.WriteBulk(payload)
+		return
+	}
+	w.w.WriteByte('=')
+	w.w.WriteString(strconv.Itoa(len(format) + 1 + len(payload)))
+	w.w.WriteString("\r\n")
+	w.w.WriteString(format)
+	w.w.WriteByte(':')
+	w.w.Write(payload)
+	w.w.WriteString("\r\n")
+}
+
+// FormatDouble renders a floating-point value the way Redis does: the shortest
+// form that round-trips, with the infinities spelled "inf"/"-inf" (the spelling
+// Redis both emits and accepts back) rather than Go's "+Inf".
+//
+// It lives here because it is the wire encoding of a double, and both protocols
+// need the identical text: RESP2 puts it in a bulk string and RESP3 after a comma,
+// and a server whose two protocols disagreed about how to spell a score would be
+// reporting two different values.
+func FormatDouble(f float64) string {
+	switch {
+	case math.IsInf(f, 1):
+		return "inf"
+	case math.IsInf(f, -1):
+		return "-inf"
+	case math.IsNaN(f):
+		return "nan"
+	}
+	// A value that is exactly an integer is written as one, with no exponent, which is
+	// what Redis does (its d2string tries an integer conversion first). It matters for the
+	// large integral scores GEOADD produces: a 52-bit geohash rendered as "3.4790999e+15"
+	// is the same number, but not the same text a client comparing against Redis's ZSCORE
+	// expects. The bound is 2^53, past which a float64 no longer represents every integer
+	// and "integral" stops being a meaningful thing to preserve.
+	if f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+// WriteRaw writes bytes that are already in RESP form, without re-encoding them.
+// A partial resync uses it to replay the replication backlog, which stores the exact
+// bytes the replica would have received: decoding them into commands only to encode
+// them again would cost the copy and, worse, risk producing a stream that differs by
+// a byte from the one the offsets were counted over.
+func (w *Writer) WriteRaw(p []byte) error {
+	_, err := w.w.Write(p)
 	return err
+}
+
+// CommandSize reports how many bytes WriteCommand writes for args. It is the single
+// place that knows the encoding's size, so the AOF's growth accounting and the
+// replication offset both measure the stream with the same ruler the writer uses --
+// two independent size formulas would eventually disagree with the bytes on the wire.
+func CommandSize(args [][]byte) int {
+	n := 1 + len(strconv.Itoa(len(args))) + 2 // *<count>\r\n
+	for _, a := range args {
+		n += 1 + len(strconv.Itoa(len(a))) + 2 + len(a) + 2 // $<len>\r\n<payload>\r\n
+	}
+	return n
 }
 
 // WriteCommand encodes args as a client command: a RESP array of bulk strings.
