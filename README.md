@@ -49,10 +49,13 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 - **Six data types** — strings, lists, hashes, sets, **sorted sets backed by a
   hand-written skip list** with O(log n) insertion, deletion and rank queries, and
-  **streams** with consumer groups. 193 commands, including the set algebra
-  (`SINTER`/`SUNION`/`SDIFF` and their `*STORE` forms), score/rank/lex range
+  **streams** with consumer groups. 196 commands, including the set algebra
+  (`SINTER`/`SUNION`/`SDIFF` and their `*STORE` forms), score and rank range
   queries, the positional list operations, and the cursor iterators for every
-  collection.
+  collection. Lexicographic *ranges* (`ZRANGEBYLEX` and its family) and the sorted-set
+  algebra (`ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFF`) are **not** implemented — see
+  [Compatibility](#compatibility-what-is-missing) for the full list of what a client
+  may expect and not find.
 - **Cluster mode** — CRC16-XMODEM hash slots with hash tags, `MOVED`/`ASK`/
   `CROSSSLOT`/`TRYAGAIN`/`CLUSTERDOWN` redirects, the `CLUSTER` administration
   surface (`NODES`/`SLOTS`/`SHARDS` in the exact formats clients parse), and live
@@ -191,10 +194,16 @@ of goroutines and TCP clients — passes under the Go race detector.
   flags) reject malformed and incompatible input rather than letting the last one
   win; AOF rewrites survive a failed swap and surface write/fsync errors instead
   of silently losing durability; passwords are compared in constant time and never
-  logged; a replica always verifies its master's TLS certificate; and every
-  unbounded-growth path a client can drive — a replica feed, a subscriber queue,
-  the replication backlog, the AOF itself — is bounded, with the overflow answered
+  logged; a replica always verifies its master's TLS certificate; and the
+  per-client growth paths — a replica feed, a subscriber queue, a monitor feed, the
+  replication backlog, the AOF itself — are each bounded, with the overflow answered
   by a visible disconnect or a compaction rather than by unbounded memory.
+
+  One path is **not** bounded, and it is worth naming rather than leaving to be
+  discovered: there is no `maxclients`, no idle timeout and no per-client read
+  deadline, and every accepted connection gets a goroutine. A caller that opens
+  connections and never closes them will exhaust memory. See
+  [Compatibility](#compatibility-what-is-missing).
 - **Self-registering command table** — each command declares an arity and either
   a `write` flag, an effect handler, or a session handler for the connection-control
   commands. The `write` flag is what automatically drives both AOF persistence and
@@ -1673,23 +1682,80 @@ documented as approximate anyway.
   that redirected it would silently drop data it is supposed to hold. Redis draws the
   same line (`mustObeyClient`).
 
-## Benchmarks
+## Store microbenchmarks
+
+**These are in-process numbers for the store package, not server throughput.** They
+measure a Go function call against a map behind a shard lock, with no socket, no RESP
+encoding and no syscall involved. A networked server cannot approach them: the TCP and
+protocol path dominates by orders of magnitude. The table is here because it is the
+number the data structures are tuned against, not because it describes what a client
+would see.
 
 Apple Silicon, `go test -bench`, 8 logical cores:
 
-| Operation         | ns/op | allocs/op | throughput     |
-| ----------------- | ----- | --------- | -------------- |
-| `GET` (parallel)  | ~28   | 2         | ~35 M ops/sec  |
-| `SET`             | ~115  | 3         | ~9 M ops/sec   |
-| `INCR` (parallel) | ~77   | 3         | ~13 M ops/sec  |
+| Operation         | ns/op | allocs/op | in-process rate |
+| ----------------- | ----- | --------- | --------------- |
+| `GET` (parallel)  | ~28   | 2         | ~35 M ops/sec   |
+| `SET`             | ~115  | 3         | ~9 M ops/sec    |
+| `INCR` (parallel) | ~77   | 3         | ~13 M ops/sec   |
 
 ```bash
 go test -bench=. -benchmem ./internal/store
 ```
 
 The write-path allocation is the `*entry` that enables in-place LRU bookkeeping
-(see design notes); for a networked store the RESP/TCP path dominates these
-in-memory costs in practice.
+(see design notes).
+
+### End-to-end throughput: no trustworthy numbers yet
+
+There is deliberately **no server-level benchmark table here**, because attempts to
+produce one on a development machine were not reproducible: three consecutive identical
+`redis-benchmark` runs against the same real Redis on Docker Desktop for macOS measured
+78k, 191k and 781k SET/sec — a tenfold spread on the reference implementation itself.
+Publishing a comparison from that host would be publishing noise with a favourable
+number selected from it.
+
+Doing this properly needs a Linux host, cores pinned, the client on separate hardware
+from the server, `memtier_benchmark` rather than a single-threaded driver, and several
+runs with the variance reported alongside the median. Until that exists, the honest
+statement is that end-to-end performance relative to Redis is **unmeasured**.
+
+## Compatibility: what is missing
+
+This server speaks the Redis wire protocol and reports `redis_version:7.4.0` for the
+feature level it implements, which means client libraries and monitoring agents treat it
+as a Redis 7.4 server. The gap between that claim and reality is listed here rather than
+left for a caller to discover at runtime.
+
+**No scripting.** `EVAL`, `EVALSHA`, `FCALL` and the rest are absent — there is no Lua
+interpreter, and adding one would mean a third-party dependency the project does not
+have. `SCRIPT FLUSH`/`EXISTS` and `FUNCTION FLUSH`/`LIST`/`STATS` answer truthfully for a
+server that caches nothing (which is what lets Redis's own test suite run against it),
+but anything that *executes* a script is refused explicitly rather than faked.
+
+The consequence worth knowing: **library features built on scripts do not work**, and
+some of them fail asymmetrically. `redis-py`'s `Lock` acquires successfully and then
+cannot release, because release is a registered script — the lock expires by TTL instead.
+Verified against redis-py 6.4. The same applies to Redisson, BullMQ, Sidekiq and most
+Lua-based rate limiters. If you need those, you need Redis.
+
+**Commands a client may expect and not find**, verified absent: `SORT`/`SORT_RO`;
+`ZRANGEBYLEX`/`ZREVRANGEBYLEX`/`ZREMRANGEBYLEX` and `ZRANGE ... BYLEX` (`ZLEXCOUNT`
+exists, so a lex range can be *counted* but not retrieved); the sorted-set algebra
+`ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZUNION`/`ZINTER`/`ZDIFF`/`ZRANGESTORE`;
+`LPUSHX`/`RPUSHX`; `EXPIRETIME`/`PEXPIRETIME`; `SAVE`/`BGSAVE`; `WAITAOF`; `ACL`.
+
+**No RDB, in either direction.** A full resync ships a stream of RESP commands rather
+than an RDB payload, and `DUMP`/`RESTORE` use a self-describing `SHARDKV1` format that
+real Redis rejects cleanly (and vice versa) rather than misreading. That choice is
+deliberate — a subtly wrong listpack encoding would produce a payload real Redis
+*accepts and misparses*, which is silent corruption — but it has a real cost: **you
+cannot load an existing Redis dataset into this server**, and `redis-cli --rdb`,
+`redis-shake` and live cutover from Redis do not work.
+
+**No connection ceiling.** There is no `maxclients`, no idle timeout and no per-client
+read deadline; each accepted connection gets a goroutine. A client that opens
+connections without closing them will exhaust memory.
 
 ## Testing
 

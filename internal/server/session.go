@@ -102,6 +102,13 @@ type session struct {
 	nPSub         atomic.Int64 // pattern subscriptions
 	listeningPort string       // REPLCONF listening-port, reported by INFO
 
+	// libName and libVer are what CLIENT SETINFO records: the client library behind this
+	// connection, which CLIENT LIST then reports. Modern redis-py and node-redis send them
+	// unprompted on connect, and on a server with many callers they are often the fastest
+	// way to tell whose connection is misbehaving.
+	libName atomic.Pointer[string]
+	libVer  atomic.Pointer[string]
+
 	// isReplicaFeed marks a connection that PSYNC turned into a replication feed.
 	// It is set by handleSync and read by another connection's CLIENT LIST, so it is
 	// atomic.

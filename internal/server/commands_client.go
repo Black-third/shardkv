@@ -12,6 +12,7 @@ package server
 import (
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Black-third/shardkv/internal/resp"
@@ -205,6 +206,32 @@ func cmdClient(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 		sess.name.Store(&name)
 		w.WriteSimple("OK")
 
+	case "SETINFO":
+		// CLIENT SETINFO lib-name|lib-ver <value>, sent unprompted on connect by modern
+		// redis-py and node-redis so that CLIENT LIST shows which library a connection
+		// belongs to. Answering with an error is not fatal -- the clients tolerate it --
+		// but it puts an error in the log of every healthy connection, and the whole point
+		// of the field is to make debugging a busy server easier, which is worth having.
+		if len(args) != 4 {
+			w.WriteError("ERR wrong number of arguments for 'client|setinfo' command")
+			return
+		}
+		value := string(args[3])
+		if strings.ContainsAny(value, " \n\r") {
+			w.WriteError("ERR lib-name cannot contain spaces, newlines or special characters.")
+			return
+		}
+		switch strings.ToUpper(string(args[2])) {
+		case "LIB-NAME":
+			sess.libName.Store(&value)
+		case "LIB-VER":
+			sess.libVer.Store(&value)
+		default:
+			w.WriteError("ERR Unrecognized option '" + string(args[2]) + "'")
+			return
+		}
+		w.WriteSimple("OK")
+
 	case "INFO":
 		// A verbatim string in RESP3, as in Redis: the line is meant to be read, not
 		// escaped onto one line by the client's pretty-printer.
@@ -256,7 +283,19 @@ func clientInfoLine(sess *session) string {
 		" sub=" + strconv.FormatInt(sess.nSub.Load(), 10) +
 		" psub=" + strconv.FormatInt(sess.nPSub.Load(), 10) +
 		" multi=" + multi +
-		" cmd=" + sess.lastCommand()
+		" cmd=" + sess.lastCommand() +
+		// Reported even when empty, because Redis reports them unconditionally and a
+		// parser that splits on spaces counts fields.
+		" lib-name=" + loadString(&sess.libName) +
+		" lib-ver=" + loadString(&sess.libVer)
+}
+
+// loadString reads an optional atomic string, returning "" when nothing was stored.
+func loadString(p *atomic.Pointer[string]) string {
+	if v := p.Load(); v != nil {
+		return *v
+	}
+	return ""
 }
 
 // clientUnblock implements CLIENT UNBLOCK <id> [TIMEOUT|ERROR]: end another

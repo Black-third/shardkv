@@ -376,18 +376,182 @@ func TestCommandIntrospection(t *testing.T) {
 		}
 	}
 
-	// DOCS is what redis-cli asks for on connect: a name -> attributes map.
+	// DOCS is what redis-cli and several client libraries ask for on connect: a name ->
+	// attributes map. Its fields are *not* COMMAND INFO's fields, and the difference is
+	// load-bearing rather than cosmetic: redis-py walks the DOCS map converting the fields
+	// it knows, and an integer under a key DOCS does not define made it raise
+	// `ValueError: invalid literal for int() with base 10` before the application's first
+	// command. `arity` is a COMMAND INFO field; asserting it here pinned the bug.
 	docs := c.cmd("COMMAND DOCS get")
-	for _, want := range []string{"get", "summary", "arity", "since"} {
+	for _, want := range []string{"get", "summary", "since", "group"} {
 		if !contains(docs, want) {
 			t.Errorf("COMMAND DOCS get is missing %q; got %q", want, docs)
 		}
+	}
+	if contains(docs, "arity") {
+		t.Errorf("COMMAND DOCS reports arity, which is a COMMAND INFO field: %q", docs)
+	}
+	// The group has to be the command's actual family, or a client that buckets commands
+	// by it mislabels every one of them.
+	for _, tc := range []struct{ cmd, want string }{
+		{"COMMAND DOCS get", "string"},
+		{"COMMAND DOCS lpush", "list"},
+		{"COMMAND DOCS zadd", "sorted_set"},
+		{"COMMAND DOCS hset", "hash"},
+		{"COMMAND DOCS sadd", "set"},
+		{"COMMAND DOCS xadd", "stream"},
+		{"COMMAND DOCS pfadd", "hyperloglog"},
+		{"COMMAND DOCS geoadd", "geo"},
+		{"COMMAND DOCS setbit", "bitmap"},
+		{"COMMAND DOCS subscribe", "pubsub"},
+		{"COMMAND DOCS multi", "transactions"},
+		{"COMMAND DOCS echo", "connection"},
+		{"COMMAND DOCS info", "server"},
+		{"COMMAND DOCS cluster", "cluster"},
+		{"COMMAND DOCS del", "generic"},
+	} {
+		if got := c.cmd(tc.cmd); !contains(got, tc.want) {
+			t.Errorf("%s should report group %q; got %q", tc.cmd, tc.want, got)
+		}
+	}
+	// arity still belongs to INFO, so the coverage the assertion above gave up is kept here.
+	if got := c.cmd("COMMAND INFO get"); !contains(got, ":2") {
+		t.Errorf("COMMAND INFO get should still carry the arity: %q", got)
 	}
 	if got := c.cmd("COMMAND DOCS nosuchcommand"); got != "[]" {
 		t.Errorf("COMMAND DOCS of an unknown command = %q; want an empty map", got)
 	}
 	if got := c.cmd("COMMAND BOGUS"); !contains(got, "Unknown subcommand") {
 		t.Errorf("COMMAND BOGUS = %q", got)
+	}
+}
+
+// TestEchoIsAvailable covers ECHO, which looks like a toy and is not.
+//
+// StackExchange.Redis issues ECHO while establishing a connection, so a server without it
+// cannot be reached by any .NET client at all: the handshake fails before the application
+// sends its first command. It was missing here, and nothing in the test suite noticed
+// because nothing in the test suite is a .NET client.
+func TestEchoIsAvailable(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	if got := c.cmd("ECHO hello"); got != "hello" {
+		t.Errorf("ECHO hello = %q; want hello", got)
+	}
+	// An empty payload is still a bulk string, not a null.
+	if got := c.cmdRaw("ECHO", ""); got != "" {
+		t.Errorf("ECHO \"\" = %q; want an empty bulk string", got)
+	}
+	if got := c.cmd("ECHO"); !contains(got, "wrong number of arguments") {
+		t.Errorf("ECHO with no argument = %q; want an arity error", got)
+	}
+	if got := c.cmd("ECHO one two"); !contains(got, "wrong number of arguments") {
+		t.Errorf("ECHO with two arguments = %q; want an arity error", got)
+	}
+}
+
+// TestScriptAndFunctionStubs covers the two subcommands that decide whether Redis's own
+// test suite can run against this server at all.
+//
+// There is no Lua interpreter here, and EVAL is honestly absent. But the suite's setup
+// path flushes scripts and functions before each unit, and an error there stops it before
+// a single test executes -- so the difference between answering these and not is the
+// difference between "untestable by Redis's suite" and "passes N of Redis's own tests".
+// Both answers are truthful on a server that caches nothing.
+func TestScriptAndFunctionStubs(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	cases := []struct{ cmd, want string }{
+		{"SCRIPT FLUSH", "+OK"},
+		{"SCRIPT FLUSH ASYNC", "+OK"},
+		{"FUNCTION FLUSH", "+OK"},
+		{"FUNCTION LIST", "[]"},
+		// Nothing is cached, so nothing exists -- one answer per sha asked about.
+		{"SCRIPT EXISTS abc", "[:0]"},
+		{"SCRIPT EXISTS abc def", "[:0 :0]"},
+	}
+	for _, tc := range cases {
+		if got := c.cmd(tc.cmd); got != tc.want {
+			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
+		}
+	}
+	// What is not supported says so, rather than pretending: SCRIPT LOAD must hand back a
+	// sha the client can then EVALSHA, and there is nothing to hand back.
+	if got := c.cmd("SCRIPT LOAD \"return 1\""); !contains(got, "not supported") {
+		t.Errorf("SCRIPT LOAD = %q; want an explicit refusal", got)
+	}
+	if got := c.cmd("FUNCTION LOAD whatever"); !contains(got, "not supported") {
+		t.Errorf("FUNCTION LOAD = %q; want an explicit refusal", got)
+	}
+}
+
+// TestInfoReportsRedisVersionAndMemory covers the fields monitoring tools parse.
+//
+// redis_exporter and every Grafana dashboard built on it read redis_version and
+// used_memory; a server reporting neither is invisible to all of that tooling, and a
+// client library that gates features on the version either fails or assumes the oldest
+// server it supports.
+func TestInfoReportsRedisVersionAndMemory(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	server := c.cmd("INFO server")
+	for _, want := range []string{"redis_version:", "redis_mode:standalone", "loading:0", "shardkv_version:"} {
+		if !contains(server, want) {
+			t.Errorf("INFO server is missing %q; got %q", want, server)
+		}
+	}
+
+	mem := c.cmd("INFO memory")
+	for _, want := range []string{"used_memory:", "used_memory_human:", "maxmemory:", "maxmemory_policy:"} {
+		if !contains(mem, want) {
+			t.Errorf("INFO memory is missing %q; got %q", want, mem)
+		}
+	}
+	// A bare INFO has to carry them too, since that is what an agent polls.
+	if all := c.cmd("INFO"); !contains(all, "redis_version:") || !contains(all, "used_memory:") {
+		t.Errorf("a bare INFO omits redis_version or used_memory")
+	}
+}
+
+// TestClientSetInfo covers the handshake field modern redis-py and node-redis send
+// unprompted, and that CLIENT LIST reports it back -- recording a value nothing ever
+// shows would be pointless.
+func TestClientSetInfo(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	if got := c.cmd("CLIENT SETINFO LIB-NAME redis-py"); got != "+OK" {
+		t.Errorf("CLIENT SETINFO LIB-NAME = %q", got)
+	}
+	if got := c.cmd("CLIENT SETINFO LIB-VER 8.1.0"); got != "+OK" {
+		t.Errorf("CLIENT SETINFO LIB-VER = %q", got)
+	}
+	info := c.cmd("CLIENT INFO")
+	for _, want := range []string{"lib-name=redis-py", "lib-ver=8.1.0"} {
+		if !contains(info, want) {
+			t.Errorf("CLIENT INFO is missing %q; got %q", want, info)
+		}
+	}
+	// An unset library still reports the fields, because a client that splits the line on
+	// spaces counts them.
+	fresh := dialTx(t, addr)
+	defer fresh.close()
+	if got := fresh.cmd("CLIENT INFO"); !contains(got, "lib-name=") {
+		t.Errorf("CLIENT INFO omits lib-name when unset: %q", got)
+	}
+	if got := c.cmd("CLIENT SETINFO BOGUS x"); !contains(got, "Unrecognized option") {
+		t.Errorf("CLIENT SETINFO with an unknown attribute = %q", got)
 	}
 }
 
