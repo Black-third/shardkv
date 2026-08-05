@@ -457,7 +457,7 @@ func crossDBTarget(name string, args [][]byte) (db int, key string, ok bool) {
 // concurrent change.
 func affectedKeys(name string, args [][]byte) []string {
 	switch name {
-	case "MSET":
+	case "MSET", "MSETNX":
 		var ks []string
 		for i := 1; i+1 < len(args); i += 2 {
 			ks = append(ks, string(args[i]))

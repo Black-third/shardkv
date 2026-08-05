@@ -66,6 +66,35 @@ func cmdDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 		debugObject(s, w, string(args[2]))
 
+	case "SET-ACTIVE-EXPIRE":
+		// Turns the janitor's expiry sweep off, so a test can observe lazy expiration --
+		// that a *read* is what removed a key past its deadline -- without the background
+		// pass racing it and reclaiming the key first. Implemented rather than stubbed,
+		// because a stub that accepted the flag and kept sweeping would make exactly the
+		// tests that ask for it flaky. Correctness never depends on it: the lazy check on
+		// every read is what keeps an expired key invisible, and the sweep only reclaims
+		// memory.
+		if len(args) != 3 {
+			w.WriteError("ERR wrong number of arguments for 'debug|set-active-expire' command")
+			return false
+		}
+		on, ok := parseInt64(args[2])
+		if !ok || (on != 0 && on != 1) {
+			w.WriteError("ERR Invalid argument")
+			return false
+		}
+		s.store.SetActiveExpire(on == 1)
+		w.WriteSimple("OK")
+
+	case "JMAP", "STRINGMATCH-LEN", "QUICKLIST-PACKED-THRESHOLD", "LISTPACK", "LISTPACK-ENTRIES":
+		// Accepted and ignored. These ask the server to dump internal representations or
+		// to tune thresholds of encodings this store does not have -- there is one
+		// representation per type here, so there is nothing to switch or to print. They
+		// are answered rather than refused because Redis's test suite calls them in
+		// passing, and an error would cost every assertion after the call in that file
+		// while telling nobody anything.
+		w.WriteSimple("OK")
+
 	case "CHANGE-REPL-ID":
 		// Honest here: the replication ID names the history this server serves, and
 		// changing it is exactly how a test forces the next PSYNC to fall back to a full

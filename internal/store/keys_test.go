@@ -248,3 +248,58 @@ func TestRenameNXAndTouch(t *testing.T) {
 		t.Error("Touch reported a missing key as present")
 	}
 }
+
+// TestEncodingReportsRepresentationNotContent covers what OBJECT ENCODING names.
+//
+// The field describes how a value is *stored*, not what its bytes happen to look like.
+// Redis tries an integer encoding when a value is stored whole and does not re-encode one
+// it has appended to, so `SET k 1` then `APPEND k 2` leaves a value that reads "12" and
+// is still a plain buffer. Deriving the answer from the content instead reports `int`
+// both times -- wrong in a way that matters, because assert_encoding runs throughout
+// Redis's own test suite and memory-analysis tools read the field.
+func TestEncodingReportsRepresentationNotContent(t *testing.T) {
+	s := New(8)
+
+	s.Set("k", []byte("1"), 0)
+	if enc, _ := s.Encoding("k"); enc != "int" {
+		t.Errorf("a whole numeric value encodes as %q; want int", enc)
+	}
+	if _, err := s.Append("k", []byte("2")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if v, _ := s.Get("k"); string(v) != "12" {
+		t.Fatalf("Append produced %q; want 12", v)
+	}
+	if enc, _ := s.Encoding("k"); enc != "raw" {
+		t.Errorf("an appended value encodes as %q; want raw (it reads as a number but is a buffer)", enc)
+	}
+	// Storing it whole again re-encodes, as Redis re-encodes on SET.
+	s.Set("k", []byte("12"), 0)
+	if enc, _ := s.Encoding("k"); enc != "int" {
+		t.Errorf("re-storing the value whole encodes as %q; want int", enc)
+	}
+	// INCR re-encodes too: it writes a fresh integer.
+	if _, err := s.Incr("k", 1); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	if enc, _ := s.Encoding("k"); enc != "int" {
+		t.Errorf("after INCR the encoding is %q; want int", enc)
+	}
+
+	// SETRANGE writes into a value, so it is a buffer for the same reason.
+	s.Set("r", []byte("9"), 0)
+	if _, err := s.SetRange("r", 1, []byte("9")); err != nil {
+		t.Fatalf("SetRange: %v", err)
+	}
+	if enc, _ := s.Encoding("r"); enc != "raw" {
+		t.Errorf("a value written into by SETRANGE encodes as %q; want raw", enc)
+	}
+
+	// A bitmap is a string that was never stored whole.
+	if _, err := s.SetBit("b", 7, true); err != nil {
+		t.Fatalf("SetBit: %v", err)
+	}
+	if enc, _ := s.Encoding("b"); enc != "raw" {
+		t.Errorf("a bitmap encodes as %q; want raw", enc)
+	}
+}

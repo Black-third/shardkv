@@ -130,7 +130,9 @@ func (s *Store) SetRange(key string, offset int, val []byte) (int, error) {
 	nv := make([]byte, n)
 	copy(nv, base)
 	copy(nv[offset:], val)
-	ne := &entry{kind: kindString, str: nv, expireAt: expireAt}
+	// Written into rather than stored whole, so it stays a plain buffer: see
+	// entry.rawString and OBJECT ENCODING.
+	ne := &entry{kind: kindString, str: nv, rawString: true, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return n, nil

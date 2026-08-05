@@ -220,11 +220,17 @@ func (s *Store) Encoding(key string) (string, bool) {
 	}
 	switch e.kind {
 	case kindString:
-		if _, err := strconv.ParseInt(string(e.str), 10, 64); err == nil && len(e.str) <= 20 {
-			return "int", true
-		}
-		if len(e.str) <= 44 {
-			return "embstr", true
+		// A value that has been appended to or written into stays a plain buffer, whatever
+		// its bytes now look like: the encoding names the representation, not the content.
+		// See entry.rawString -- `SET k 1` then `APPEND k 2` reads "12" and is still raw,
+		// which is what Redis reports.
+		if !e.rawString {
+			if _, err := strconv.ParseInt(string(e.str), 10, 64); err == nil && len(e.str) <= 20 {
+				return "int", true
+			}
+			if len(e.str) <= 44 {
+				return "embstr", true
+			}
 		}
 		return "raw", true
 	case kindList:

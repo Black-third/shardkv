@@ -45,6 +45,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 )
 
 // Protocol versions a Writer can serialize replies in.
@@ -514,7 +515,56 @@ func FormatDouble(f float64) string {
 	if f == math.Trunc(f) && math.Abs(f) < 1<<53 {
 		return strconv.FormatInt(int64(f), 10)
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+
+	// Otherwise: shortest round-trip digits, in fixed notation over the range where Redis
+	// uses fixed notation, and scientific outside it.
+	//
+	// Go's 'g' verb cannot be used directly. It switches to an exponent far earlier than
+	// Redis does -- it renders 17179869185.5 as "1.71798691855e+10" where Redis returns
+	// "17179869185.5" -- and that is not merely a cosmetic reply difference here. Per the
+	// effect-propagation invariant, INCRBYFLOAT ships its result as `SET key <result>`, so
+	// the formatted text is what reaches the AOF and every replica; a later increment then
+	// has to re-parse it. A value whose scale changes its serialisation is a bad thing to
+	// build durability on.
+	//
+	// The bounds were measured against redis:7.2 rather than derived: exponent 18 formats
+	// fixed and 19 scientific, -6 formats fixed and -7 scientific.
+	exp := decimalExponent(f)
+	if exp >= -6 && exp <= 18 {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return trimExponentZeros(strconv.FormatFloat(f, 'e', -1, 64))
+}
+
+// decimalExponent is floor(log10(|f|)), computed from the formatted digits rather than
+// with math.Log10 so it cannot disagree with the digits actually emitted at a power-of-ten
+// boundary (where Log10 rounding would put the value on the wrong side of a bound).
+func decimalExponent(f float64) int {
+	s := strconv.FormatFloat(f, 'e', -1, 64)
+	i := strings.IndexByte(s, 'e')
+	if i < 0 {
+		return 0
+	}
+	exp, err := strconv.Atoi(s[i+1:])
+	if err != nil {
+		return 0
+	}
+	return exp
+}
+
+// trimExponentZeros rewrites Go's zero-padded exponent into the form Redis prints: Go
+// renders 1e-7 as "1e-07", Redis as "1e-7". Clients compare these strings.
+func trimExponentZeros(s string) string {
+	i := strings.IndexByte(s, 'e')
+	if i < 0 || i+2 >= len(s) {
+		return s
+	}
+	mantissa, sign, digits := s[:i], s[i+1], s[i+2:]
+	digits = strings.TrimLeft(digits, "0")
+	if digits == "" {
+		digits = "0"
+	}
+	return mantissa + "e" + string(sign) + digits
 }
 
 // WriteRaw writes bytes that are already in RESP form, without re-encoding them.

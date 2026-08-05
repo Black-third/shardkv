@@ -54,7 +54,7 @@ func (s *Store) stringForWrite(sh *shard, key string, now time.Time) (*entry, er
 		}
 		return e, nil
 	}
-	e = &entry{kind: kindString}
+	e = &entry{kind: kindString, rawString: true}
 	sh.data[key] = e
 	return e, nil
 }
@@ -366,7 +366,7 @@ func (s *Store) BitOp(op BitOpKind, dst string, srcs []string) (int, error) {
 	// The destination is replaced outright, TTL and all: BITOP computes a new value
 	// rather than editing one, so carrying over the old key's expiry would attach a
 	// deadline that described different data.
-	ne := &entry{kind: kindString, str: out}
+	ne := &entry{kind: kindString, str: out, rawString: true}
 	s.touch(ne, now)
 	dsh.data[dst] = ne
 	return len(out), nil
