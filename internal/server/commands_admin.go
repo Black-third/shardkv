@@ -2,10 +2,12 @@ package server
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,9 +19,27 @@ import (
 // and logged at startup.
 const Version = "0.3.0"
 
+// RedisCompatVersion is the Redis feature level this server implements, reported as
+// INFO's redis_version and by HELLO.
+//
+// It is deliberately a separate constant from Version. Client libraries and monitoring
+// agents branch on redis_version -- to decide whether HELLO is available, whether a
+// command takes a newer option, whether to expect a field in a reply -- so the value has
+// to describe *what is implemented here*, not what this build is called. Raising it is a
+// claim: it means the commands and reply shapes that release introduced are present.
+//
+// 7.4 is the level claimed: RESP3, streams with consumer groups, functions-free scripting
+// absence aside, the expire flag families, OBJECT ENCODING names, cluster slots/shards
+// replies. What is genuinely missing at this level is recorded in the README's
+// compatibility section rather than papered over by lowering this number.
+const RedisCompatVersion = "7.4.0"
+
 func init() {
 	register("PING", -1, false, cmdPing)
+	register("ECHO", 2, false, cmdEcho)
 	register("INFO", -1, false, cmdInfo)
+	register("SCRIPT", -2, false, cmdScript)
+	register("FUNCTION", -2, false, cmdFunction)
 	register("DBSIZE", 1, false, cmdDBSize)
 	register("FLUSHALL", 1, true, cmdFlushAll)
 	register("FLUSHDB", 1, true, cmdFlushDB)
@@ -40,6 +60,94 @@ func cmdPing(s *Server, w *resp.Writer, args [][]byte) bool {
 	return false
 }
 
+// cmdEcho returns its argument.
+//
+// It looks like a toy, and it is the single most load-bearing trivial command here:
+// StackExchange.Redis issues ECHO as part of establishing a connection, so a server
+// without it cannot be reached by any .NET client at all -- the handshake fails before
+// the application's first command. Several other libraries use it to measure round-trip
+// latency and to prove a pooled connection is still the one they think it is.
+func cmdEcho(s *Server, w *resp.Writer, args [][]byte) bool {
+	w.WriteBulk(args[1])
+	return false
+}
+
+// cmdScript answers the SCRIPT subcommands a client sends when it is *not* running a
+// script. There is no Lua interpreter here (see the README's compatibility section), so
+// EVAL and friends are absent and honestly so -- but SCRIPT FLUSH and SCRIPT EXISTS are
+// asked by callers that are only tidying up or checking, and both have truthful answers
+// on a server that caches no scripts: flushing an empty cache succeeds, and nothing
+// exists.
+//
+// This is what lets Redis's own test suite run against this server in external mode: its
+// setup path flushes scripts and functions before each unit, and an error there stops the
+// suite before a single test executes. Answering these two is the difference between
+// "cannot be tested by Redis's suite" and "passes N of Redis's own tests".
+func cmdScript(s *Server, w *resp.Writer, args [][]byte) bool {
+	switch strings.ToUpper(string(args[1])) {
+	case "FLUSH":
+		w.WriteSimple("OK")
+	case "EXISTS":
+		w.WriteArrayHeader(len(args) - 2)
+		for range args[2:] {
+			w.WriteInt(0)
+		}
+	case "HELP":
+		writeScriptHelp(w)
+	default:
+		// LOAD would be a lie: it must return a sha the client can then EVALSHA.
+		w.WriteError("ERR This Redis command is not allowed from script: " +
+			"scripting is not supported by this server")
+	}
+	return false
+}
+
+// cmdFunction is the SCRIPT story for Redis Functions, and for the same reason: the test
+// suite's setup flushes them.
+func cmdFunction(s *Server, w *resp.Writer, args [][]byte) bool {
+	switch strings.ToUpper(string(args[1])) {
+	case "FLUSH":
+		w.WriteSimple("OK")
+	case "LIST":
+		w.WriteArrayHeader(0)
+	case "STATS":
+		w.WriteMapHeader(3)
+		w.WriteBulk([]byte("running_script"))
+		w.WriteNull()
+		w.WriteBulk([]byte("engines"))
+		w.WriteMapHeader(0)
+		w.WriteBulk([]byte("cluster_enabled"))
+		w.WriteInt(boolToInt64(s.ClusterEnabled()))
+	case "DUMP":
+		w.WriteBulk(nil)
+	case "HELP":
+		writeFunctionHelp(w)
+	default:
+		w.WriteError("ERR Functions are not supported by this server")
+	}
+	return false
+}
+
+func writeScriptHelp(w *resp.Writer) {
+	w.WriteArrayHeader(3)
+	w.WriteSimple("SCRIPT FLUSH -- Flush the scripts cache (always empty here).")
+	w.WriteSimple("SCRIPT EXISTS <sha1> [<sha1> ...] -- Always 0: no scripts are cached.")
+	w.WriteSimple("Scripting (EVAL/EVALSHA) is not supported by this server.")
+}
+
+func writeFunctionHelp(w *resp.Writer) {
+	w.WriteArrayHeader(2)
+	w.WriteSimple("FUNCTION FLUSH|LIST|STATS|DUMP -- Answered for compatibility; nothing is loaded.")
+	w.WriteSimple("Functions (FCALL) are not supported by this server.")
+}
+
+func boolToInt64(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // infoSection is one titled block of INFO. Splitting the report into named sections is
 // not cosmetic: INFO is polled by monitoring agents, and one that wants the
 // replication offsets should not have to receive (and parse past) the whole keyspace
@@ -58,6 +166,7 @@ type infoSection struct {
 var infoSections = []infoSection{
 	{name: "server", render: infoServer},
 	{name: "clients", render: infoClients},
+	{name: "memory", render: infoMemory},
 	{name: "persistence", render: infoPersistence},
 	{name: "stats", render: infoStats},
 	{name: "replication", render: infoReplication},
@@ -112,12 +221,73 @@ func infoWanted(wanted [][]byte, name string, optional bool) bool {
 }
 
 func infoServer(s *Server, b *strings.Builder) {
+	// redis_version comes first and is not decoration. Every Redis monitoring agent
+	// (redis_exporter and the Grafana dashboards built on it) parses this field, and
+	// client libraries gate features on it -- a client that cannot find it either fails
+	// or assumes the oldest server it supports. Reporting shardkv_version alone made the
+	// server invisible to all of that tooling.
+	//
+	// The value is the Redis feature level this server implements, not a claim to be
+	// Redis: shardkv_version below is the real build. Raising it means having implemented
+	// what that release added.
+	fmt.Fprintf(b, "redis_version:%s\r\n", RedisCompatVersion)
+	fmt.Fprintf(b, "redis_mode:%s\r\n", s.redisMode())
+	// loading:0 says the dataset is ready to serve. Clients poll it after connecting to a
+	// server that might still be replaying an AOF; a missing field reads as unknown.
+	fmt.Fprintf(b, "loading:%d\r\n", 0)
 	fmt.Fprintf(b, "shardkv_version:%s\r\n", Version)
 	fmt.Fprintf(b, "go_version:%s\r\n", runtime.Version())
+	fmt.Fprintf(b, "os:%s %s\r\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(b, "arch_bits:%d\r\n", strconv.IntSize)
 	fmt.Fprintf(b, "process_id:%d\r\n", os.Getpid())
+	fmt.Fprintf(b, "run_id:%s\r\n", s.replID)
 	fmt.Fprintf(b, "tcp_port:%s\r\n", s.listeningPort())
 	fmt.Fprintf(b, "uptime_in_seconds:%d\r\n", int(time.Since(s.startTime).Seconds()))
+	fmt.Fprintf(b, "uptime_in_days:%d\r\n", int(time.Since(s.startTime).Hours()/24))
 	fmt.Fprintf(b, "shards:%d\r\n", s.store.Shards())
+}
+
+// redisMode is what INFO and HELLO report for the deployment shape. Redis answers
+// "cluster" or "standalone"; a client uses it to decide whether to expect redirects.
+func (s *Server) redisMode() string {
+	if s.ClusterEnabled() {
+		return "cluster"
+	}
+	return "standalone"
+}
+
+// infoMemory reports the memory fields monitoring agents chart.
+//
+// Go does not expose a process RSS, and this server has no allocator it controls the
+// way Redis controls jemalloc, so used_memory is the Go heap in use -- an honest
+// approximation of "how much of the dataset is resident", which is what the field is
+// read for. maxmemory is reported as 0 (no limit) because eviction here is bounded by
+// -maxkeys rather than by a byte budget; reporting a byte limit this server does not
+// enforce would be a lie a client could act on.
+func infoMemory(s *Server, b *strings.Builder) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Fprintf(b, "used_memory:%d\r\n", m.HeapAlloc)
+	fmt.Fprintf(b, "used_memory_human:%.2fM\r\n", float64(m.HeapAlloc)/(1024*1024))
+	fmt.Fprintf(b, "used_memory_rss:%d\r\n", m.Sys)
+	fmt.Fprintf(b, "used_memory_peak:%d\r\n", m.HeapSys)
+	fmt.Fprintf(b, "used_memory_lua:%d\r\n", 0)
+	fmt.Fprintf(b, "number_of_cached_scripts:%d\r\n", 0)
+	fmt.Fprintf(b, "maxmemory:%d\r\n", 0)
+	fmt.Fprintf(b, "maxmemory_human:0B\r\n")
+	fmt.Fprintf(b, "maxmemory_policy:%s\r\n", s.maxmemoryPolicy())
+	fmt.Fprintf(b, "mem_allocator:go-%s\r\n", runtime.Version())
+	fmt.Fprintf(b, "mem_fragmentation_ratio:%.2f\r\n", float64(m.Sys)/math.Max(float64(m.HeapAlloc), 1))
+}
+
+// maxmemoryPolicy describes what this server does when it is full. With -maxkeys set it
+// samples and evicts by approximate LRU, which is allkeys-lru; without it nothing is
+// evicted, which is noeviction.
+func (s *Server) maxmemoryPolicy() string {
+	if s.store.MaxKeys() > 0 {
+		return "allkeys-lru"
+	}
+	return "noeviction"
 }
 
 func infoClients(s *Server, b *strings.Builder) {
@@ -510,14 +680,103 @@ func writeCommandDocs(w *resp.Writer, names []string) {
 	for _, name := range present {
 		cmd := commandTable[name]
 		w.WriteBulk([]byte(cmd.lowerName))
+		// Only fields COMMAND DOCS actually defines, all string-valued.
+		//
+		// This previously emitted "arity" here, which belongs to COMMAND INFO, not DOCS --
+		// and clients parse the two replies with different expectations. redis-py walks the
+		// DOCS map converting known fields, and an integer under a key it does not expect
+		// made it raise `ValueError: invalid literal for int() with base 10` before the
+		// application's first command. Every field of DOCS is optional, so reporting fewer
+		// honest ones is correct where inventing structure is not.
 		w.WriteMapHeader(3)
 		w.WriteBulk([]byte("summary"))
 		w.WriteBulk([]byte(commandSummary(cmd)))
 		w.WriteBulk([]byte("since"))
-		w.WriteBulk([]byte(Version))
-		w.WriteBulk([]byte("arity"))
-		w.WriteInt(int64(cmd.arity))
+		w.WriteBulk([]byte(commandSince(cmd)))
+		w.WriteBulk([]byte("group"))
+		w.WriteBulk([]byte(commandGroup(name)))
 	}
+}
+
+// commandSince is the "since" DOCS field: the version in which a command appeared.
+//
+// This server does not track per-command history, and inventing one would be a fiction a
+// client could branch on. Reporting the compatibility level says the honest thing -- "this
+// is available at the level this server implements" -- without claiming a Redis release
+// history it does not have.
+func commandSince(cmd *command) string { return RedisCompatVersion }
+
+// commandGroup classifies a command the way COMMAND DOCS and COMMAND INFO's ACL
+// categories do. It is derived from the name rather than stored on the table entry: the
+// grouping is a documentation concern, and threading a field through 190-odd
+// registrations to serve one introspection reply would put the cost on every command.
+func commandGroup(name string) string {
+	switch {
+	case strings.HasPrefix(name, "X"):
+		return "stream"
+	case strings.HasPrefix(name, "PF"):
+		return "hyperloglog"
+	case strings.HasPrefix(name, "GEO"):
+		return "geo"
+	case strings.HasPrefix(name, "CLUSTER"), name == "ASKING", name == "READONLY", name == "READWRITE":
+		return "cluster"
+	case strings.HasPrefix(name, "SUBSCRIBE"), strings.HasPrefix(name, "PSUBSCRIBE"),
+		strings.HasPrefix(name, "UNSUBSCRIBE"), strings.HasPrefix(name, "PUNSUBSCRIBE"),
+		strings.HasPrefix(name, "PUBSUB"), name == "PUBLISH", name == "SPUBLISH":
+		return "pubsub"
+	case strings.HasPrefix(name, "Z"):
+		return "sorted_set"
+	case strings.HasPrefix(name, "H"):
+		return "hash"
+	case strings.HasPrefix(name, "SCRIPT"), strings.HasPrefix(name, "FUNCTION"),
+		strings.HasPrefix(name, "EVAL"), strings.HasPrefix(name, "FCALL"):
+		return "scripting"
+	default:
+		if group, ok := commandGroups[name]; ok {
+			return group
+		}
+		return "generic"
+	}
+}
+
+// commandGroups holds the commands whose group its name does not imply. The
+// prefix rules in commandGroup cover the type families; these are the rest.
+var commandGroups = map[string]string{
+	"APPEND": "string", "DECR": "string", "DECRBY": "string", "GET": "string",
+	"GETDEL": "string", "GETEX": "string", "GETRANGE": "string", "GETSET": "string",
+	"INCR": "string", "INCRBY": "string", "INCRBYFLOAT": "string", "MGET": "string",
+	"MSET": "string", "MSETNX": "string", "PSETEX": "string", "SET": "string",
+	"SETEX": "string", "SETNX": "string", "SETRANGE": "string", "STRLEN": "string",
+	"SUBSTR": "string", "LCS": "string",
+
+	"SETBIT": "bitmap", "GETBIT": "bitmap", "BITCOUNT": "bitmap", "BITPOS": "bitmap",
+	"BITOP": "bitmap", "BITFIELD": "bitmap", "BITFIELD_RO": "bitmap",
+
+	"BLMOVE": "list", "BLMPOP": "list", "BLPOP": "list", "BRPOP": "list",
+	"BRPOPLPUSH": "list", "LINDEX": "list", "LINSERT": "list", "LLEN": "list",
+	"LMOVE": "list", "LMPOP": "list", "LPOP": "list", "LPOS": "list", "LPUSH": "list",
+	"LPUSHX": "list", "LRANGE": "list", "LREM": "list", "LSET": "list", "LTRIM": "list",
+	"RPOP": "list", "RPOPLPUSH": "list", "RPUSH": "list", "RPUSHX": "list",
+
+	"SADD": "set", "SCARD": "set", "SDIFF": "set", "SDIFFSTORE": "set", "SINTER": "set",
+	"SINTERCARD": "set", "SINTERSTORE": "set", "SISMEMBER": "set", "SMEMBERS": "set",
+	"SMISMEMBER": "set", "SMOVE": "set", "SPOP": "set", "SRANDMEMBER": "set",
+	"SREM": "set", "SSCAN": "set", "SUNION": "set", "SUNIONSTORE": "set",
+
+	"AUTH": "connection", "CLIENT": "connection", "ECHO": "connection",
+	"HELLO": "connection", "PING": "connection", "QUIT": "connection",
+	"RESET": "connection", "SELECT": "connection",
+
+	"BGREWRITEAOF": "server", "COMMAND": "server", "CONFIG": "server", "DBSIZE": "server",
+	"DEBUG": "server", "FLUSHALL": "server", "FLUSHDB": "server", "INFO": "server",
+	"LASTSAVE": "server", "LATENCY": "server", "MEMORY": "server", "MONITOR": "server",
+	"REPLICAOF": "server", "SLAVEOF": "server", "SHUTDOWN": "server", "SLOWLOG": "server",
+	"SWAPDB": "server",
+
+	"DISCARD": "transactions", "EXEC": "transactions", "MULTI": "transactions",
+	"UNWATCH": "transactions", "WATCH": "transactions",
+
+	"PSYNC": "replication", "REPLCONF": "replication", "WAIT": "replication",
 }
 
 func commandSummary(cmd *command) string {
