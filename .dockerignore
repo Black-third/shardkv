@@ -1,0 +1,23 @@
+.git
+.github
+.gitignore
+.DS_Store
+.idea
+.vscode
+Dockerfile
+.dockerignore
+Makefile
+README.md
+LICENSE
+CLAUDE.md
+
+# Build and test output that must never reach the build context.
+/shardkv
+/bin
+*.exe
+*.out
+*.test
+*.aof
+
+# Fuzz corpora can grow large and are regenerated on demand.
+**/testdata/fuzz

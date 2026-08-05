@@ -105,8 +105,8 @@ func (s *Store) StrLen(key string) (int, error) {
 	now := s.clock()
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindString {
@@ -119,18 +119,9 @@ func (s *Store) StrLen(key string) (int, error) {
 
 // ExpireAt sets an absolute expiry on an existing live key. A past deadline
 // makes the key eligible for removal on the next access/sweep. Reports false if
-// the key is missing or already expired.
+// the key is missing or already expired. It is ExpireAtCond with no condition.
 func (s *Store) ExpireAt(key string, deadline time.Time) bool {
-	sh := s.getShard(key)
-	now := s.clock()
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
-		return false
-	}
-	e.expireAt = deadline
-	return true
+	return s.ExpireAtCond(key, deadline, ExpireAlways)
 }
 
 // Persist removes the TTL from key, making it permanent. Reports whether a TTL

@@ -59,26 +59,8 @@ func (z *zset) remove(member string) bool {
 // newly-created members (0 or 1); changed reports whether the set was modified
 // (false for a same-score no-op, so the caller can skip propagation).
 func (s *Store) ZAdd(key string, member string, score float64) (added int, changed bool, err error) {
-	sh := s.getShard(key)
-	now := s.clock()
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
-	e, found := sh.data[key]
-	live := found && !e.expired(now)
-	if live && e.kind != kindZSet {
-		return 0, false, ErrWrongType
-	}
-	if !live {
-		e = &entry{kind: kindZSet, zset: newZSet()}
-		sh.data[key] = e
-	}
-	isNew, didChange := e.zset.add(member, score)
-	if isNew {
-		added = 1
-	}
-	s.touch(e, now)
-	return added, didChange, nil
+	added, nChanged, err := s.ZAddMulti(key, ZAddOptions{}, []ZMember{{Member: member, Score: score}})
+	return added, nChanged > 0, err
 }
 
 // ZScore returns the score of member. ok is false if key or member is absent.
@@ -88,8 +70,8 @@ func (s *Store) ZScore(key, member string) (float64, bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, false, nil
 	}
 	if e.kind != kindZSet {
@@ -128,8 +110,8 @@ func (s *Store) ZCard(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindZSet {
@@ -146,8 +128,8 @@ func (s *Store) ZRank(key, member string) (int, bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, false, nil
 	}
 	if e.kind != kindZSet {
@@ -174,8 +156,8 @@ func (s *Store) ZRange(key string, start, stop int) ([]ZMember, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindZSet {
