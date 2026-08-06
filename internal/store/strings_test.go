@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,21 +157,21 @@ func TestIncrByFloatFormatting(t *testing.T) {
 	s := New(8)
 	cases := []struct {
 		start string
-		delta float64
+		delta string
 		want  string
 	}{
-		{"", 3, "3"},
-		{"10.5", 0.1, "10.6"},
-		{"5", -5, "0"},
-		{"3.0e3", 200, "3200"},
+		{"", "3", "3"},
+		{"10.5", "0.1", "10.6"},
+		{"5", "-5", "0"},
+		{"3.0e3", "200", "3200"},
 		// redis:7.2: SET a 0.000001; INCRBYFLOAT a 0.000001 -> "0.000002", and GET agrees.
-		{"0.000001", 0.000001, "0.000002"},
+		{"0.000001", "0.000001", "0.000002"},
 		// And below the exponent threshold a score would use, an increment still does not.
 		// redis:7.2: SET b 0.0000001; INCRBYFLOAT b 0.0000001 -> "0.0000002".
-		{"0.0000001", 0.0000001, "0.0000002"},
+		{"0.0000001", "0.0000001", "0.0000002"},
 		// A large value stays decimal too -- this is the case that was reaching the AOF as
 		// "1.71798691855e+10" while the reply said otherwise.
-		{"17179869184", 1.5, "17179869185.5"},
+		{"17179869184", "1.5", "17179869185.5"},
 	}
 	for _, tc := range cases {
 		s.Del("k")
@@ -181,7 +182,7 @@ func TestIncrByFloatFormatting(t *testing.T) {
 		// replies and propagates -- so asserting on it here covers all three at once.
 		// Re-formatting the float instead is what let the reply and the stored bytes
 		// drift apart.
-		_, text, err := s.IncrByFloat("k", tc.delta)
+		text, err := s.IncrByFloat("k", mustParseLD(tc.delta))
 		if err != nil {
 			t.Fatalf("IncrByFloat(%q, %v): %v", tc.start, tc.delta, err)
 		}
@@ -194,16 +195,49 @@ func TestIncrByFloatFormatting(t *testing.T) {
 		}
 	}
 
-	// A value that is not a number, and a result that is not finite, are refused.
+	// A value that is not a number is refused.
 	s.Set("bad", []byte("hello"), 0)
-	if _, _, err := s.IncrByFloat("bad", 1); !errors.Is(err, ErrNotFloat) {
+	if _, err := s.IncrByFloat("bad", mustParseLD("1")); !errors.Is(err, ErrNotFloat) {
 		t.Errorf("IncrByFloat on a non-number = %v; want ErrNotFloat", err)
 	}
+
+	// 1e308 + 1e308 is *not* an overflow, and this test used to assert that it was.
+	// That expectation was pinning a float64 implementation rather than Redis: a long
+	// double has four thousand more decades of headroom, and measured on redis:7.2
+	// (amd64) `SET huge 1e308; INCRBYFLOAT huge 1e308` answers a 309-digit number
+	// beginning 1999999999999999999933717593116912913211 and ending
+	// 1514636284849020905456510092687857156096. Corrected to the measured answer rather
+	// than deleted, since the case itself is the interesting one.
 	s.Set("huge", []byte("1e308"), 0)
-	if _, _, err := s.IncrByFloat("huge", 1e308); !errors.Is(err, ErrNaN) {
+	got, err := s.IncrByFloat("huge", mustParseLD("1e308"))
+	if err != nil {
+		t.Fatalf("IncrByFloat(1e308 += 1e308) = %v; want a 309-digit result", err)
+	}
+	if len(got) != 309 || !strings.HasPrefix(got, "19999999999999999999") {
+		t.Errorf("IncrByFloat(1e308 += 1e308) = %.40s… (%d digits); want 309 digits beginning 19999999999999999999", got, len(got))
+	}
+
+	// The overflow that *is* one is four thousand decades further out, and it leaves the
+	// value untouched. Measured: `SET over 1e4932; INCRBYFLOAT over 1e4932` answers
+	// "ERR increment would produce NaN or Infinity".
+	s.Set("over", []byte("1e4932"), 0)
+	if _, err := s.IncrByFloat("over", mustParseLD("1e4932")); !errors.Is(err, ErrNaN) {
 		t.Errorf("IncrByFloat overflowing = %v; want ErrNaN", err)
 	}
-	if v, _ := s.Get("huge"); string(v) != "1e308" {
-		t.Errorf("value after a refused increment = %q; want 1e308", v)
+	if v, _ := s.Get("over"); string(v) != "1e4932" {
+		t.Errorf("value after a refused increment = %q; want 1e4932", v)
+	}
+
+	// A stored "inf" *parses* -- string2ld accepts the infinities and refuses only NaN --
+	// so the refusal names the result rather than the value. It used to answer ErrNotFloat,
+	// which was a float64 artefact and which no test pinned; measured on redis:7.2,
+	// `SET i inf; INCRBYFLOAT i 1` answers "ERR increment would produce NaN or Infinity"
+	// and leaves "inf" in place.
+	s.Set("i", []byte("inf"), 0)
+	if _, err := s.IncrByFloat("i", mustParseLD("1")); !errors.Is(err, ErrNaN) {
+		t.Errorf("IncrByFloat over a stored inf = %v; want ErrNaN", err)
+	}
+	if v, _ := s.Get("i"); string(v) != "inf" {
+		t.Errorf("value after a refused increment over inf = %q; want inf", v)
 	}
 }

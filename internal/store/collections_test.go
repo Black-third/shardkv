@@ -252,7 +252,7 @@ func TestFloatIncrementsRejectAnUnderscoredValue(t *testing.T) {
 
 	for _, planted := range []string{"1_0", "1_000.5", "1_", "_1"} {
 		s.Set("k", []byte(planted), 0)
-		if _, _, err := s.IncrByFloat("k", 1); err != ErrNotFloat {
+		if _, err := s.IncrByFloat("k", mustParseLD("1")); err != ErrNotFloat {
 			t.Errorf("IncrByFloat over a stored %q: err = %v; want ErrNotFloat", planted, err)
 		}
 		// The refusal must leave the value alone rather than half-applying.
@@ -263,7 +263,7 @@ func TestFloatIncrementsRejectAnUnderscoredValue(t *testing.T) {
 		if _, err := s.HSet("h", [2][]byte{[]byte("f"), []byte(planted)}); err != nil {
 			t.Fatalf("HSet: %v", err)
 		}
-		if _, _, err := s.HIncrByFloat("h", "f", 1); err != ErrHashNotFloat {
+		if _, err := s.HIncrByFloat("h", "f", mustParseLD("1")); err != ErrHashNotFloat {
 			t.Errorf("HIncrByFloat over a stored %q: err = %v; want ErrHashNotFloat", planted, err)
 		}
 		if got, _, _ := s.HGet("h", "f"); string(got) != planted {
@@ -275,7 +275,7 @@ func TestFloatIncrementsRejectAnUnderscoredValue(t *testing.T) {
 	// than anything that merely looks unusual.
 	for _, planted := range []string{"5", "+5", ".5", "5.", "1e1"} {
 		s.Set("ok", []byte(planted), 0)
-		if _, _, err := s.IncrByFloat("ok", 0); err != nil {
+		if _, err := s.IncrByFloat("ok", mustParseLD("0")); err != nil {
 			t.Errorf("IncrByFloat over a stored %q: %v", planted, err)
 		}
 	}

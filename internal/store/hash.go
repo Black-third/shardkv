@@ -5,8 +5,6 @@ import (
 	"math/rand"
 	"strconv"
 	"time"
-
-	"github.com/Black-third/shardkv/internal/resp"
 )
 
 // This file extends the hash type whose HSet/HGet/HDel core lives in types.go
@@ -163,10 +161,14 @@ func (s *Store) HIncrBy(key, field string, delta int64) (int64, error) {
 	return n, nil
 }
 
-// HIncrByFloat adds delta to the float at field and returns the result, stored in
-// the shortest round-trippable form. ErrHashNotFloat reports a field that is not a
-// number and ErrNaN a result that is not finite.
-func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, string, error) {
+// HIncrByFloat adds delta to the float at field and returns the text it stored, which is
+// also what the server replies and propagates. The arithmetic and the formatting are long
+// double's, exactly as IncrByFloat's are -- the two commands must agree, since a client
+// can move a value between a string and a hash field and expect the same answer.
+//
+// ErrHashNotFloat reports a field that is not a number (the message Redis words
+// differently on the hash side) and ErrNaN a result that is not finite.
+func (s *Store) HIncrByFloat(key, field string, delta LongDouble) (string, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -174,24 +176,24 @@ func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, string,
 
 	e, err := s.hashForWrite(sh, key, now)
 	if err != nil {
-		return 0, "", err
+		return "", err
 	}
-	var cur float64
+	var cur LongDouble
 	if have, ok := e.dict[field]; ok {
-		parsed, ok := resp.ParseDouble(string(have))
-		if !ok || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-			return 0, "", ErrHashNotFloat
+		parsed, ok := ParseLongDouble(string(have))
+		if !ok {
+			return "", ErrHashNotFloat
 		}
 		cur = parsed
 	}
-	sum := cur + delta
-	if math.IsNaN(sum) || math.IsInf(sum, 0) {
-		return 0, "", ErrNaN
+	sum, ok := cur.add(delta)
+	if !ok {
+		return "", ErrNaN
 	}
-	text := formatIncrFloat(sum)
+	text := sum.Text()
 	e.dict[field] = []byte(text)
 	s.touch(e, now)
-	return sum, text, nil
+	return text, nil
 }
 
 // hashForWrite returns the hash at key in an already-locked shard, creating it if

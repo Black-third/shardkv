@@ -319,23 +319,30 @@ func cmdGetRange(s *Server, w *resp.Writer, args [][]byte) bool {
 // what keeps that rewrite honest -- the increment preserved the key's TTL, so the
 // SET standing in for it must not clear the replica's.
 func cmdIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
+	// The operand is parsed as a long double, not as a float64, because that is what the
+	// addition is done in and what the stored bytes spell (store/longdouble.go covers
+	// which long double and why). Parsing it to a float64 first was a silent precision
+	// loss before the addition even happened: measured against redis:7.2,
+	// `SET k 1; INCRBYFLOAT k 1e-17` stores "1.00000000000000001" there and stored "1"
+	// here, because 1+1e-17 is not representable in a float64.
+	//
 	// An infinite *operand* parses -- "inf" is a valid float, and Redis's string2ld
 	// accepts it while rejecting NaN -- so the infinity is caught on the *result*, where
 	// the error names what actually went wrong ("increment would produce NaN or Infinity")
 	// rather than blaming the operand for being unparseable when it parsed fine.
-	// parseScore has precisely those semantics: infinities in, NaN out.
-	delta, ok := parseScore(args[2])
+	// ParseLongDouble has precisely those semantics: infinities in, NaN out.
+	delta, ok := store.ParseLongDouble(string(args[2]))
 	if !ok {
 		w.WriteError("ERR value is not a valid float")
 		return nil
 	}
 	// The store returns the text it stored, and that exact text is what is replied and
-	// what is propagated. Formatting the float again here is what went wrong before: an
+	// what is propagated. Formatting the number again here is what went wrong before: an
 	// increment result is spelled by Redis's human formatter (never an exponent) while a
 	// score uses the other one, so re-formatting produced a reply and a propagated SET
 	// that disagreed with the bytes actually in memory -- leaving a master and its replica
 	// holding different text for the same key, silently.
-	_, val, err := s.store.IncrByFloat(string(args[1]), delta)
+	val, err := s.store.IncrByFloat(string(args[1]), delta)
 	if err != nil {
 		writeStoreErr(w, err)
 		return nil

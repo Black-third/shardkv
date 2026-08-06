@@ -1,10 +1,10 @@
 package server
 
 import (
-	"math"
 	"strings"
 
 	"github.com/Black-third/shardkv/internal/resp"
+	"github.com/Black-third/shardkv/internal/store"
 )
 
 func init() {
@@ -216,7 +216,10 @@ func cmdHIncrBy(s *Server, w *resp.Writer, args [][]byte) bool {
 // cannot drift, while replaying an addition relies on the replica reproducing the
 // master's floating-point arithmetic exactly.
 func cmdHIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
-	delta, ok := parseScore(args[3])
+	// Long double, and for the same reason INCRBYFLOAT's operand is: the two commands must
+	// answer identically for the same numbers, since a client can move a value between a
+	// string and a hash field. See store/longdouble.go.
+	delta, ok := store.ParseLongDouble(string(args[3]))
 	if !ok {
 		w.WriteError("ERR value is not a valid float")
 		return nil
@@ -225,14 +228,15 @@ func cmdHIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	// HINCRBYFLOAT differs from INCRBYFLOAT, which lets an infinity through and reports it
 	// against the result: Redis checks the operand in one and not the other, with two
 	// different messages, and its own hash test asserts on this one. The result is still
-	// checked in the store, which is what catches inf + -inf.
-	if math.IsInf(delta, 0) || math.IsNaN(delta) {
+	// checked in the store, which is what catches inf + -inf. NaN never reaches here --
+	// ParseLongDouble refuses it, as string2ld does.
+	if delta.IsInf() {
 		w.WriteError("ERR value is NaN or Infinity")
 		return nil
 	}
 	// The stored text is what is replied and what is propagated -- see cmdIncrByFloat for
-	// why re-formatting the float here was wrong.
-	_, val, err := s.store.HIncrByFloat(string(args[1]), string(args[2]), delta)
+	// why re-formatting the number here was wrong.
+	val, err := s.store.HIncrByFloat(string(args[1]), string(args[2]), delta)
 	if err != nil {
 		writeStoreErr(w, err)
 		return nil

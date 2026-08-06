@@ -202,10 +202,15 @@ func TestIncrByFloat(t *testing.T) {
 		{"INCRBYFLOAT f abc", "-ERR value is not a valid float"},
 		{"INCRBYFLOAT f nan", "-ERR value is not a valid float"},
 		{"INCRBYFLOAT f", "-ERR wrong number of arguments for 'incrbyfloat' command"},
-		// A result that leaves the finite range is refused, value untouched.
-		{"SET big 1e308", "+OK"},
-		{"INCRBYFLOAT big 1e308", "-ERR increment would produce NaN or Infinity"},
-		{"GET big", "1e308"},
+		// A result that leaves the finite range is refused, value untouched. The finite
+		// range is long double's, though, which reaches four thousand decades past a
+		// float64's: this case used to assert that 1e308 + 1e308 overflowed, which was
+		// pinning the float64 implementation rather than Redis. Measured on redis:7.2
+		// (amd64), that sum answers a 309-digit number -- see
+		// TestIncrByFloatMatchesLongDouble -- and the overflow is out at 1e4932.
+		{"SET big 1e4932", "+OK"},
+		{"INCRBYFLOAT big 1e4932", "-ERR increment would produce NaN or Infinity"},
+		{"GET big", "1e4932"},
 		// The TTL survives an increment.
 		{"SETEX tf 100 1", "+OK"},
 		{"INCRBYFLOAT tf 1", "2"},

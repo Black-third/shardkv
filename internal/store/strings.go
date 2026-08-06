@@ -1,8 +1,6 @@
 package store
 
 import (
-	"math"
-	"strconv"
 	"time"
 
 	"github.com/Black-third/shardkv/internal/resp"
@@ -182,15 +180,22 @@ func (s *Store) GetRange(key string, start, end int) ([]byte, error) {
 	return copyBytes(e.str[start : end+1]), nil
 }
 
-// IncrByFloat adds delta to the float string at key and returns the result,
-// stored in the shortest round-trippable form. A missing key counts as 0 and any
-// existing TTL is preserved.
+// IncrByFloat adds delta to the float string at key and returns the text it stored --
+// which is also the text the server replies and the text it propagates, so there is one
+// spelling of the new value and not three. A missing key counts as 0 and any existing TTL
+// is preserved.
 //
-// ErrNotFloat reports a stored value that is not a number; ErrNaN reports a
-// result that is not finite (adding to a huge value, or opposite infinities),
-// which Redis refuses rather than storing an "inf" a later increment could never
-// recover from.
-func (s *Store) IncrByFloat(key string, delta float64) (float64, string, error) {
+// The arithmetic is long double, not float64, because that is what the value's bytes are
+// the decimal text of: see longdouble.go, which is also where the delta was parsed. The
+// caller passes the parsed operand rather than a float64 for that reason -- rounding the
+// operand to a float64 on the way in threw away precision the addition needed, and
+// `INCRBYFLOAT k 1e-17` on a stored 1 answered "1" instead of "1.00000000000000001".
+//
+// ErrNotFloat reports a stored value that is not a number -- including one outside long
+// double's range, which is what Redis's own parse refuses. ErrNaN reports a result that is
+// not finite (adding to a huge value, or an infinite operand), which Redis refuses rather
+// than storing an "inf" a later increment could never recover from.
+func (s *Store) IncrByFloat(key string, delta LongDouble) (string, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -198,26 +203,26 @@ func (s *Store) IncrByFloat(key string, delta float64) (float64, string, error) 
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindString {
-		return 0, "", ErrWrongType
+		return "", ErrWrongType
 	}
-	var cur float64
+	var cur LongDouble
 	var expireAt time.Time
 	if e != nil {
-		parsed, ok := resp.ParseDouble(string(e.str))
-		if !ok || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-			return 0, "", ErrNotFloat
+		parsed, ok := ParseLongDouble(string(e.str))
+		if !ok {
+			return "", ErrNotFloat
 		}
 		cur, expireAt = parsed, e.expireAt
 	}
-	sum := cur + delta
-	if math.IsNaN(sum) || math.IsInf(sum, 0) {
-		return 0, "", ErrNaN
+	sum, ok := cur.add(delta)
+	if !ok {
+		return "", ErrNaN
 	}
-	text := formatIncrFloat(sum)
+	text := sum.Text()
 	ne := &entry{kind: kindString, str: []byte(text), expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
-	return sum, text, nil
+	return text, nil
 }
 
 // formatFloat renders a *score*: the text ZSCORE and a snapshot both spell it with.
@@ -228,31 +233,3 @@ func (s *Store) IncrByFloat(key string, delta float64) (float64, string, error) 
 // strconv.FormatFloat(f, 'g', -1, 64), which switches to an exponent far earlier than
 // Redis does. resp imports nothing from this package, so the dependency is acyclic.
 func formatFloat(f float64) string { return resp.FormatDouble(f) }
-
-// formatIncrFloat renders the result of INCRBYFLOAT or HINCRBYFLOAT, which Redis spells
-// differently from a score -- and the difference is measurable, not theoretical.
-//
-// Redis formats a score with d2string, which uses an exponent outside roughly 1e-6..1e18,
-// and an increment result with ld2string in its "human" mode, which never does. Measured
-// against redis:7.2: ZSCORE of 1e-7 answers "1e-7", while INCRBYFLOAT reaching 2e-7
-// answers and stores "0.0000002". Using one formatter for both got the increment wrong.
-//
-// Getting this wrong was not cosmetic. INCRBYFLOAT propagates its result as `SET key
-// <text>`, so the value the master stored and the value the replica stored came from
-// different formatters: `INCRBYFLOAT` replied "17179869185.5", `GET` on the master
-// answered "1.71798691855e+10", and the replica held the decimal form. Master and replica
-// disagreed about the bytes of a key, silently, which is what invariant 4 exists to
-// prevent.
-//
-// 'f' with precision -1 is the shortest round-trippable fixed form: never an exponent,
-// and no trailing-zero noise. A very large value renders long, which is what Redis's
-// %.17Lf does too.
-func formatIncrFloat(f float64) string {
-	switch {
-	case math.IsInf(f, 1):
-		return "inf"
-	case math.IsInf(f, -1):
-		return "-inf"
-	}
-	return strconv.FormatFloat(f, 'f', -1, 64)
-}
