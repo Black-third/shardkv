@@ -1,0 +1,64 @@
+# One shardkv node with an append-only file on a named volume.
+#
+# Run it:
+#
+#     docker compose -f deploy/docker-compose.single.yml up -d --build
+#
+# Talk to it -- it speaks RESP, so any Redis client works. From the host, if you have a
+# redis-cli:
+#
+#     redis-cli -p 6380 set greeting hello
+#     redis-cli -p 6380 info persistence
+#
+# or without one, from a container:
+#
+#     docker run --rm -it redis:7-alpine redis-cli -h host.docker.internal -p 6380
+#
+# The published host port is 6380 by default and overridable, which is what you want
+# when something already holds it (a real Redis, or another copy of this stack):
+#
+#     SHARDKV_PORT=7380 docker compose -f deploy/docker-compose.single.yml up -d
+#
+# Tear it down. Without -v the AOF volume survives, so the next `up` replays it and the
+# data is still there; with -v the data is gone:
+#
+#     docker compose -f deploy/docker-compose.single.yml down
+#     docker compose -f deploy/docker-compose.single.yml down -v
+
+name: shardkv-single
+
+services:
+  shardkv:
+    # Built from this checkout so the file works before any image has been published.
+    # To run the published image instead, drop the `build:` block and use
+    #   image: ghcr.io/black-third/shardkv:latest
+    image: shardkv:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "${SHARDKV_PORT:-6380}:6380"
+    volumes:
+      # /data is the image's VOLUME and the working directory of a non-root user; the
+      # AOF is the only thing the server writes.
+      - shardkv-data:/data
+    command:
+      - -addr
+      - ":6380"
+      - -aof
+      - /data/shardkv.aof
+      - -aofsync
+      - everysec
+    restart: unless-stopped
+    # Closing the AOF is what flushes and fsyncs its tail, and that happens on the way
+    # out of a clean shutdown. Compose's default grace period is 10s; a large log being
+    # rewritten at that moment deserves more than that before the SIGKILL.
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    # The image already carries a HEALTHCHECK that PINGs over the socket, so
+    # `docker compose ps` reports "healthy" only once the server is answering commands
+    # rather than merely holding the port open.
+
+volumes:
+  shardkv-data:

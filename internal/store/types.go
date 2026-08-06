@@ -77,7 +77,28 @@ func (s *Store) RPush(key string, vals ...[]byte) (int, error) {
 	return s.listPush(key, false, vals)
 }
 
+// LPushX and RPushX push only onto a list that already exists, returning 0 without
+// creating anything when it does not. They are the conditional forms Redis provides so
+// that a producer can append to a queue a consumer has established without conjuring the
+// queue into existence itself.
+func (s *Store) LPushX(key string, vals ...[]byte) (int, error) {
+	return s.listPushX(key, true, vals)
+}
+
+func (s *Store) RPushX(key string, vals ...[]byte) (int, error) {
+	return s.listPushX(key, false, vals)
+}
+
 func (s *Store) listPush(key string, left bool, vals [][]byte) (int, error) {
+	return s.listPushMaybe(key, left, vals, false)
+}
+
+func (s *Store) listPushX(key string, left bool, vals [][]byte) (int, error) {
+	return s.listPushMaybe(key, left, vals, true)
+}
+
+// listPushMaybe is the shared body: requireExisting is what makes it the X form.
+func (s *Store) listPushMaybe(key string, left bool, vals [][]byte, requireExisting bool) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -87,6 +108,11 @@ func (s *Store) listPush(key string, left bool, vals [][]byte) (int, error) {
 	live := found && !e.expired(now)
 	if live && e.kind != kindList {
 		return 0, ErrWrongType
+	}
+	if !live && requireExisting {
+		// The wrong-type check above still applies, and comes first: LPUSHX against a string
+		// is a WRONGTYPE error in Redis, not a silent 0.
+		return 0, nil
 	}
 	if !live {
 		e = &entry{kind: kindList, list: newDeque()}
@@ -145,8 +171,8 @@ func (s *Store) LRange(key string, start, stop int) ([][]byte, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindList {
@@ -163,8 +189,8 @@ func (s *Store) LLen(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindList {
@@ -210,8 +236,8 @@ func (s *Store) HGet(key, field string) ([]byte, bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, false, nil
 	}
 	if e.kind != kindHash {
@@ -262,8 +288,8 @@ func (s *Store) HGetAll(key string) ([][]byte, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindHash {
@@ -284,8 +310,8 @@ func (s *Store) HLen(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindHash {
@@ -359,8 +385,8 @@ func (s *Store) SMembers(key string) ([]string, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return nil, nil
 	}
 	if e.kind != kindSet {
@@ -381,8 +407,8 @@ func (s *Store) SIsMember(key, member string) (bool, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return false, nil
 	}
 	if e.kind != kindSet {
@@ -399,8 +425,8 @@ func (s *Store) SCard(key string) (int, error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindSet {

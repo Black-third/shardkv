@@ -1,0 +1,101 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errorlint
+    - misspell
+    - nilerr
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    errcheck:
+      # RESP writes go to a buffered writer whose error surfaces on Flush, which
+      # the caller does check. Requiring a check on every Write* would add noise
+      # to every handler without catching anything Flush does not already report.
+      exclude-functions:
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteSimple
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteError
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteInt
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteBulk
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteNull
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteNullArray
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteArrayHeader
+        - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteCommand
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    rules:
+      # ST1005 wants error strings uncapitalized, which is right for Go errors and wrong
+      # for these: the sentinels in internal/store carry the *protocol* text a client
+      # receives, and client libraries match on it exactly. Redis spells several of them
+      # with a capital ("The specified keys must contain string values", "WRONGTYPE ..."),
+      # so obeying the convention here would mean answering differently from Redis in
+      # order to look more idiomatic.
+      - path: internal/store/.*\.go
+        linters:
+          - staticcheck
+        text: 'ST1005'
+      # Tests deliberately ignore errors on setup paths and reuse fixture helpers.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+      # The store returns its sentinels bare -- it never wraps them -- and the
+      # tests assert on exactly that contract. Production code that dispatches on
+      # them (writeStoreErr) does use errors.Is, so wrapping stays possible later.
+      - path: _test\.go
+        linters:
+          - errorlint
+      # resp.Writer builds each reply with several bufio writes and returns the
+      # error of the last one. A bufio.Writer error is sticky, so the final write
+      # reports any earlier failure; checking each intermediate call would add a
+      # branch per byte written and catch nothing extra.
+      - path: internal/resp/resp\.go
+        linters:
+          - errcheck
+      # Closing a socket that is already being abandoned, and flushing to
+      # io.Discard during AOF replay or replica apply, have no actionable error:
+      # the next read on a dead connection ends the loop, which is the only
+      # recovery available.
+      - path: internal/(server|aof)/.*\.go
+        linters:
+          - errcheck
+        text: 'Error return value of `(conn|sess\.conn|victim\.conn|s\.ln)\.Close` is not checked'
+      - path: internal/server/(server|commands_client)\.go
+        linters:
+          - errcheck
+        text: 'Error return value of `w\.Flush` is not checked'
+      # Best-effort file operations in the AOF, each for a stated reason:
+      # cleanup after a failed rewrite (the meaningful error is already on its way
+      # to the caller, and a temp-file removal failure would hide why the rewrite
+      # was abandoned); closing the descriptor a successful rewrite has just
+      # superseded (its data is already durable in the new file); syncDir, which is
+      # documented as best effort because some platforms refuse to fsync a
+      # directory; and closing the read-only handle Load replayed from.
+      #
+      # Close on the *live* log is checked -- see (*Log).Close, where a discarded
+      # flush or fsync error would report a clean shutdown for an unpersisted tail.
+      - path: internal/aof/aof\.go
+        linters:
+          - errcheck
+        text: 'Error return value of `(tf\.Close|os\.Remove|l\.w\.Flush|l\.f\.Sync|l\.f\.Close|d\.Sync|d\.Close|f\.Close)` is not checked'
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

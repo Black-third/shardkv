@@ -34,6 +34,39 @@ func (s *Store) SetNX(key string, val []byte) bool {
 	return true
 }
 
+// MSetNX sets every pair only if *none* of the keys already exists, reporting whether
+// it did. Either all of them are written or none is.
+//
+// The all-or-nothing guarantee is the whole command, so the existence check and the
+// writes have to happen under one acquisition of every shard involved -- checking first
+// and writing after would let a concurrent SET land in between and turn "none existed"
+// into "one did" without the caller ever being told. lockKeys orders the shards by index
+// so two MSETNX calls with the keys in opposite orders cannot deadlock, and it handles
+// two keys that hash to the same shard.
+func (s *Store) MSetNX(pairs [][2][]byte) bool {
+	keys := make([]string, len(pairs))
+	for i, p := range pairs {
+		keys[i] = string(p[0])
+	}
+	unlock := s.lockKeys(keys...)
+	defer unlock()
+
+	now := s.clock()
+	for _, key := range keys {
+		sh := s.getShard(key)
+		if e, found := sh.data[key]; found && !e.expired(now) {
+			return false
+		}
+	}
+	for _, p := range pairs {
+		key := string(p[0])
+		ne := &entry{kind: kindString, str: copyBytes(p[1])}
+		s.touch(ne, now)
+		s.getShard(key).data[key] = ne
+	}
+	return true
+}
+
 // GetSet sets key to val and returns the previous string value (clearing any
 // TTL, as Redis does). old is invalid when oldOK is false.
 func (s *Store) GetSet(key string, val []byte) (old []byte, oldOK bool, err error) {
@@ -93,7 +126,18 @@ func (s *Store) Append(key string, suffix []byte) (int, error) {
 	nv := make([]byte, 0, len(base)+len(suffix))
 	nv = append(nv, base...)
 	nv = append(nv, suffix...)
-	ne := &entry{kind: kindString, str: nv, expireAt: expireAt}
+	// APPEND is the one command whose origin depends on whether the key was there.
+	// Appending to an existing value unshares it into a plain buffer that Redis never
+	// re-encodes, so it is raw from here on whatever its bytes read as; appending to a
+	// *missing* key is really a store of the whole argument, and Redis's appendCommand
+	// runs tryObjectEncoding on it before dbAdd -- so `APPEND fresh 123` reads `int`,
+	// measured on redis 7.2.15. Treating both as mutations reported raw for the create
+	// case, which is the second half of the encoding gap strOrigin fixed.
+	origin := strMutatedBuffer
+	if !live {
+		origin = strWholeValue
+	}
+	ne := &entry{kind: kindString, str: nv, strOrigin: origin, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return len(nv), nil
@@ -105,8 +149,8 @@ func (s *Store) StrLen(key string) (int, error) {
 	now := s.clock()
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
+	e := s.readEntry(sh, key, now)
+	if e == nil {
 		return 0, nil
 	}
 	if e.kind != kindString {
@@ -119,18 +163,9 @@ func (s *Store) StrLen(key string) (int, error) {
 
 // ExpireAt sets an absolute expiry on an existing live key. A past deadline
 // makes the key eligible for removal on the next access/sweep. Reports false if
-// the key is missing or already expired.
+// the key is missing or already expired. It is ExpireAtCond with no condition.
 func (s *Store) ExpireAt(key string, deadline time.Time) bool {
-	sh := s.getShard(key)
-	now := s.clock()
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	e, found := sh.data[key]
-	if !found || e.expired(now) {
-		return false
-	}
-	e.expireAt = deadline
-	return true
+	return s.ExpireAtCond(key, deadline, ExpireAlways)
 }
 
 // Persist removes the TTL from key, making it permanent. Reports whether a TTL

@@ -3,6 +3,16 @@
 /bin/
 *.exe
 
+# GoReleaser output (`goreleaser release --snapshot --clean`)
+/dist/
+
+# Compat- and benchmark-harness scratch: the cross-compiled server they run in a
+# container, and the per-run results they write.
+/test/compat/.bin/
+/test/compat/.results/
+/test/bench/.bin/
+/test/bench/.results/
+
 # Test & coverage output
 *.out
 *.test

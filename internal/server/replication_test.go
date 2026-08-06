@@ -13,6 +13,9 @@ import (
 func startServer(t *testing.T, st *store.Store) (*Server, string, func()) {
 	t.Helper()
 	s := New(st)
+	if err := s.SetDatabases(defaultDatabases); err != nil {
+		t.Fatalf("SetDatabases: %v", err)
+	}
 	if err := s.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

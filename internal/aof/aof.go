@@ -28,15 +28,52 @@ const (
 	SyncNo
 )
 
+// String returns the policy's configuration-file spelling, which is also what
+// CONFIG GET appendfsync reports.
+func (p SyncPolicy) String() string {
+	switch p {
+	case SyncAlways:
+		return "always"
+	case SyncNo:
+		return "no"
+	default:
+		return "everysec"
+	}
+}
+
+// ParseSyncPolicy parses a policy name, reporting whether it was recognized. An
+// unknown name is rejected rather than defaulted, so a typo in a durability setting
+// cannot silently leave the log less durable than the operator asked for.
+func ParseSyncPolicy(name string) (SyncPolicy, bool) {
+	switch name {
+	case "always":
+		return SyncAlways, true
+	case "everysec":
+		return SyncEverySec, true
+	case "no":
+		return SyncNo, true
+	}
+	return SyncEverySec, false
+}
+
 // Log is a concurrency-safe append-only command log.
 type Log struct {
-	mu     sync.Mutex
-	path   string
-	f      *os.File
-	w      *resp.Writer
-	policy SyncPolicy
-	closed bool
-	logf   func(string, ...any) // surfaces background durability failures
+	mu      sync.Mutex
+	path    string
+	f       *os.File
+	w       *resp.Writer
+	policy  SyncPolicy
+	closed  bool
+	syncing bool                 // the background flush loop is running
+	logf    func(string, ...any) // surfaces background durability failures
+
+	// size is how many bytes the log holds, and baseSize how many it held at the end
+	// of the last rewrite. Their ratio is what the automatic rewrite policy compares
+	// against a percentage, so the accounting is kept here, incrementally, rather than
+	// stat()ed: the file is buffered, so its on-disk size lags the records the log has
+	// accepted, and a policy driven by that would fire late and erratically.
+	size     int64
+	baseSize int64
 }
 
 // Open opens (creating if needed) the AOF at path for appending.
@@ -46,10 +83,70 @@ func Open(path string, policy SyncPolicy) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{path: path, f: f, w: resp.NewWriter(f), policy: policy, logf: log.Printf}
+	// A log opened on an existing file starts with that file as its base: the growth
+	// the policy measures is growth since the last rewrite, and a restart is not one.
+	if fi, err := f.Stat(); err == nil {
+		l.size, l.baseSize = fi.Size(), fi.Size()
+	}
 	if policy == SyncEverySec {
+		l.syncing = true
 		go l.syncLoop()
 	}
 	return l, nil
+}
+
+// Policy reports the configured sync policy, for CONFIG GET appendfsync.
+func (l *Log) Policy() SyncPolicy {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.policy
+}
+
+// SetPolicy changes the sync policy of a running log (CONFIG SET appendfsync).
+//
+// Switching *to* everysec has to start the background flusher, since a log opened
+// with another policy never started one; switching away leaves it running, where its
+// once-a-second flush is harmless (an "always" log is already flushed, and a "no" log
+// is allowed to reach the disk whenever). Stopping it would need a second lifetime to
+// manage for no benefit.
+func (l *Log) SetPolicy(p SyncPolicy) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.policy = p
+	if p == SyncEverySec && !l.syncing && !l.closed {
+		l.syncing = true
+		go l.syncLoop()
+	}
+}
+
+// Size reports how many bytes of records the log holds.
+func (l *Log) Size() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.size
+}
+
+// BaseSize reports how large the log was after the last rewrite (or when it was
+// opened, if it has not been rewritten since).
+func (l *Log) BaseSize() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.baseSize
+}
+
+// Flush pushes buffered records to the file and fsyncs it, making everything appended
+// so far durable regardless of the sync policy. SHUTDOWN uses it: an orderly stop
+// should not lose writes that a "no" or "everysec" policy still had in a buffer.
+func (l *Log) Flush() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	if err := l.w.Flush(); err != nil {
+		return err
+	}
+	return l.f.Sync()
 }
 
 // SetLogger overrides where background errors are reported (used in tests).
@@ -70,6 +167,7 @@ func (l *Log) Append(args [][]byte) error {
 	if err := l.w.WriteCommand(args); err != nil {
 		return err
 	}
+	l.size += int64(resp.CommandSize(args))
 	if l.policy == SyncAlways {
 		if err := l.w.Flush(); err != nil {
 			return err
@@ -97,7 +195,14 @@ func (l *Log) syncLoop() {
 	}
 }
 
-// Close flushes and closes the log.
+// Close flushes and closes the log, reporting every failure it hit rather than
+// only the last one.
+//
+// The flush and the fsync are the steps that actually persist the tail, so
+// discarding their errors would report a clean shutdown for a log whose final
+// writes never reached the disk -- the one failure a caller most needs to hear
+// about. Closing proceeds even after an earlier step fails, so the descriptor is
+// always released.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -105,9 +210,7 @@ func (l *Log) Close() error {
 		return nil
 	}
 	l.closed = true
-	l.w.Flush()
-	l.f.Sync()
-	return l.f.Close()
+	return errors.Join(l.w.Flush(), l.f.Sync(), l.f.Close())
 }
 
 // Rewrite atomically replaces the log with a compacted snapshot: it writes the
@@ -130,12 +233,14 @@ func (l *Log) Rewrite(snapshot [][][]byte) error {
 		return err
 	}
 	tw := resp.NewWriter(tf)
+	var written int64
 	for _, cmd := range snapshot {
 		if err := tw.WriteCommand(cmd); err != nil {
 			tf.Close()
 			os.Remove(tmp)
 			return err
 		}
+		written += int64(resp.CommandSize(cmd))
 	}
 	if err := tw.Flush(); err != nil {
 		tf.Close()
@@ -172,6 +277,8 @@ func (l *Log) Rewrite(snapshot [][][]byte) error {
 	l.f.Close()
 	l.f = newF
 	l.w = resp.NewWriter(newF)
+	// The compacted file is the new baseline the growth policy measures against.
+	l.size, l.baseSize = written, written
 	return nil
 }
 

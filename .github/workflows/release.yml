@@ -1,0 +1,53 @@
+name: Release
+
+# A tag is the trigger, and the gate runs again here rather than being trusted from the
+# CI run on the same commit: a tag can be pushed to a commit CI never saw, and a broken
+# binary on a release page is far harder to withdraw than a red build.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  # GoReleaser creates the GitHub release and uploads the archives, which is a write to
+  # this repository's contents. Nothing else is needed -- pushing the Homebrew formula
+  # to another repository needs a PAT, not a permission here (see .goreleaser.yml).
+  contents: write
+
+jobs:
+  release:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changelog is built from the commits between this tag and the previous
+          # one, so the whole history has to be present. A shallow clone silently
+          # produces an empty or truncated changelog rather than failing.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      # The race detector is the project's central claim, so a release is not cut from a
+      # commit that has not passed it.
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Uncomment once Black-third/homebrew-tap exists and the secret is set; see
+          # the SKELETON comment above `brews:` in .goreleaser.yml.
+          # HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

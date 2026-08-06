@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"net"
 	"testing"
+
+	"github.com/Black-third/shardkv/internal/resp"
 )
 
 // txConn is a small client helper for the transaction tests.
@@ -188,4 +190,73 @@ func TestWatchSucceedsWithoutConflict(t *testing.T) {
 	if got := c.cmd("GET k"); got != "2" {
 		t.Fatalf("GET k = %q; want 2", got)
 	}
+}
+
+// TestWatchSeesWritesToASecondKey covers WATCH against every multi-key write. These
+// are the commands affectedKeys has to know about by name: it otherwise assumes a
+// command touches only its first argument, so a write landing on the *destination*
+// of a COPY or an SMOVE would leave a transaction guarding that key unaware, and
+// EXEC would commit on top of a change it was watching for.
+func TestWatchSeesWritesToASecondKey(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	cases := []struct {
+		name  string
+		setup []string
+		watch string // the key the transaction guards
+		write string // another client's write, which must invalidate it
+	}{
+		{"COPY", []string{"SET csrc v"}, "cdst", "COPY csrc cdst"},
+		{"COPY REPLACE", []string{"SET c2src v", "SET c2dst old"}, "c2dst", "COPY c2src c2dst REPLACE"},
+		{"SMOVE", []string{"SADD ssrc m"}, "sdst", "SMOVE ssrc sdst m"},
+		{"SINTERSTORE", []string{"SADD ia x"}, "inter", "SINTERSTORE inter ia ia"},
+		{"SUNIONSTORE", []string{"SADD ua x"}, "union", "SUNIONSTORE union ua ua"},
+		{"SDIFFSTORE", []string{"SADD da x", "SADD db y"}, "diff", "SDIFFSTORE diff da db"},
+		{"LMOVE", []string{"RPUSH lsrc x"}, "ldst", "LMOVE lsrc ldst LEFT LEFT"},
+		{"RPOPLPUSH", []string{"RPUSH rsrc x"}, "rdst", "RPOPLPUSH rsrc rdst"},
+		{"RENAMENX", []string{"SET rnsrc v"}, "rndst", "RENAMENX rnsrc rndst"},
+		{"UNLINK", []string{"MSET u1 a u2 b"}, "u2", "UNLINK u1 u2"},
+	}
+	for _, tc := range cases {
+		c := dialTx(t, addr)
+		other := dialTx(t, addr)
+
+		for _, s := range tc.setup {
+			other.cmd(s)
+		}
+		if got := c.cmd("WATCH " + tc.watch); got != "+OK" {
+			t.Fatalf("%s: WATCH = %q", tc.name, got)
+		}
+		c.cmd("MULTI")
+		c.cmd("SET " + tc.watch + " from-tx")
+		if got := other.cmd(tc.write); got[0] == '-' {
+			t.Fatalf("%s: %q failed: %s", tc.name, tc.write, got)
+		}
+		if got := c.cmd("EXEC"); got != "(nil)" {
+			t.Errorf("%s wrote %q without aborting the transaction watching it (EXEC = %q)",
+				tc.name, tc.watch, got)
+		}
+
+		c.close()
+		other.close()
+	}
+}
+
+// newBufReader wraps a connection for the txConn helper, so a caller that dialed the
+// connection itself (a TLS client, say) can still use it.
+func newBufReader(conn net.Conn) *bufio.Reader { return bufio.NewReader(conn) }
+
+// cmdRaw sends a command as a RESP array, so an argument may contain spaces -- which the
+// inline form the other helpers use cannot express.
+func (c *txConn) cmdRaw(parts ...string) string {
+	c.t.Helper()
+	w := resp.NewWriter(c.conn)
+	if err := w.WriteCommand(cmdArgs(parts...)); err != nil {
+		c.t.Fatalf("write: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		c.t.Fatalf("flush: %v", err)
+	}
+	return readReply(c.t, c.br)
 }

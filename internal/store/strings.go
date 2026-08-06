@@ -1,0 +1,242 @@
+package store
+
+import (
+	"time"
+
+	"github.com/Black-third/shardkv/internal/resp"
+)
+
+// This file holds the string operations beyond the plain Get/Set pair in store.go
+// and the small helpers in moreops.go: the option-driven SET, the range editors,
+// and the float increment.
+
+// SetOptions is the parsed option tail of the SET command.
+//
+// Deadline is only consulted when HasDeadline is set; the caller resolves a
+// relative EX/PX operand into an absolute instant against Store.Now first, so the
+// deadline written to memory is the same one the server propagates. With neither
+// HasDeadline nor KeepTTL, SET clears any existing TTL, as Redis does.
+type SetOptions struct {
+	NX          bool // only set when the key does not exist
+	XX          bool // only set when the key already exists
+	Get         bool // report the previous string value
+	KeepTTL     bool // retain the existing TTL instead of clearing it
+	HasDeadline bool
+	Deadline    time.Time
+}
+
+// SetWithOptions is SET with its NX/XX/GET/KEEPTTL/expiry options applied as one
+// atomic step. set reports whether the value was actually written (false when NX
+// found the key present or XX found it absent); old/oldOK carry the previous
+// string value and are only populated when Get is set.
+//
+// ErrWrongType is returned -- and nothing is written -- when Get is requested on
+// a key holding another data type, matching Redis: the GET half of the command
+// cannot be answered, so the SET half does not happen either. Without Get, SET
+// replaces a value of any type as usual.
+func (s *Store) SetWithOptions(key string, val []byte, o SetOptions) (old []byte, oldOK, set bool, err error) {
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e := sh.liveEntry(key, now)
+	if e != nil && o.Get {
+		if e.kind != kindString {
+			return nil, false, false, ErrWrongType
+		}
+		old, oldOK = copyBytes(e.str), true
+	}
+	if (o.NX && e != nil) || (o.XX && e == nil) {
+		return old, oldOK, false, nil
+	}
+
+	var expireAt time.Time
+	switch {
+	case o.HasDeadline:
+		expireAt = o.Deadline
+	case o.KeepTTL && e != nil:
+		expireAt = e.expireAt
+	}
+	ne := &entry{kind: kindString, str: copyBytes(val), expireAt: expireAt}
+	s.touch(ne, now)
+	sh.data[key] = ne
+	return old, oldOK, true, nil
+}
+
+// GetEx reads the string at key and optionally rewrites its expiry in the same
+// locked step, which is what GETEX needs: the value it reports and the TTL it
+// leaves behind must describe one state.
+//
+// apply says whether to touch the expiry at all (GETEX with no option is a plain
+// read); with apply set, a zero deadline persists the key and any other deadline
+// replaces its TTL. changed reports whether the expiry actually moved, so the
+// caller propagates nothing for a no-op.
+func (s *Store) GetEx(key string, deadline time.Time, apply bool) (val []byte, ok, changed bool, err error) {
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e := sh.liveEntry(key, now)
+	if e == nil {
+		return nil, false, false, nil
+	}
+	if e.kind != kindString {
+		return nil, false, false, ErrWrongType
+	}
+	out := copyBytes(e.str)
+	if apply && !e.expireAt.Equal(deadline) {
+		e.expireAt = deadline
+		changed = true
+	}
+	s.touch(e, now)
+	return out, true, changed, nil
+}
+
+// SetRange overwrites the string at key from offset with val, zero-padding any
+// gap, and returns the resulting length. A missing key is treated as an empty
+// string; any existing TTL is preserved.
+//
+// An empty val is a no-op that reports the current length (0 for a missing key)
+// without creating anything, and an offset that would grow the value past the
+// largest string the protocol can carry is refused rather than allocated.
+func (s *Store) SetRange(key string, offset int, val []byte) (int, error) {
+	if offset < 0 {
+		return 0, ErrOffset
+	}
+	// Written as two comparisons rather than as offset+len(val) > maxStringLen, because
+	// that sum overflows for an offset near the top of int64 and wraps to a negative --
+	// which passed the check and then panicked slicing at the offset. A single integer
+	// operand from any client was enough to take the process down.
+	if offset > maxStringLen || len(val) > maxStringLen-offset {
+		return 0, ErrStringTooLong
+	}
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e := sh.liveEntry(key, now)
+	if e != nil && e.kind != kindString {
+		return 0, ErrWrongType
+	}
+	var base []byte
+	var expireAt time.Time
+	if e != nil {
+		base, expireAt = e.str, e.expireAt
+	}
+	if len(val) == 0 {
+		return len(base), nil
+	}
+
+	n := max(len(base), offset+len(val))
+	nv := make([]byte, n)
+	copy(nv, base)
+	copy(nv[offset:], val)
+	// Written into rather than stored whole, so it stays a plain buffer: see
+	// strOrigin and OBJECT ENCODING. That holds whether the key existed or not --
+	// Redis's setrangeCommand builds the new value with createObject over a raw sds and
+	// never runs tryObjectEncoding, unlike APPEND's create path.
+	ne := &entry{kind: kindString, str: nv, strOrigin: strMutatedBuffer, expireAt: expireAt}
+	s.touch(ne, now)
+	sh.data[key] = ne
+	return n, nil
+}
+
+// GetRange returns the substring of the string at key covered by the inclusive
+// [start, end] range, with Redis's index rules: negative indexes count from the
+// end and both bounds are then clamped into the string, so an out-of-range pair
+// yields an empty result rather than an error. A missing key reads as an empty
+// string.
+func (s *Store) GetRange(key string, start, end int) ([]byte, error) {
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	e := s.readEntry(sh, key, now)
+	if e == nil {
+		return nil, nil
+	}
+	if e.kind != kindString {
+		return nil, ErrWrongType
+	}
+	s.touch(e, now)
+
+	n := len(e.str)
+	if start < 0 {
+		start += n
+	}
+	if end < 0 {
+		end += n
+	}
+	start = max(start, 0)
+	end = max(end, 0)
+	if end >= n {
+		end = n - 1
+	}
+	if start > end || n == 0 {
+		return nil, nil
+	}
+	return copyBytes(e.str[start : end+1]), nil
+}
+
+// IncrByFloat adds delta to the float string at key and returns the text it stored --
+// which is also the text the server replies and the text it propagates, so there is one
+// spelling of the new value and not three. A missing key counts as 0 and any existing TTL
+// is preserved.
+//
+// The arithmetic is long double, not float64, because that is what the value's bytes are
+// the decimal text of: see longdouble.go, which is also where the delta was parsed. The
+// caller passes the parsed operand rather than a float64 for that reason -- rounding the
+// operand to a float64 on the way in threw away precision the addition needed, and
+// `INCRBYFLOAT k 1e-17` on a stored 1 answered "1" instead of "1.00000000000000001".
+//
+// ErrNotFloat reports a stored value that is not a number -- including one outside long
+// double's range, which is what Redis's own parse refuses. ErrNaN reports a result that is
+// not finite (adding to a huge value, or an infinite operand), which Redis refuses rather
+// than storing an "inf" a later increment could never recover from.
+func (s *Store) IncrByFloat(key string, delta LongDouble) (string, error) {
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e := sh.liveEntry(key, now)
+	if e != nil && e.kind != kindString {
+		return "", ErrWrongType
+	}
+	var cur LongDouble
+	var expireAt time.Time
+	if e != nil {
+		parsed, ok := ParseLongDouble(string(e.str))
+		if !ok {
+			return "", ErrNotFloat
+		}
+		cur, expireAt = parsed, e.expireAt
+	}
+	sum, ok := cur.add(delta)
+	if !ok {
+		return "", ErrNaN
+	}
+	text := sum.Text()
+	// Built whole, but *not* through the integer encoding: Redis's incrbyfloatCommand
+	// hands the formatted text to createStringObject and stops there, where SET runs
+	// tryObjectEncoding first. So an integral result reads `embstr` here and `int` after a
+	// SET of the same digits -- see strOrigin, and note that returning strWholeValue
+	// instead is the bug this state was added to fix.
+	ne := &entry{kind: kindString, str: []byte(text), strOrigin: strPlainObject, expireAt: expireAt}
+	s.touch(ne, now)
+	sh.data[key] = ne
+	return text, nil
+}
+
+// formatFloat renders a *score*: the text ZSCORE and a snapshot both spell it with.
+// It delegates to the one formatter that decides how a double appears on the wire, so a
+// score written into a Dump replays to the same text ZSCORE reports.
+//
+// It must not have its own implementation, and briefly did: this used
+// strconv.FormatFloat(f, 'g', -1, 64), which switches to an exponent far earlier than
+// Redis does. resp imports nothing from this package, so the dependency is acyclic.
+func formatFloat(f float64) string { return resp.FormatDouble(f) }
