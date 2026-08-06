@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,14 @@ type handlerFunc func(s *Server, w *resp.Writer, args [][]byte) (dirty bool)
 // cannot ship verbatim: the replica running it would draw different members and
 // the two copies would silently diverge. Real Redis rewrites SPOP into the SREM of
 // exactly the members it removed, and so does this.
+//
+// The clock is a source of non-determinism on exactly the same terms, which is why the
+// commands carrying a *relative* deadline are effect producers too (SET ... EX, EXPIRE,
+// SETEX, GETEX, RESTORE, and the stream commands that mint an id). Such a handler has
+// already resolved the deadline it wrote to memory; returning the absolute form built
+// from that one value is what keeps the wire and memory naming the same instant. Deriving
+// the wire form from a second reading of the clock, however careful it is about which
+// clock, skews the two by the handler's own execution time -- see propagation.go.
 type effectFunc func(s *Server, w *resp.Writer, args [][]byte) (effect [][][]byte)
 
 // sessionFunc handles a command that acts on the calling connection rather than on
@@ -61,6 +70,21 @@ type command struct {
 	effect    effectFunc  // set instead of fn for a command that propagates its effect
 	sess      sessionFunc // set instead of fn for a connection-control command
 	block     *blockSpec  // set instead of fn for a command that can wait for data
+
+	// container marks a command whose first argument names a subcommand -- CONFIG, CLIENT,
+	// OBJECT and the rest. Statistics for those are kept per *subcommand*, because that is
+	// what Redis reports (`cmdstat_config|resetstat`, never `cmdstat_config`) and because a
+	// single figure for CONFIG would average a CONFIG GET against a CONFIG RESETSTAT.
+	//
+	// It is a plain bool read from the entry the dispatcher already holds, so a command that
+	// is not a container -- every data command -- pays one branch and nothing else. That is
+	// the whole reason this is a flag rather than "look up the name in a set of containers".
+	container bool
+	// subs holds one statistics-only *command per subcommand seen, created on demand under
+	// subMu. The lock and the map lookup are affordable precisely because they are only ever
+	// reached for the administrative commands: nothing on a data path takes them.
+	subMu sync.Mutex
+	subs  map[string]*command
 
 	// The per-command statistics INFO commandstats and INFO latencystats report. They
 	// live on the table entry, as atomics, because that is what makes recording them
@@ -103,6 +127,24 @@ type blockSpec struct {
 	// replicate, so "it served the client" cannot be inferred from "it produced an
 	// effect" the way it can for BLPOP. See tryBlocking.
 	readOnly bool
+	// wantType is the data type a wakeup must find for this command to be retried: a list
+	// for BLPOP, a sorted set for BZPOPMIN, a stream for XREAD.
+	//
+	// It exists because a waiter is woken by anything that creates one of its keys, and what
+	// created it may be the wrong kind of thing entirely -- a client blocked in BZPOPMIN is
+	// woken by the SET in `ZADD k 0 x; DEL k; SET k v`. Redis checks the type at the wakeup
+	// and leaves such a client blocked; retrying the command instead would answer WRONGTYPE
+	// for a value that is already gone by the time the client reads the error, failing a
+	// command whose own arguments were never wrong. See retryBlocking.
+	wantType string
+	// wakeOnAnyChange makes every wakeup worth a retry, whatever the key now holds. Only
+	// XREADGROUP sets it, and the reason is that its waiter depends on state *attached to*
+	// the key rather than on the key's contents: a consumer group. A key that was deleted or
+	// overwritten with another type has destroyed the group, so the client is not waiting for
+	// data any more -- it is waiting for something that can never arrive, and it has to be
+	// told (NOGROUP, or WRONGTYPE) rather than parked forever. Redis unblocks an XREADGROUP on
+	// exactly these changes and no other blocking command on them.
+	wakeOnAnyChange bool
 	// silentEffect suppresses the keyspace notification a served effect would
 	// otherwise report.
 	//
@@ -146,14 +188,19 @@ func (c *command) apply(s *Server, w *resp.Writer, args [][]byte) (dirty bool, e
 	return len(effect) > 0, effect
 }
 
-// wireForm is the sequence a dirty write ships to the AOF and replicas: the effect
-// a non-deterministic handler produced, or else the command itself with relative
-// TTLs rewritten to absolute deadlines.
-func wireForm(args [][]byte, effect [][][]byte, now time.Time) [][][]byte {
+// wireForm is the sequence a dirty write ships to the AOF and replicas: the effect a
+// non-deterministic handler produced, or else the command itself.
+//
+// It deliberately takes no clock. A command whose text depends on the clock -- anything
+// carrying a relative deadline -- resolves that deadline once, in its handler, and returns
+// the absolute form built from it; there is no second derivation here that could disagree
+// with what the handler wrote to memory. Everything else propagates verbatim, which is
+// exactly what "its own text is replayable" means.
+func wireForm(args [][]byte, effect [][][]byte) [][][]byte {
 	if effect != nil {
 		return effect
 	}
-	return [][][]byte{propagationForm(args, now)}
+	return [][][]byte{args}
 }
 
 var commandTable = map[string]*command{}
@@ -161,13 +208,19 @@ var commandTable = map[string]*command{}
 // register adds a command to the table. Called from init() in the commands_*.go
 // files so each group of commands wires itself in.
 func register(name string, arity int, write bool, fn handlerFunc) {
-	commandTable[name] = &command{lowerName: strings.ToLower(name), arity: arity, write: write, fn: fn}
+	commandTable[name] = &command{
+		lowerName: strings.ToLower(name), arity: arity, write: write, fn: fn,
+		container: containerCommands[name],
+	}
 }
 
 // registerEffect adds a write command that propagates the effect it had rather
 // than its own text. See effectFunc.
 func registerEffect(name string, arity int, fn effectFunc) {
-	commandTable[name] = &command{lowerName: strings.ToLower(name), arity: arity, write: true, effect: fn}
+	commandTable[name] = &command{
+		lowerName: strings.ToLower(name), arity: arity, write: true, effect: fn,
+		container: containerCommands[name],
+	}
 }
 
 // registerBlocking adds a command that can wait for data to arrive. It is a write, so
@@ -177,6 +230,7 @@ func registerEffect(name string, arity int, fn effectFunc) {
 func registerBlocking(name string, arity int, spec *blockSpec) {
 	commandTable[name] = &command{
 		lowerName: strings.ToLower(name), arity: arity, write: !spec.readOnly, block: spec,
+		container: containerCommands[name],
 	}
 }
 
@@ -184,7 +238,88 @@ func registerBlocking(name string, arity int, spec *blockSpec) {
 // command is never a write, so it is never persisted or propagated: what it changes
 // lives and dies with one client socket. See sessionFunc.
 func registerSession(name string, arity int, fn sessionFunc) {
-	commandTable[name] = &command{lowerName: strings.ToLower(name), arity: arity, sess: fn}
+	commandTable[name] = &command{
+		lowerName: strings.ToLower(name), arity: arity, sess: fn,
+		container: containerCommands[name],
+	}
+}
+
+// containerCommands are the commands that dispatch on a subcommand, and whose statistics are
+// therefore kept per subcommand.
+//
+// The set is written out rather than inferred from arity, because "arity is negative and the
+// first argument happens to be a word" describes plenty of commands that are not containers
+// (SET, GEOADD). Getting it wrong in that direction would file every SET under its first
+// *value*, which is both useless and unbounded.
+//
+// It is consulted by register rather than applied by a later pass, deliberately: a pass would
+// have to run after every commands_*.go init, and package init order is file-name order --
+// so a container registered in a file sorting after the pass (PUBSUB, in pubsub.go) would be
+// silently missed. Reading the set at registration cannot be got wrong that way.
+var containerCommands = map[string]bool{
+	"CONFIG": true, "CLIENT": true, "COMMAND": true, "OBJECT": true, "MEMORY": true,
+	"LATENCY": true, "SLOWLOG": true, "DEBUG": true, "CLUSTER": true, "PUBSUB": true,
+	"XINFO": true, "XGROUP": true,
+}
+
+// statsTarget is the entry a command's measurements are recorded against: the table entry
+// itself, or -- for a container command -- a per-subcommand entry created on demand.
+//
+// An unknown or missing subcommand falls back to the parent, which is where a rejection has
+// to land: the subcommand could not be resolved, so there is nothing more specific to
+// attribute it to.
+func (c *command) statsTarget(args [][]byte) *command {
+	if !c.container || len(args) < 2 {
+		return c
+	}
+	sub := strings.ToLower(string(args[1]))
+	c.subMu.Lock()
+	defer c.subMu.Unlock()
+	if e := c.subs[sub]; e != nil {
+		return e
+	}
+	if c.subs == nil {
+		c.subs = make(map[string]*command)
+	}
+	e := &command{lowerName: c.lowerName + "|" + sub}
+	c.subs[sub] = e
+	return e
+}
+
+// subStats returns the container's per-subcommand entries, sorted by name so every reply
+// built from them is stable rather than following map iteration order.
+func (c *command) subStats() []*command {
+	c.subMu.Lock()
+	defer c.subMu.Unlock()
+	out := make([]*command, 0, len(c.subs))
+	for _, e := range c.subs {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].lowerName < out[j].lowerName })
+	return out
+}
+
+// statsEntries lists every entry statistics are reported for, in a stable order: each
+// command, and for a container its subcommands in place of it.
+//
+// A container's own entry is still reported when it has *rejections* -- a CONFIG with an
+// unknown subcommand is a refusal that belongs to CONFIG, because nothing narrower could be
+// resolved -- and skipped when it has none, which is what keeps `cmdstat_config` out of the
+// reply the way Redis keeps it out.
+func statsEntries() []*command {
+	var out []*command
+	for _, name := range commandNames() {
+		c := commandTable[name]
+		if !c.container {
+			out = append(out, c)
+			continue
+		}
+		if c.rejected.Load() > 0 || c.calls.Load() > 0 {
+			out = append(out, c)
+		}
+		out = append(out, c.subStats()...)
+	}
+	return out
 }
 
 // errReadOnly is the reply a write gets on a replica. Every write path shares the one
@@ -377,6 +512,23 @@ type serverCore struct {
 	clients  map[int64]*session
 	nextID   atomic.Int64
 
+	// The bounds on that registry (see limits.go). liveConns is the accept loop's own
+	// count of open connections, which is what maxClients is compared against;
+	// clientTimeout is the idle disconnect in seconds, 0 for off.
+	maxClients    atomic.Int64
+	clientTimeout atomic.Int64
+	liveConns     atomic.Int64
+	rejectedConns atomic.Int64
+
+	// dirtyChanges counts writes that changed something since the dataset was last
+	// written out in full, which is what INFO's rdb_changes_since_last_save reports.
+	dirtyChanges atomic.Int64
+
+	// streamNodeMaxEntries and listCompressDepth are stored and not read: see
+	// SetStreamNodeMaxEntries.
+	streamNodeMaxEntries atomic.Int64
+	listCompressDepth    atomic.Int64
+
 	// subMu guards the Pub/Sub registries: channel or pattern -> subscribed sessions.
 	// Like clientMu it is a leaf lock -- a publisher collects the subscribers to drop
 	// under it and closes their connections after releasing it.
@@ -464,6 +616,8 @@ func New(st *store.Store) *Server {
 	core.views = []*Server{s}
 	s.SetAOFRewritePolicy(defaultAOFRewriteMinSize, defaultAOFRewritePerc)
 	s.SetSlowlogPolicy(defaultSlowlogThresholdUs, defaultSlowlogMaxLen)
+	s.SetMaxClients(defaultMaxClients)
+	s.SetStreamNodeMaxEntries(defaultStreamNodeMaxEntries)
 	s.aofRewriteOK.Store(true) // no rewrite has failed yet
 	s.lastSave.Store(s.startTime.Unix())
 	st.SetRemovalHook(s.onKeyRemoved)
@@ -532,8 +686,11 @@ func (s *Server) onKeyRemoved(key string, evicted bool) {
 	s.touchWatchers(args)
 	s.notifyRemoved(key, evicted)
 	if evicted && s.propagating.Load() {
+		// Shipped as-is: a DEL names no deadline, so there is nothing to rewrite. It still
+		// goes through shipRaw rather than shipCommand so the stream is positioned in the
+		// database the key was evicted from.
 		s.propMu.Lock()
-		s.propagate(args)
+		s.shipRaw(args)
 		s.propMu.Unlock()
 	}
 }
@@ -666,6 +823,9 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		s.ln.Close()
 	}()
+	// The idle reaper (see limits.go). It exists whether or not a timeout is configured;
+	// while none is, it is one atomic load per second.
+	go s.reapIdleClients(ctx)
 
 	for {
 		conn, err := s.ln.Accept()
@@ -678,10 +838,17 @@ func (s *Server) Serve(ctx context.Context) error {
 				return err
 			}
 		}
+		// The connection table is bounded before a goroutine is spent on the connection,
+		// which is the point: the cost this refuses is the goroutine, the reader, the writer
+		// and the session, not the accept.
+		if !s.admitConn(conn) {
+			continue
+		}
 		s.totalConns.Add(1)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.releaseConn()
 			s.handle(ctx, conn)
 		}()
 	}
@@ -760,6 +927,10 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			sess.relockWriter()
 		}
 		s.execute(sess, w, args)
+		// CLIENT REPLY SKIP spans exactly one following command, so its state machine is
+		// stepped here, where one command has just finished. Two boolean tests when no SKIP
+		// is outstanding, which is every connection that never sends one.
+		advanceReplyMode(sess, w)
 		// Coalesce replies for pipelined clients: only flush once the input is
 		// drained, so a batch of pipelined commands costs one write syscall.
 		var flushErr error
@@ -849,6 +1020,9 @@ func (s *Server) runWrite(cmd *command, args [][]byte, apply func() (bool, [][][
 	if propagating {
 		s.propMu.Lock()
 	}
+	// Which of this command's keys do not exist yet, for the "new key" notification class.
+	// Nil, and free, unless that class is enabled -- see watchNewKeys.
+	created := s.watchNewKeys(args)
 	dirty, effect := apply()
 
 	// What the write is *reported* as. Normally a command describes itself: SPOP's
@@ -858,6 +1032,7 @@ func (s *Server) runWrite(cmd *command, args [][]byte, apply func() (bool, [][][
 	// served>) names the key that actually changed.
 	var observed [][][]byte
 	if dirty {
+		s.noteDirty(1)
 		observed = [][][]byte{args}
 		if cmd.block != nil {
 			observed = effect
@@ -866,6 +1041,9 @@ func (s *Server) runWrite(cmd *command, args [][]byte, apply func() (bool, [][][
 		// queues need. Whether it also names the *event* is a separate question: see
 		// blockSpec.silentEffect.
 		notify := cmd.block == nil || !cmd.block.silentEffect
+		if notify {
+			s.notifyNewKeys(created)
+		}
 		for _, o := range observed {
 			s.touchWatchers(o)
 			if notify {
@@ -875,7 +1053,7 @@ func (s *Server) runWrite(cmd *command, args [][]byte, apply func() (bool, [][][
 		if propagating {
 			// A multi-command effect ships framed in MULTI/EXEC, so a truncated AOF never
 			// replays half of one command's consequences.
-			s.propagateBatch(wireForm(args, effect, s.store.Now()))
+			s.propagateBatch(wireForm(args, effect))
 		}
 	}
 	if propagating {
@@ -907,8 +1085,11 @@ func (s *Server) applyCommand(w *resp.Writer, args [][]byte) {
 	if !ok || !arityOK(cmd.arity, len(args)) || cmd.sess != nil {
 		return // a connection-control command has no connection to act on here
 	}
+	created := s.watchNewKeys(args)
 	dirty, _ := cmd.apply(s, w, args)
 	if cmd.write && dirty {
+		s.noteDirty(1)
+		s.notifyNewKeys(created)
 		s.touchWatchers(args)
 		// A write arriving from a master is a change to this node's keyspace, so its
 		// own subscribers hear about it exactly as they would a local write.
@@ -1062,14 +1243,6 @@ func (s *Server) shipReplicas(args [][]byte) {
 		s.replicaDrops.Add(1)
 		log.Printf("shardkv: replica too far behind, dropping its feed to force a resync")
 	}
-}
-
-// propagate ships a single client write, rewriting relative TTLs to absolute
-// deadlines so the AOF and replicas reconstruct the same expiry instant. The
-// rewrite reads the store's clock, the one the handler already resolved its
-// deadline against, so memory and the wire agree exactly.
-func (s *Server) propagate(args [][]byte) {
-	s.shipRaw(propagationForm(args, s.store.Now()))
 }
 
 // forward ships an already-propagation-formed command (e.g. one received from a

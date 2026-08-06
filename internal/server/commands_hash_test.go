@@ -99,7 +99,9 @@ func TestHashWriteCommands(t *testing.T) {
 		{"HINCRBYFLOAT fl f nan", "-ERR value is not a valid float"},
 		// An infinite operand parses; the infinity is reported against the result, as
 		// Redis reports it. See TestIncrByFloat for the same distinction on the string side.
-		{"HINCRBYFLOAT fl f inf", "-ERR increment would produce NaN or Infinity"},
+		// An infinite operand is refused as an operand, which is where HINCRBYFLOAT's message
+		// differs from INCRBYFLOAT's -- Redis words the two differently and this follows it.
+		{"HINCRBYFLOAT fl f inf", "-ERR value is NaN or Infinity"},
 		{"HSET fbig f 1e308", ":1"},
 		{"HINCRBYFLOAT fbig f 1e308", "-ERR increment would produce NaN or Infinity"},
 		{"HGET fbig f", "1e308"},

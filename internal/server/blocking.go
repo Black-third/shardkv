@@ -171,16 +171,43 @@ func (s *Server) signalWaiters(cmds [][][]byte) {
 			continue
 		}
 		name := strings.ToUpper(string(cmd[0]))
-		// SWAPDB can make data appear under a key nothing was written to, so there is no
-		// key-level answer: every waiter is told to look again, and the ones with nothing
-		// to take go back to sleep. It is a rare administrative command, so the sweep
-		// costs nothing that matters.
-		if name == "SWAPDB" {
+		// Three commands change the keyspace without naming a key, so there is no key-level
+		// answer and every waiter in scope is told to look again. All three are rare
+		// administrative commands, so the sweep costs nothing that matters.
+		//
+		//   - SWAPDB can make data *appear* under a key nothing was written to.
+		//   - FLUSHALL and FLUSHDB make it disappear. That matters even though there is
+		//     nothing to serve afterwards: a client blocked in XREADGROUP was waiting on a
+		//     consumer *group*, and a flush destroyed it, so it is now waiting for something
+		//     that can never arrive and has to be told (NOGROUP). A BLPOP waiter woken by
+		//     the same sweep finds no list, and goes straight back to sleep -- which is
+		//     what it did before, reached differently.
+		//
+		// FLUSHDB is scoped to the database it emptied; the other two are not scoped at all.
+		switch name {
+		case "SWAPDB", "FLUSHALL":
 			s.wakeAll()
+			continue
+		case "FLUSHDB":
+			s.wakeDatabase(s.db)
 			continue
 		}
 		s.wakeKeys(s.affectedDBKeys(name, cmd))
 	}
+}
+
+// wakeDatabase signals the head of every queue in one database, for a change that emptied
+// or replaced that database's whole keyspace.
+func (s *Server) wakeDatabase(db int) {
+	var heads []*waiter
+	s.blockMu.Lock()
+	for k, q := range s.blockQueues {
+		if k.db == db && len(q) > 0 {
+			heads = append(heads, q[0])
+		}
+	}
+	s.blockMu.Unlock()
+	signalHeads(heads)
 }
 
 // wakeAll signals the head of every queue, for a change too sweeping to name keys for.
@@ -193,10 +220,17 @@ func (s *Server) wakeAll() {
 		}
 	}
 	s.blockMu.Unlock()
+	signalHeads(heads)
+}
+
+// signalHeads delivers the wakeup, outside the registry lock for the reason wakeKeys gives:
+// a send here cannot block (the slot is single-buffered and dropped when full), and keeping
+// the lock to a map walk means a writer is never delayed by a waiter.
+func signalHeads(heads []*waiter) {
 	for _, wt := range heads {
 		select {
 		case wt.ready <- struct{}{}:
-		default:
+		default: // a wakeup is already pending; the waiter will retry once for both
 		}
 	}
 }
@@ -356,11 +390,12 @@ func (s *Server) blockUntilServed(sess *session, w *resp.Writer, cmd *command, a
 		select {
 		case <-wt.ready:
 			relock()
-			if served, _ := s.tryBlocking(cmd, w, args); served {
+			if s.retryBlocking(cmd, w, args) {
 				return
 			}
 			// Nothing there after all: the element was taken between the signal and this
-			// retry. Stay at the head of the queue and wait again.
+			// retry, or what appeared is not something this command can serve. Stay at the
+			// head of the queue and wait again.
 			released = sess.unlockWriter()
 
 		case <-deadline:
@@ -413,6 +448,59 @@ func (s *Server) tryBlocking(cmd *command, w *resp.Writer, args [][]byte) (serve
 		return len(effect) > 0, effect
 	})
 	return served, wait
+}
+
+// retryBlocking is one attempt made after a wakeup, reporting whether the client was
+// served and may be released.
+//
+// It is not simply "run the command again", because a waiter is woken by *anything* that
+// creates one of its keys -- and what created it may be the wrong kind of thing entirely. A
+// client blocked in BZPOPMIN is woken by the SET in `ZADD k 0 x; DEL k; SET k v`, and
+// running the command then would answer WRONGTYPE about a value that is already gone by the
+// time the client reads the error, failing a command whose own arguments were never wrong.
+//
+// So the wakeup is filtered first: unless one of the keys this command waits on now holds a
+// value of the type it can serve, nothing is attempted and the client stays at the head of
+// its queue. Redis checks exactly this (getBlockedTypeByType, in handleClientsBlockedOnKey)
+// and its own test pins it -- "ZADD + DEL + SET should not awake blocked client".
+//
+// Once a key of the right type is there the command runs normally and whatever it produces
+// is delivered, error included. That distinction matters: BRPOPLPUSH onto a *string
+// destination* must answer WRONGTYPE when the source finally receives an element, because
+// the destination's type is a real problem with the command rather than a spurious wakeup.
+func (s *Server) retryBlocking(cmd *command, w *resp.Writer, args [][]byte) bool {
+	if !s.wakeupIsServiceable(cmd, args) {
+		return false
+	}
+	// An error counts as an answer. The attempt has three outcomes -- served, nothing to
+	// serve, and refused -- and only the middle one leaves the client waiting; a refusal has
+	// already written the error, so continuing to wait would leave that error on the wire in
+	// front of whatever the next attempt produced.
+	errs0 := w.ErrorsWritten()
+	served, _ := s.tryBlocking(cmd, w, args)
+	return served || w.ErrorsWritten() != errs0
+}
+
+// wakeupIsServiceable reports whether any key the command waits on currently holds a value
+// of the type that command can serve.
+//
+// A key that is absent counts as not serviceable: there is nothing there to hand over, so
+// attempting the command would find nothing and the client would go back to sleep anyway.
+// A spec with no declared type (there is none today) is always attempted, so adding a
+// blocking command without one degrades to the old behaviour rather than to a hang.
+//
+// XREADGROUP opts out entirely (wakeOnAnyChange): what it waits on is a consumer group, and
+// a key that vanished or changed type has taken the group with it.
+func (s *Server) wakeupIsServiceable(cmd *command, args [][]byte) bool {
+	if cmd.block.wantType == "" || cmd.block.wakeOnAnyChange {
+		return true
+	}
+	for _, key := range cmd.block.keys(args) {
+		if typ, ok := s.store.Type(key); ok && typ == cmd.block.wantType {
+			return true
+		}
+	}
+	return false
 }
 
 // waitFor reports how long this command is willing to wait, or the error to answer

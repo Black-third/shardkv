@@ -11,13 +11,20 @@ import (
 )
 
 // infoField extracts one INFO field's value.
+//
+// It fatals when the field is absent rather than returning "": a renamed or dropped INFO
+// field would otherwise reach the callers as an empty string, and the assertions that
+// compare against "" or against a zero would report the missing field as the expected
+// value. Every other helper in this suite fatals for the same reason.
 func infoField(t *testing.T, c *txConn, section, field string) string {
 	t.Helper()
-	for _, line := range strings.Split(c.cmd("INFO "+section), "\r\n") {
+	reply := c.cmd("INFO " + section)
+	for _, line := range strings.Split(reply, "\r\n") {
 		if name, value, ok := strings.Cut(line, ":"); ok && name == field {
 			return value
 		}
 	}
+	t.Fatalf("INFO %s does not report %q: %q", section, field, reply)
 	return ""
 }
 

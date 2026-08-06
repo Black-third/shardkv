@@ -205,14 +205,25 @@ func TestHLLMergeIsTheUnion(t *testing.T) {
 // canonical rather than a history of in-place patches -- so do the same additions in a
 // different order.
 func TestHLLIsDeterministic(t *testing.T) {
+	// GetString's ok and err are checked rather than discarded: they used to be dropped,
+	// and a build that produced no sketch at all returned nil -- so the comparisons below
+	// were string(nil) != string(nil), which cannot fail. The determinism this test exists
+	// to pin would have been reported as holding by a server that stored nothing.
 	build := func(order []int) []byte {
+		t.Helper()
 		s := New(4)
 		for _, i := range order {
 			if _, err := s.PFAdd("k", [][]byte{[]byte("e" + strconv.Itoa(i))}); err != nil {
 				t.Fatal(err)
 			}
 		}
-		v, _, _ := s.GetString("k")
+		v, ok, err := s.GetString("k")
+		if err != nil || !ok {
+			t.Fatalf("GetString after %d PFADDs: ok = %v, err = %v", len(order), ok, err)
+		}
+		if len(v) <= hllHdrSize || string(v[:4]) != string(hllMagic[:]) {
+			t.Fatalf("a %d-element sketch is %d bytes with prefix %q; want a HYLL body", len(order), len(v), v[:min(4, len(v))])
+		}
 		return v
 	}
 	forward := make([]int, 500)

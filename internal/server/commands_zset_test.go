@@ -54,7 +54,9 @@ func TestZAddFlags(t *testing.T) {
 		{"ZADD z NX GT 1 a", "-ERR GT, LT, and/or NX options at the same time are not compatible"},
 		{"ZADD z GT LT 1 a", "-ERR GT, LT, and/or NX options at the same time are not compatible"},
 		{"ZADD z INCR 1 a 2 b", "-ERR INCR option supports a single increment-element pair"},
-		{"ZADD z 1 a 2", "-ERR wrong number of arguments for 'zadd' command"},
+		// A score with no member is a syntax error, not an arity error: the command is long
+		// enough to be a ZADD, it is the pairing that is wrong. Redis's wording.
+		{"ZADD z 1 a 2", "-ERR syntax error"},
 		{"ZADD z NX", "-ERR wrong number of arguments for 'zadd' command"},
 		{"ZADD z nan a", "-ERR value is not a valid float"},
 		{"ZADD z abc a", "-ERR value is not a valid float"},

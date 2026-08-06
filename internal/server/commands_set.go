@@ -163,9 +163,9 @@ func cmdSRandMember(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteBulk([]byte(members[0]))
 		return false
 	}
-	count, ok := parseInt(args[2])
-	if !ok {
-		w.WriteError("ERR value is not an integer or out of range")
+	count, errMsg := parseRandomCount(args[2], false)
+	if errMsg != "" {
+		w.WriteError(errMsg)
 		return false
 	}
 	members, err := s.store.SRandMember(string(args[1]), count)

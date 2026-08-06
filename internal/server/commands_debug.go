@@ -108,8 +108,7 @@ func cmdDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 		writeDebugHelp(w)
 
 	default:
-		w.WriteError("ERR unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try DEBUG HELP.")
+		writeUnknownSubcommand(w, "DEBUG", args[1])
 	}
 	return false
 }

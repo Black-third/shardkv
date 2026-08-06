@@ -64,11 +64,14 @@ func init() {
 	// blocking machinery in blocking.go, so both get its fairness and no-lock-while-
 	// waiting guarantees for free.
 	registerBlocking("XREAD", -4, &blockSpec{
-		fn: blockingXRead, keys: xreadBlockKeys, timeoutFn: xreadTimeout,
+		wantType: "stream",
+		fn:       blockingXRead, keys: xreadBlockKeys, timeoutFn: xreadTimeout,
 		empty: writeNullArray, readOnly: true,
 	})
 	registerBlocking("XREADGROUP", -7, &blockSpec{
-		fn: blockingXReadGroup, keys: xreadBlockKeys, timeoutFn: xreadTimeout,
+		wantType:        "stream",
+		wakeOnAnyChange: true,
+		fn:              blockingXReadGroup, keys: xreadBlockKeys, timeoutFn: xreadTimeout,
 		empty: writeNullArray,
 		// Its effect is an XGROUP SETID, which must be propagated so a replica's group
 		// advances identically -- but must not be reported, because Redis sends no
@@ -92,6 +95,9 @@ const (
 		"or use the > ID to get new messages. The $ ID would just return an empty result set."
 	errGTOutsideGroup = "ERR The > ID can be specified only when calling " +
 		"XREADGROUP using the GROUP <group> <consumer> option."
+	errPlusInGroup = "ERR The + ID is meaningless in the context of XREADGROUP: " +
+		"you want to read the history of this consumer by specifying a proper ID, " +
+		"or use the > ID to get new messages. The + ID would just return an empty result set."
 	errXAddIDSmaller = "ERR The ID specified in XADD is equal or " +
 		"smaller than the target stream top item"
 	errXAddIDExhausted = "ERR The stream has exhausted the last possible ID, " +
@@ -615,8 +621,8 @@ func parseXRead(args [][]byte, isGroup bool) (xreadOpts, string) {
 	return o, "ERR syntax error"
 }
 
-// resolveDollarIDs replaces every "$" id operand with the stream's current last id,
-// mutating the argument slice in place.
+// resolveDollarIDs replaces every "$" or "+" id operand with a concrete id, mutating the
+// argument slice in place.
 //
 // It has to happen exactly once, on arrival, and the rewrite is what guarantees that.
 // "$" means "entries added after I asked", so re-resolving it on each retry would move
@@ -625,14 +631,26 @@ func parseXRead(args [][]byte, isGroup bool) (xreadOpts, string) {
 // the same slice to every retry, so the second attempt reads the id the first one
 // resolved. Nothing else uses these arguments afterwards -- a blocking command
 // propagates its effect, never its own text.
+//
+// "+" means "the last entry", which is one place *before* the stream's last id -- XREAD
+// returns what follows the id it is given, so the id it wants is the last one minus one.
+// The distinction matters on a stream whose final entry has been deleted: the last id
+// stays where it was, so "+" resolves behind a tombstone and the read correctly finds
+// nothing, which is what Redis answers. On a stream that does not exist yet both spellings
+// resolve to 0-0, so a blocking "+" waits for the first entry rather than returning
+// immediately.
 func (s *Server) resolveDollarIDs(args [][]byte, o *xreadOpts) {
 	for i, id := range o.ids {
-		if string(id) != "$" {
+		spelling := string(id)
+		if spelling != "$" && spelling != "+" {
 			continue
 		}
 		last, _, err := s.store.XLastID(string(o.keys[i]))
 		if err != nil {
 			last = store.StreamID{}
+		}
+		if spelling == "+" && last != (store.StreamID{}) {
+			last = last.Prev()
 		}
 		concrete := []byte(last.String())
 		o.ids[i] = concrete
@@ -753,8 +771,16 @@ func blockingXReadGroup(s *Server, w *resp.Writer, args [][]byte) ([][][]byte, b
 		return nil, false
 	}
 	for _, id := range o.ids {
-		if string(id) == "$" {
+		// Both of XREAD's "where is the stream now" spellings are refused here, with the
+		// messages Redis words for each: a group already tracks where its consumers are, so
+		// asking for "after the current end" would return nothing and asking for "the last
+		// entry" would hand out an entry the group has no record of delivering.
+		switch string(id) {
+		case "$":
 			w.WriteError(errDollarInGroup)
+			return nil, false
+		case "+":
+			w.WriteError(errPlusInGroup)
 			return nil, false
 		}
 	}
@@ -981,7 +1007,7 @@ func (s *Server) xgroupCreate(w *resp.Writer, args [][]byte, key, group string) 
 		w.WriteError("ERR wrong number of arguments for 'xgroup|create' command")
 		return nil
 	}
-	start, ok := s.groupStartID(key, args[4])
+	start, ok := s.groupStartID(key, args[4], false)
 	if !ok {
 		w.WriteError(errInvalidStreamID)
 		return nil
@@ -993,9 +1019,9 @@ func (s *Server) xgroupCreate(w *resp.Writer, args [][]byte, key, group string) 
 		case strings.EqualFold(string(args[i]), "MKSTREAM"):
 			mkstream = true
 		case strings.EqualFold(string(args[i]), "ENTRIESREAD") && i+1 < len(args):
-			n, valid := parseInt64(args[i+1])
-			if !valid {
-				w.WriteError("ERR value is not an integer or out of range")
+			n, errMsg := parseEntriesRead(args[i+1])
+			if errMsg != "" {
+				w.WriteError(errMsg)
 				return nil
 			}
 			entriesRead = n
@@ -1028,7 +1054,7 @@ func (s *Server) xgroupSetID(w *resp.Writer, args [][]byte, key, group string) [
 		w.WriteError("ERR wrong number of arguments for 'xgroup|setid' command")
 		return nil
 	}
-	id, ok := s.groupStartID(key, args[4])
+	id, ok := s.groupStartID(key, args[4], true)
 	if !ok {
 		w.WriteError(errInvalidStreamID)
 		return nil
@@ -1039,9 +1065,9 @@ func (s *Server) xgroupSetID(w *resp.Writer, args [][]byte, key, group string) [
 			w.WriteError("ERR syntax error")
 			return nil
 		}
-		n, valid := parseInt64(args[6])
-		if !valid {
-			w.WriteError("ERR value is not an integer or out of range")
+		n, errMsg := parseEntriesRead(args[6])
+		if errMsg != "" {
+			w.WriteError(errMsg)
 			return nil
 		}
 		hasRead, entriesRead = true, n
@@ -1066,7 +1092,7 @@ func (s *Server) xgroupSetID(w *resp.Writer, args [][]byte, key, group string) [
 // because the command itself carries no id a replica could agree on: a replica's stream
 // is at the same position only if it has already applied every write ahead of this one,
 // which is exactly the assumption a replicated "$" would be betting on.
-func (s *Server) groupStartID(key string, arg []byte) (store.StreamID, bool) {
+func (s *Server) groupStartID(key string, arg []byte, allowExtremes bool) (store.StreamID, bool) {
 	if string(arg) == "$" {
 		last, _, err := s.store.XLastID(key)
 		if err != nil {
@@ -1074,7 +1100,36 @@ func (s *Server) groupStartID(key string, arg []byte) (store.StreamID, bool) {
 		}
 		return last, true
 	}
+	// "-" and "+" are the smallest and largest ids that can be represented. XGROUP SETID
+	// accepts them -- `XGROUP SETID k g -` is how Redis's own tests rewind a group to the
+	// beginning -- and XGROUP CREATE does not, which is not an inconsistency to smooth
+	// over: Redis parses CREATE's id strictly and SETID's loosely, and a compatible server
+	// has to refuse where Redis refuses or a client's mistake goes unreported on one of
+	// them.
+	if allowExtremes {
+		switch string(arg) {
+		case "-":
+			return store.StreamID{}, true
+		case "+":
+			return store.StreamID{Ms: math.MaxUint64, Seq: math.MaxUint64}, true
+		}
+	}
 	return parseID(arg, 0)
+}
+
+// parseEntriesRead validates XGROUP's ENTRIESREAD operand: a count of entries the group
+// has read, where -1 means "unknown". Any other negative value is refused, because the
+// field feeds XINFO's lag arithmetic and a negative count there would produce a lag no
+// consumer could act on.
+func parseEntriesRead(b []byte) (int64, string) {
+	n, valid := parseInt64(b)
+	if !valid {
+		return 0, "ERR value is not an integer or out of range"
+	}
+	if n < -1 {
+		return 0, "ERR value for ENTRIESREAD must be positive or -1"
+	}
+	return n, ""
 }
 
 // --- XPENDING -----------------------------------------------------------------
@@ -1434,14 +1489,17 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 }
 
 func writeXInfoStream(w *resp.Writer, info store.StreamInfo) {
-	w.WriteMapHeader(8)
+	w.WriteMapHeader(10)
 	w.WriteBulk([]byte("length"))
 	w.WriteInt(info.Length)
 	w.WriteBulk([]byte("radix-tree-keys"))
-	// Reported as the entry count rather than invented: this server keeps entries in a
-	// sorted slice, not a radix tree of listpacks, so there are no internal nodes to
-	// count. The field exists because clients read it; the honest value for a structure
-	// with one level is "one node per entry".
+	// Both radix-tree fields are reported as the entry count rather than invented: this
+	// server keeps entries in a sorted slice, not a radix tree of listpacks, so there are no
+	// internal nodes to count. They exist because clients read them, and the honest value for
+	// a structure with one level is "one node per entry" -- which is also why they are equal
+	// here and are not in Redis.
+	w.WriteInt(info.Length)
+	w.WriteBulk([]byte("radix-tree-nodes"))
 	w.WriteInt(info.Length)
 	w.WriteBulk([]byte("last-generated-id"))
 	w.WriteBulk([]byte(info.LastID.String()))
@@ -1451,6 +1509,11 @@ func writeXInfoStream(w *resp.Writer, info store.StreamInfo) {
 	w.WriteInt(info.EntriesAdded)
 	w.WriteBulk([]byte("recorded-first-entry-id"))
 	w.WriteBulk([]byte(info.RecordedFirstID.String()))
+	// The number of consumer groups on the stream. It was computed and then dropped, which
+	// is the worst of the three options: a client reading XINFO STREAM to decide whether a
+	// stream has consumers found the field missing rather than zero.
+	w.WriteBulk([]byte("groups"))
+	w.WriteInt(info.Groups)
 	w.WriteBulk([]byte("first-entry"))
 	if info.HasEntries {
 		writeStreamEntry(w, info.First)

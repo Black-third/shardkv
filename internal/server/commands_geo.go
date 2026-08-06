@@ -67,8 +67,13 @@ triples:
 		w.WriteError("ERR syntax error")
 		return false
 	}
+	// GEOADD answers a plain "syntax error" here, where ZADD names the two flags. The
+	// difference is real -- verified side by side against redis:7.2 -- and it is what
+	// Redis's own geo test asserts on: GEOADD parses its own option prefix and rejects
+	// the combination before it ever builds the ZADD, so it never reaches the message
+	// ZADD would have produced.
 	if o.NX && o.XX {
-		w.WriteError("ERR XX and NX options at the same time are not compatible")
+		w.WriteError("ERR syntax error")
 		return false
 	}
 
@@ -242,6 +247,7 @@ type geoSearchOpts struct {
 // parseGeoSearch parses the option tail starting at args[from].
 func parseGeoSearch(args [][]byte, from int, allowWith bool) (geoSearchOpts, string) {
 	o := geoSearchOpts{unit: 1}
+	name := strings.ToLower(string(args[0]))
 	for i := from; i < len(args); i++ {
 		word := strings.ToUpper(string(args[i]))
 		switch {
@@ -312,10 +318,21 @@ func parseGeoSearch(args [][]byte, from int, allowWith bool) (geoSearchOpts, str
 		}
 	}
 	switch {
-	case o.hasMember == o.hasLonLat:
-		return o, "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"
-	case o.byRadius == o.byBox:
-		return o, "ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH"
+	case o.hasMember && o.hasLonLat, o.byRadius && o.byBox:
+		// Two centres, or two shapes: a plain syntax error, which is what Redis answers here
+		// and what its own test asserts. Naming the clauses would read better, but the text is
+		// what a client matches on.
+		//
+		// *Neither* is reported differently, below, and the asymmetry is Redis's: giving both
+		// is a malformed command, while giving neither is a command missing a mandatory
+		// clause, and the second message says which clause.
+		return o, "ERR syntax error"
+	case !o.hasMember && !o.hasLonLat:
+		// The command's own name, lower-cased, as Redis spells it here -- so GEOSEARCHSTORE
+		// says "geosearchstore" rather than borrowing GEOSEARCH's name.
+		return o, "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for " + name
+	case !o.byRadius && !o.byBox:
+		return o, "ERR exactly one of BYRADIUS and BYBOX can be specified for " + name
 	case o.sortAsc && o.sortDesc:
 		return o, "ERR syntax error"
 	}
@@ -338,6 +355,12 @@ type geoResult struct {
 func (s *Server) geoSearch(key string, o geoSearchOpts) ([]geoResult, error) {
 	lon, lat := o.lon, o.lat
 	if o.hasMember {
+		// A *missing key* is an empty search rather than a missing centre: there is nothing
+		// there to search and nothing to report, which is the answer Redis gives. It is only a
+		// key that exists and does not hold this member that is an error the caller can act on.
+		if !s.store.Exists(key) {
+			return nil, nil
+		}
 		lons, lats, present, err := s.geoPositions(key, []string{o.fromMember})
 		if err != nil {
 			return nil, err
@@ -401,9 +424,17 @@ func (s *Server) geoSearch(key string, o geoSearchOpts) ([]geoResult, error) {
 	// Sorted by distance unless the caller asked for neither order, in which case a COUNT
 	// still has to take the *nearest* ones -- which means sorting anyway. Redis does the
 	// same: COUNT without ANY is documented as returning the closest matches.
-	if o.sortDesc {
+	switch {
+	case o.sortDesc:
 		sort.SliceStable(out, func(i, j int) bool { return out[i].dist > out[j].dist })
-	} else if o.sortAsc || o.count > 0 {
+	case o.sortAsc:
+		sort.SliceStable(out, func(i, j int) bool { return out[i].dist < out[j].dist })
+	case o.count > 0 && !o.any:
+		// A COUNT with no explicit order still has to take the *nearest* matches, which means
+		// sorting. ANY is the exception and the reason this is not just "count > 0": ANY asks
+		// for any N matches rather than the closest N, so sorting them would quietly turn it
+		// back into the exhaustive search it exists to avoid -- and Redis's own test checks
+		// that GEORADIUS ... ANY comes back unsorted.
 		sort.SliceStable(out, func(i, j int) bool { return out[i].dist < out[j].dist })
 	}
 	if o.count > 0 && len(out) > o.count {
@@ -517,6 +548,190 @@ func cmdGeoSearchStore(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 	// Replace rather than merge: the destination is the result of this query.
 	s.store.Del(dst)
+	if _, _, err := s.store.ZAddMulti(dst, store.ZAddOptions{}, members); err != nil {
+		writeStoreErr(w, err)
+		return false
+	}
+	w.WriteInt(int64(len(members)))
+	return true
+}
+
+// --- GEORADIUS and GEORADIUSBYMEMBER ------------------------------------------
+
+// The deprecated radius searches. GEOSEARCH replaced them in 6.2 and expresses everything
+// they do, but a decade of client code and examples sends these, and Redis still ships
+// them -- so a server that answers "unknown command" is not wire-compatible with the
+// clients people actually run.
+//
+// They are the same search as GEOSEARCH over a different argument layout, so they share
+// geoSearchOpts and s.geoSearch outright. Two differences are worth naming:
+//
+//   - The centre is positional (lon/lat or a member) rather than introduced by FROMLONLAT
+//     or FROMMEMBER, and the radius is positional too.
+//   - STORE and STOREDIST each take a *key operand* here, where GEOSEARCHSTORE's STOREDIST
+//     is a bare flag. That is why they are parsed here rather than by parseGeoSearch.
+//
+// The _RO forms exist so a client can send a radius search to a replica: they are the same
+// command with STORE and STOREDIST refused, which is why they are registered as reads.
+func init() {
+	register("GEORADIUS", -6, true, cmdGeoRadius)
+	register("GEORADIUSBYMEMBER", -5, true, cmdGeoRadiusByMember)
+	register("GEORADIUS_RO", -6, false, cmdGeoRadiusRO)
+	register("GEORADIUSBYMEMBER_RO", -5, false, cmdGeoRadiusByMemberRO)
+}
+
+func cmdGeoRadius(s *Server, w *resp.Writer, args [][]byte) bool {
+	return geoRadius(s, w, args, false, false)
+}
+
+func cmdGeoRadiusByMember(s *Server, w *resp.Writer, args [][]byte) bool {
+	return geoRadius(s, w, args, true, false)
+}
+
+func cmdGeoRadiusRO(s *Server, w *resp.Writer, args [][]byte) bool {
+	geoRadius(s, w, args, false, true)
+	return false
+}
+
+func cmdGeoRadiusByMemberRO(s *Server, w *resp.Writer, args [][]byte) bool {
+	geoRadius(s, w, args, true, true)
+	return false
+}
+
+// geoRadius is the shared body. byMember selects the centre's spelling; readOnly refuses
+// the two storing clauses.
+func geoRadius(s *Server, w *resp.Writer, args [][]byte, byMember, readOnly bool) bool {
+	o := geoSearchOpts{unit: 1, byRadius: true}
+	// The centre and the radius are positional: key member radius unit, or
+	// key longitude latitude radius unit.
+	next := 3
+	if byMember {
+		o.fromMember, o.hasMember = string(args[2]), true
+	} else {
+		next = 4
+		if len(args) < 6 {
+			w.WriteError("ERR wrong number of arguments for '" + strings.ToLower(string(args[0])) + "' command")
+			return false
+		}
+		lon, ok1 := parseFloat(args[2])
+		lat, ok2 := parseFloat(args[3])
+		if !ok1 || !ok2 {
+			w.WriteError("ERR value is not a valid float")
+			return false
+		}
+		o.lon, o.lat, o.hasLonLat = lon, lat, true
+	}
+	radius, ok := parseFloat(args[next])
+	if !ok || radius < 0 {
+		w.WriteError("ERR value is not a valid float")
+		return false
+	}
+	unit, ok := geoUnit(string(args[next+1]))
+	if !ok {
+		w.WriteError("ERR unsupported unit provided. please use M, KM, FT, MI")
+		return false
+	}
+	o.radius, o.unit = radius, unit
+
+	storeKey, storeDistKey, errMsg := parseGeoRadiusTail(args, next+2, &o, readOnly)
+	if errMsg != "" {
+		w.WriteError(errMsg)
+		return false
+	}
+	// STORE and the WITH* options ask for two different replies -- a stored sorted set and
+	// an annotated array -- so Redis refuses the combination rather than choosing one. The
+	// message names all three WITH options because any of them conflicts.
+	if (storeKey != "" || storeDistKey != "") && (o.withCoord || o.withDist || o.withHash) {
+		w.WriteError("ERR STORE option in GEORADIUS is not compatible with " +
+			"WITHDIST, WITHHASH and WITHCOORD options")
+		return false
+	}
+
+	results, err := s.geoSearch(string(args[1]), o)
+	if err != nil {
+		writeGeoSearchErr(w, err)
+		return false
+	}
+	if storeKey == "" && storeDistKey == "" {
+		writeGeoResults(w, results, o)
+		return false
+	}
+	// STOREDIST wins when both are given, which is what Redis does: the later clause
+	// replaces the earlier one, and STOREDIST is the more specific request.
+	dst, byDist := storeKey, false
+	if storeDistKey != "" {
+		dst, byDist = storeDistKey, true
+	}
+	return s.geoStoreResults(w, dst, results, byDist)
+}
+
+// parseGeoRadiusTail parses the option tail these four commands share, which is
+// GEOSEARCH's minus the FROM*/BY* clauses and plus the two storing ones.
+func parseGeoRadiusTail(args [][]byte, from int, o *geoSearchOpts, readOnly bool) (storeKey, storeDistKey, errMsg string) {
+	sawCount := false
+	for i := from; i < len(args); i++ {
+		switch word := strings.ToUpper(string(args[i])); {
+		case word == "WITHCOORD":
+			o.withCoord = true
+		case word == "WITHDIST":
+			o.withDist = true
+		case word == "WITHHASH":
+			o.withHash = true
+		case word == "ASC":
+			o.sortAsc = true
+		case word == "DESC":
+			o.sortDesc = true
+		case word == "ANY":
+			// ANY on its own is meaningless: it says "stop as soon as you have enough", and
+			// without a COUNT there is no "enough". Redis names the missing operand rather
+			// than answering a generic syntax error, because that is the fix.
+			if !sawCount {
+				return "", "", "ERR the ANY argument requires COUNT argument"
+			}
+			o.any = true
+		case word == "COUNT" && i+1 < len(args):
+			n, ok := parseInt(args[i+1])
+			if !ok || n <= 0 {
+				return "", "", "ERR COUNT must be > 0"
+			}
+			o.count, sawCount = n, true
+			i++
+		case word == "STORE" && i+1 < len(args) && !readOnly:
+			storeKey = string(args[i+1])
+			i++
+		case word == "STOREDIST" && i+1 < len(args) && !readOnly:
+			storeDistKey = string(args[i+1])
+			i++
+		default:
+			return "", "", "ERR syntax error"
+		}
+	}
+	if o.sortAsc && o.sortDesc {
+		return "", "", "ERR syntax error"
+	}
+	return storeKey, storeDistKey, ""
+}
+
+// geoStoreResults replaces dst with the search's results: the geohashes as scores, or the
+// distances when byDist. It is shared with GEOSEARCHSTORE, so the two spellings of "store
+// this search" cannot store different things.
+func (s *Server) geoStoreResults(w *resp.Writer, dst string, results []geoResult, byDist bool) bool {
+	if len(results) == 0 {
+		// An empty result deletes the destination: one left holding a previous result would
+		// answer a query nobody asked.
+		deleted := s.store.Del(dst)
+		w.WriteInt(0)
+		return deleted
+	}
+	members := make([]store.ZMember, 0, len(results))
+	for _, r := range results {
+		score := r.score
+		if byDist {
+			score = r.dist
+		}
+		members = append(members, store.ZMember{Member: r.member, Score: score})
+	}
+	s.store.Del(dst) // replace rather than merge: the destination is this query's result
 	if _, _, err := s.store.ZAddMulti(dst, store.ZAddOptions{}, members); err != nil {
 		writeStoreErr(w, err)
 		return false

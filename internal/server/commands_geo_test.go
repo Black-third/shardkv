@@ -195,8 +195,12 @@ func TestGeoSearch(t *testing.T) {
 		{"GEOSEARCH nosuch FROMLONLAT 15 37 BYRADIUS 200 km", "[]"},
 		// Errors.
 		{"GEOSEARCH Sicily FROMMEMBER nobody BYRADIUS 200 km", "-ERR could not decode requested zset member"},
-		{"GEOSEARCH Sicily FROMLONLAT 15 37 FROMMEMBER Palermo BYRADIUS 1 km", "-ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"},
-		{"GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 1 km BYBOX 1 1 km", "-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH"},
+		// Giving *both* centres is a plain syntax error while giving neither names the
+		// missing clause -- Redis's own asymmetry, checked side by side against redis:7.2.
+		{"GEOSEARCH Sicily FROMLONLAT 15 37 FROMMEMBER Palermo BYRADIUS 1 km", "-ERR syntax error"},
+		{"GEOSEARCH Sicily BYRADIUS 1 km ASC COUNT 1", "-ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for geosearch"},
+		{"GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 1 km BYBOX 1 1 km", "-ERR syntax error"},
+		{"GEOSEARCH Sicily FROMLONLAT 15 37 ASC WITHDIST", "-ERR exactly one of BYRADIUS and BYBOX can be specified for geosearch"},
 		{"GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km COUNT 0", "-ERR COUNT must be > 0"},
 		{"GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 parsecs", "-ERR unsupported unit provided. please use M, KM, FT, MI"},
 	}

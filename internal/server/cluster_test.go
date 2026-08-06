@@ -403,8 +403,16 @@ func TestClusterForgetAndReset(t *testing.T) {
 	if s.cluster.myself().id == myID {
 		t.Error("a hard reset kept the old node id")
 	}
-	if got := c.cmd("CLUSTER RESET SIDEWAYS"); !strings.HasPrefix(got, "-ERR Unknown subcommand") {
-		t.Errorf("RESET with a bad argument = %q", got)
+	// A bad *keyword* with the right argument count is a syntax error, not an
+	// unknown-subcommand error -- RESET exists. Measured on a cluster-enabled redis:7.2
+	// (`redis-server --cluster-enabled yes`), because a standalone one refuses every
+	// CLUSTER subcommand before reaching the argument check.
+	if got := c.cmd("CLUSTER RESET SIDEWAYS"); got != "-ERR syntax error" {
+		t.Errorf("RESET with a bad argument = %q; want a syntax error", got)
+	}
+	// Wrong *count*, by contrast, names the subcommand and the count.
+	if got := c.cmd("CLUSTER RESET HARD EXTRA"); got != "-ERR wrong number of arguments for 'cluster|reset' command" {
+		t.Errorf("RESET with too many arguments = %q", got)
 	}
 }
 

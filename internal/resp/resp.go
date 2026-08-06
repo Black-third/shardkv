@@ -459,6 +459,16 @@ func unescape(c byte) byte {
 type Writer struct {
 	w     *bufio.Writer
 	proto int
+	// out is the destination the buffer normally writes to, kept so that reply
+	// suppression can point the buffer at io.Discard and back. See Suppress.
+	out io.Writer
+	// suppressed is CLIENT REPLY OFF|SKIP: every reply written is thrown away instead of
+	// sent. pushDepth counts the out-of-band frames currently being written, which are
+	// exempt -- see BeginPush. Both are touched only by the connection's own goroutine and
+	// by its pumps under the session's writer lock, which is the same discipline proto
+	// lives under.
+	suppressed bool
+	pushDepth  int
 	// errs counts the error replies written on this connection. It exists so the
 	// server's per-command statistics can report failed calls without every one of
 	// ~180 handlers having to say "I answered with an error": the caller reads the
@@ -468,7 +478,71 @@ type Writer struct {
 }
 
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: bufio.NewWriter(w), proto: ProtoRESP2}
+	return &Writer{w: bufio.NewWriter(w), out: w, proto: ProtoRESP2}
+}
+
+// Suppress makes every reply written from now on be discarded rather than sent, which is
+// what CLIENT REPLY OFF and CLIENT REPLY SKIP ask for. Resume undoes it.
+//
+// The redirection is applied to the buffer rather than checked in each Write method, and
+// that is the point: every byte this type emits goes through w.w, so pointing that at
+// io.Discard suppresses the whole reply surface by construction -- including replies
+// written by handlers added later, which a per-method check would silently miss. The cost
+// is that a suppressed reply is still formatted; it is never buffered beyond one reply
+// and never reaches a syscall, and correctness here is worth more than the formatting.
+//
+// Suppress does not flush first. A caller with replies already buffered that must still
+// be sent -- CLIENT REPLY OFF, which follows commands that were answered normally --
+// flushes before calling it, because Reset discards whatever the buffer holds.
+func (w *Writer) Suppress() {
+	if w.suppressed {
+		return
+	}
+	w.suppressed = true
+	w.w.Reset(io.Discard)
+}
+
+// Resume restores delivery. Anything written while suppressed is dropped.
+func (w *Writer) Resume() {
+	if !w.suppressed {
+		return
+	}
+	w.suppressed = false
+	w.w.Reset(w.out)
+}
+
+// Suppressed reports whether replies are currently being discarded.
+func (w *Writer) Suppressed() bool { return w.suppressed }
+
+// BeginPush and EndPush bracket an out-of-band frame -- a delivered Pub/Sub message or a
+// subscription confirmation -- which is delivered even while replies are suppressed.
+//
+// That exemption is Redis's, not an invention: its CLIENT_PUSHING flag "disables the reply
+// silencing flags", and its own Pub/Sub tests subscribe on a connection that has just sent
+// CLIENT REPLY OFF and then read the confirmations. The reasoning is that CLIENT REPLY OFF
+// says "I am not going to read your answers to my commands"; a pushed message is not an
+// answer to a command, and dropping it would lose data the client asked to receive rather
+// than an acknowledgement it asked to skip.
+//
+// They nest, so a caller need not know whether it is already inside a frame.
+func (w *Writer) BeginPush() {
+	w.pushDepth++
+	if w.pushDepth == 1 && w.suppressed {
+		w.w.Reset(w.out)
+	}
+}
+
+// EndPush closes the frame, flushing it before the buffer is pointed back at the void --
+// Reset discards what it holds, so the frame has to leave first.
+func (w *Writer) EndPush() {
+	if w.pushDepth == 0 {
+		return
+	}
+	w.pushDepth--
+	if w.pushDepth == 0 && w.suppressed {
+		_ = w.w.Flush()
+		w.w.Reset(io.Discard)
+	}
 }
 
 // SetProto selects the protocol version replies are encoded in. HELLO is the only
@@ -681,6 +755,39 @@ func (w *Writer) WriteVerbatim(format string, payload []byte) {
 	w.w.WriteByte(':')
 	w.w.Write(payload)
 	w.w.WriteString("\r\n")
+}
+
+// ParseDouble reads a double the way Redis's string2d does. It is the inverse of
+// FormatDouble and lives beside it for the same reason: a value's text and its
+// interpretation are one decision, and a server with two of them disagrees with itself.
+//
+// Go's strconv.ParseFloat is not that decision on its own, because it implements *Go's*
+// float literal grammar, which permits underscores as digit separators. So
+// strconv.ParseFloat("1_0", 64) is 10 with no error, while Redis answers
+// "ERR value is not a valid float" -- measured against redis:7.2-alpine for "1_0" and
+// "1_000.5" through ZADD, ZINCRBY, INCRBYFLOAT and HINCRBYFLOAT, all four of which
+// reject it. Accepting it is the worse half of a wire-compatibility gap: the underscore
+// is not merely tolerated but silently *dropped*, so `SET k 1_0` followed by
+// `INCRBYFLOAT k 1` answered 11 where Redis refuses the operation, and a client that
+// sent a thousands separator by accident got a number two orders of magnitude out with
+// nothing reporting it.
+//
+// Two known differences from Redis are left alone deliberately, because both were
+// measured and neither is a silent reinterpretation:
+//
+//   - Redis's strtod accepts C99 hex literals ("0x10" is 16); Go requires the binary
+//     exponent ("0x1p3" is 8, and that form both accept). Rejecting "0x10" answers an
+//     error where Redis answers a number -- a missing spelling, not a wrong one.
+//   - An underflowing literal ("1e-400") is accepted here as zero. Redis is itself
+//     inconsistent about it: string2d rejects it, so ZADD does, while string2ld accepts
+//     it, so INCRBYFLOAT does. Matching the accepting half keeps the store's stored-value
+//     parse in agreement with the command that writes it.
+func ParseDouble(s string) (float64, bool) {
+	if strings.IndexByte(s, '_') >= 0 {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	return f, err == nil
 }
 
 // FormatDouble renders a floating-point value the way Redis does: the shortest

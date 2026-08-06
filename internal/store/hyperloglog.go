@@ -32,7 +32,7 @@ package store
 // different orders therefore agree byte for byte here, where Redis would agree only on
 // the count. The cost is O(16384) per sparse update instead of O(sparse length), which
 // is bounded: sparse is only used while the sketch is small, and it is promoted to dense
-// as soon as the encoding exceeds hllSparseMaxBytes.
+// as soon as the encoding exceeds the configured hll-sparse-max-bytes.
 //
 // The cached cardinality is always written *stale*. Computing it on a write would put an
 // O(16384) pass on the PFADD path, and computing it on a read would make PFCOUNT modify
@@ -81,7 +81,9 @@ const (
 	// hllDenseSize is the length of a dense HLL string.
 	hllDenseSize = hllHdrSize + (hllRegisters*hllBits+7)/8
 	// hllSparseMaxBytes is how large the sparse encoding may grow before the value is
-	// promoted to dense. It is Redis's hll-sparse-max-bytes default.
+	// promoted to dense. It is Redis's hll-sparse-max-bytes default, and the value
+	// PFSELFTEST checks the encodings against; a live store reads the configured one
+	// (see encodingDefaults, which repeats it as HLLSparseMaxBytes).
 	hllSparseMaxBytes = 3000
 
 	hllDense  = 0
@@ -297,12 +299,12 @@ func sparseRegisters(body []byte) ([]uint8, bool) {
 
 // encodeSparse renders a register array in the sparse encoding, or reports that it
 // cannot: a register above hllSparseValMaxValue has no sparse opcode, and an encoding
-// past hllSparseMaxBytes is not worth keeping sparse.
+// past maxBytes (the configured hll-sparse-max-bytes) is not worth keeping sparse.
 //
 // The output is canonical -- the shortest run-length encoding of the register array --
 // which is what makes two servers that saw the same additions in different orders hold
 // identical bytes.
-func encodeSparse(regs []uint8) ([]byte, bool) {
+func encodeSparse(regs []uint8, maxBytes int64) ([]byte, bool) {
 	body := make([]byte, 0, 64)
 	for i := 0; i < len(regs); {
 		v := regs[i]
@@ -343,7 +345,7 @@ func encodeSparse(regs []uint8) ([]byte, bool) {
 			i++
 		}
 	}
-	if hllHdrSize+len(body) > hllSparseMaxBytes {
+	if int64(hllHdrSize+len(body)) > maxBytes {
 		return nil, false
 	}
 	out := make([]byte, hllHdrSize, hllHdrSize+len(body))
@@ -355,9 +357,11 @@ func encodeSparse(regs []uint8) ([]byte, bool) {
 
 // encodeHLL renders a register array in whichever encoding fits: sparse while it is
 // small, dense once it is not. That is the same rule Redis applies, so a sketch built
-// here changes representation at the same point one built there does.
-func encodeHLL(regs []uint8) []byte {
-	if b, ok := encodeSparse(regs); ok {
+// here changes representation at the same point one built there does -- including when
+// hll-sparse-max-bytes moves that point, which is how a caller asks for the dense
+// encoding from the first element.
+func encodeHLL(regs []uint8, sparseMaxBytes int64) []byte {
+	if b, ok := encodeSparse(regs, sparseMaxBytes); ok {
 		return b
 	}
 	return encodeDense(regs)
@@ -492,7 +496,7 @@ func (s *Store) PFAdd(key string, elements [][]byte) (updated bool, err error) {
 	}
 	// Re-encode rather than patch. See the note at the top of the file: the format is
 	// Redis's, the byte sequence is the canonical encoding of the registers.
-	ne := &entry{kind: kindString, str: encodeHLL(regs), rawString: true}
+	ne := &entry{kind: kindString, str: encodeHLL(regs, s.encoding[HLLSparseMaxBytes].Load()), rawString: true}
 	if e != nil {
 		ne.expireAt = e.expireAt
 	}
@@ -596,7 +600,7 @@ func (s *Store) PFMerge(dst string, srcs []string) (changed bool, err error) {
 			}
 		}
 	}
-	out := encodeHLL(merged)
+	out := encodeHLL(merged, s.encoding[HLLSparseMaxBytes].Load())
 	if e := dsh.liveEntry(dst, now); e != nil && string(e.str) == string(out) {
 		return false, nil
 	}
@@ -708,7 +712,7 @@ func HLLSelfTest() error {
 	for i := 0; i < 100; i++ {
 		sparseRegs[i*7] = uint8(i%hllSparseValMaxValue) + 1
 	}
-	sparse, ok := encodeSparse(sparseRegs)
+	sparse, ok := encodeSparse(sparseRegs, hllSparseMaxBytes)
 	if !ok {
 		return errors.New("hll: a small register array could not be encoded sparsely")
 	}

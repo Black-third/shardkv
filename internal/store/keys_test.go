@@ -174,12 +174,26 @@ func TestEncodingThresholds(t *testing.T) {
 	s.SAdd("strset", "a", "b")
 	s.ZAdd("smallzset", "m", 1)
 
+	// 200 elements is over the sorted set's and the plain set's default of 128 but under
+	// the hash's default of 512, and 200 small integers total far less than the 8 KB a
+	// listpack may occupy -- so the list and the hash here are *listpacks*, which is what
+	// a real redis:7.2 reports for exactly this data. The oversized cases below are what
+	// cross the thresholds.
 	for i := 0; i < 200; i++ {
 		v := strconv.Itoa(i)
-		s.RPush("biglist", []byte(v))
-		s.HSet("bighash", [2][]byte{[]byte(v), []byte(v)})
+		s.RPush("midlist", []byte(v))
+		s.HSet("midhash", [2][]byte{[]byte(v), []byte(v)})
 		s.SAdd("bigset", "m"+v)
 		s.ZAdd("bigzset", "m"+v, float64(i))
+	}
+	// A list crosses its default threshold by *bytes*, not by element count: the default
+	// list-max-listpack-size is -2, meaning "8 KB". 200 fifty-byte elements is 10 KB.
+	for i := 0; i < 200; i++ {
+		s.RPush("biglist", long)
+	}
+	for i := 0; i < 600; i++ {
+		v := strconv.Itoa(i)
+		s.HSet("bighash", [2][]byte{[]byte(v), []byte(v)})
 	}
 
 	cases := []struct{ key, want string }{
@@ -187,8 +201,10 @@ func TestEncodingThresholds(t *testing.T) {
 		{"embstr", "embstr"},
 		{"raw", "raw"},
 		{"smalllist", "listpack"},
+		{"midlist", "listpack"},
 		{"biglist", "quicklist"},
 		{"smallhash", "listpack"},
+		{"midhash", "listpack"},
 		{"bigvalhash", "hashtable"},
 		{"bighash", "hashtable"},
 		{"intset", "intset"},
@@ -209,6 +225,92 @@ func TestEncodingThresholds(t *testing.T) {
 	}
 	if _, ok := s.Encoding("ghost"); ok {
 		t.Error("Encoding reported a missing key as present")
+	}
+}
+
+// TestEncodingThresholdsAreConfigured checks that the thresholds are configuration and
+// not constants: lowering one has to change the reported encoding of a value that has
+// not itself changed. That is the whole point of them being settable -- Redis's own type
+// tests are `foreach encoding {listpack hashtable}` loops that set a threshold and then
+// assert what OBJECT ENCODING says.
+func TestEncodingThresholdsAreConfigured(t *testing.T) {
+	s := New(8)
+	long := make([]byte, 100)
+	for i := range long {
+		long[i] = 'x'
+	}
+
+	s.HSet("h", [2][]byte{[]byte("f1"), []byte("v")})
+	s.HSet("h", [2][]byte{[]byte("f2"), []byte("v")})
+	s.RPush("l", []byte("a"), []byte("b"), []byte("c"))
+	s.SAdd("s", "a", "b", "c")
+	s.SAdd("si", "1", "2", "3")
+	s.ZAdd("z", "a", 1)
+	s.ZAdd("z", "b", 2)
+
+	// Defaults first, so a later failure distinguishes "the threshold did not apply"
+	// from "the value was never a listpack".
+	for _, k := range []string{"h", "l", "s", "z"} {
+		if got, _ := s.Encoding(k); got != "listpack" {
+			t.Fatalf("Encoding(%q) = %q before any threshold moved; want listpack", k, got)
+		}
+	}
+
+	s.SetEncodingLimit(HashMaxListpackEntries, 1)
+	s.SetEncodingLimit(ListMaxListpackSize, 2)
+	s.SetEncodingLimit(SetMaxListpackEntries, 2)
+	s.SetEncodingLimit(SetMaxIntsetEntries, 2)
+	s.SetEncodingLimit(ZSetMaxListpackEntries, 1)
+
+	want := map[string]string{"h": "hashtable", "l": "quicklist", "s": "hashtable", "z": "skiplist", "si": "hashtable"}
+	for k, exp := range want {
+		if got, _ := s.Encoding(k); got != exp {
+			t.Errorf("Encoding(%q) after lowering the entry thresholds = %q; want %q", k, got, exp)
+		}
+	}
+	// An all-integer set past set-max-intset-entries falls back to the listpack, not
+	// straight to the hash table -- so raising only the listpack threshold moves it,
+	// which is the two-stage rule Redis applies to sets and to nothing else.
+	s.SetEncodingLimit(SetMaxListpackEntries, 8)
+	if got, _ := s.Encoding("si"); got != "listpack" {
+		t.Errorf("Encoding of an integer set over set-max-intset-entries = %q; want listpack", got)
+	}
+
+	// And by value length, which is the other half of Redis's rule: a member longer than
+	// the configured maximum forces the general representation whatever the count is.
+	s2 := New(8)
+	s2.SAdd("s", string(long))
+	s2.ZAdd("z", string(long), 1)
+	s2.HSet("h", [2][]byte{[]byte("f"), long})
+	for k, exp := range map[string]string{"s": "hashtable", "z": "skiplist", "h": "hashtable"} {
+		if got, _ := s2.Encoding(k); got != exp {
+			t.Errorf("Encoding(%q) with a 100-byte member = %q; want %q", k, got, exp)
+		}
+	}
+	s2.SetEncodingLimit(SetMaxListpackValue, 128)
+	s2.SetEncodingLimit(ZSetMaxListpackValue, 128)
+	s2.SetEncodingLimit(HashMaxListpackValue, 128)
+	for _, k := range []string{"s", "z", "h"} {
+		if got, _ := s2.Encoding(k); got != "listpack" {
+			t.Errorf("Encoding(%q) after raising the value threshold = %q; want listpack", k, got)
+		}
+	}
+
+	// A negative list-max-listpack-size is a byte budget, so a list of many tiny
+	// elements stays a listpack while one holding more than the budget does not.
+	s3 := New(8)
+	for i := 0; i < 500; i++ {
+		s3.RPush("l", []byte("x"))
+	}
+	if got, _ := s3.Encoding("l"); got != "listpack" {
+		t.Errorf("Encoding of 500 one-byte elements under the default -2 = %q; want listpack", got)
+	}
+	s3.SetEncodingLimit(ListMaxListpackSize, -1) // 4 KB
+	for i := 0; i < 5000; i++ {
+		s3.RPush("l", []byte("x"))
+	}
+	if got, _ := s3.Encoding("l"); got != "quicklist" {
+		t.Errorf("Encoding of 5500 bytes of elements under -1 (4 KB) = %q; want quicklist", got)
 	}
 }
 
@@ -296,7 +398,7 @@ func TestEncodingReportsRepresentationNotContent(t *testing.T) {
 	}
 
 	// A bitmap is a string that was never stored whole.
-	if _, err := s.SetBit("b", 7, true); err != nil {
+	if _, _, err := s.SetBit("b", 7, true); err != nil {
 		t.Fatalf("SetBit: %v", err)
 	}
 	if enc, _ := s.Encoding("b"); enc != "raw" {

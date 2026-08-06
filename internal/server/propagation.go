@@ -2,118 +2,81 @@ package server
 
 import (
 	"strconv"
-	"strings"
-	"time"
 )
 
-// propagationForm rewrites a write command into the form that should be
-// persisted to the AOF and shipped to replicas. Relative-expiry commands are
-// converted to absolute deadlines so a replica or an AOF replay reconstructs the
-// same expiry instant regardless of when it applies the command (real Redis does
-// the same: EXPIRE -> PEXPIREAT, SET EX -> SET PXAT). All other commands
-// propagate verbatim.
+// This file holds the wire forms of the commands whose own text is not replayable
+// because it names a deadline *relative to now*: the expire family, SET's expiring
+// options, SETEX/PSETEX and GETEX. Each is rewritten to an absolute deadline before it
+// reaches the AOF or a replica, so a replay reconstructs the same expiry instant however
+// much later it happens. Real Redis rewrites the same commands the same way
+// (EXPIRE -> PEXPIREAT, SET EX -> SET PXAT). RESTORE's ttl operand is the same case and
+// its renderer lives beside its handler, in commands_dump.go.
 //
-// now must be the same clock the handler resolved its own deadline against (the
-// store's), and the deadline arithmetic is the same overflow-checked deadlineMs,
-// so the instant in memory and the instant on the wire cannot differ. An operand
-// the handler rejected propagates verbatim, since nothing was applied.
+// The conversion needs a reading of the clock, and the load-bearing property of this
+// file is that it does not take one: every builder here is given the absolute deadline
+// its handler already resolved and already wrote to memory.
 //
-// Conditional flags are dropped along the way. A command only reaches here once the
-// master has decided it applies, so re-evaluating NX/XX/GT/LT against the replica's
-// own copy could only reject a write the master accepted.
-func propagationForm(args [][]byte, now time.Time) [][]byte {
-	nowMs := now.UnixMilli()
-	switch strings.ToUpper(string(args[0])) {
-	case "EXPIRE":
-		return expireatForm(args, nowMs, 1000, true)
-	case "PEXPIRE":
-		return expireatForm(args, nowMs, 1, true)
-	case "EXPIREAT":
-		return expireatForm(args, nowMs, 1000, false)
-	case "PEXPIREAT":
-		// Already absolute; only a trailing NX/XX/GT/LT flag needs stripping.
-		if len(args) > 3 {
-			return expireatForm(args, nowMs, 1, false)
-		}
-	case "SET":
-		return setForm(args, nowMs)
-	case "SETEX":
-		// SETEX key seconds value -> SET key value PXAT deadline
-		return setexForm(args, nowMs, 1000)
-	case "PSETEX":
-		return setexForm(args, nowMs, 1)
-	case "GETEX":
-		return getexForm(args, nowMs)
-	case "RESTORE":
-		return restoreForm(args, nowMs)
-	}
-	return args
+// That is not a stylistic preference. The rewrite used to re-derive the deadline from a
+// *second* reading of the store's clock, taken after the handler had run. Both readings
+// came from the same clock -- which is what the code claimed made them equal -- but they
+// were two readings separated by the handler's own execution time, so the deadline on the
+// wire was later than the deadline in memory by however long the write took, and every
+// replica outlived its master on every volatile key. Nothing reported it, because both
+// copies were internally consistent. Under a store clock that advances on each reading
+// the skew is exact and testable; see TestExpiryDeadlineTakesExactlyOneClockReading.
+//
+// So each of these commands is registered with registerEffect and returns the form built
+// here, from its own single reading (`o.atMs`, `deadlineMs(...)`). There is consequently
+// no clock anywhere on the propagation path -- wireForm takes no time argument at all --
+// which is what makes "one reading per command" true by construction rather than by two
+// call sites agreeing to be careful.
+//
+// Conditional flags are dropped along the way. A command only produces an effect once the
+// master has decided it applies, so re-evaluating NX/XX/GT/LT against the replica's own
+// copy could only reject a write the master accepted.
+
+// pexpireatForm renders the absolute PEXPIREAT that the whole expire family propagates
+// as, and that GETEX's expiring form propagates as too.
+func pexpireatForm(key []byte, atMs int64) [][]byte {
+	return [][]byte{[]byte("PEXPIREAT"), key, []byte(strconv.FormatInt(atMs, 10))}
 }
 
-// expireatForm rewrites one of the relative/second-granularity expire commands
-// into the absolute PEXPIREAT the AOF and replicas should see.
-func expireatForm(args [][]byte, nowMs, unitMs int64, rel bool) [][]byte {
-	n, ok := parseInt64(args[2])
-	if !ok {
-		return args
-	}
-	atMs, ok := deadlineMs(nowMs, n, unitMs, rel)
-	if !ok {
-		return args
-	}
-	return pexpireat(args[1], atMs)
-}
-
-// setForm rewrites SET into its canonical propagated shape: the value, plus at
-// most an absolute PXAT deadline or KEEPTTL.
+// setWireForm renders SET's canonical propagated shape: the value, plus at most an
+// absolute PXAT deadline or KEEPTTL. o is the option tail its handler parsed, so atMs is
+// the very instant the store was given.
 //
-// The conditional flags are dropped for the reason above, and GET is dropped
-// because it only shapes the reply. What remains has to be exact about the TTL: a
-// SET that reached memory with KEEPTTL must not clear the replica's TTL, and one
-// with no expiry option must.
-func setForm(args [][]byte, nowMs int64) [][]byte {
-	o, errMsg := parseSetOpts(args, nowMs)
-	if errMsg != "" {
-		return args // rejected by the handler; nothing was applied
-	}
-	out := [][]byte{args[0], args[1], args[2]}
+// The conditional flags are dropped for the reason above, and GET is dropped because it
+// only shapes the reply. What remains has to be exact about the TTL: a SET that reached
+// memory with KEEPTTL must not clear the replica's TTL, and one with no expiry option
+// must.
+//
+// The head is re-sliced with its capacity clamped, so appending the tail copies rather
+// than writing into the caller's argument slice -- which belongs to the client's request
+// buffer, and whose fourth element is still an option word the wire form must not carry.
+func setWireForm(args [][]byte, o setOpts) [][]byte {
+	head := args[:3:3]
 	switch {
 	case o.hasDeadline:
-		out = append(out, []byte("PXAT"), []byte(strconv.FormatInt(o.atMs, 10)))
+		return append(head, []byte("PXAT"), []byte(strconv.FormatInt(o.atMs, 10)))
 	case o.keepTTL:
-		out = append(out, []byte("KEEPTTL"))
+		return append(head, []byte("KEEPTTL"))
 	}
-	return out
+	return head
 }
 
-// setexForm rewrites SETEX/PSETEX (key, ttl, value) into the same absolute SET the
-// expiring forms of SET propagate as, so replay has one shape to reconstruct.
-func setexForm(args [][]byte, nowMs, unitMs int64) [][]byte {
-	n, ok := parseInt64(args[2])
-	if !ok {
-		return args
-	}
-	atMs, ok := deadlineMs(nowMs, n, unitMs, true)
-	if !ok {
-		return args
-	}
-	return [][]byte{[]byte("SET"), args[1], args[3], []byte("PXAT"), []byte(strconv.FormatInt(atMs, 10))}
+// setexWireForm renders SETEX/PSETEX as the same absolute SET the expiring forms of SET
+// propagate as, so a replay has one shape to reconstruct rather than three.
+func setexWireForm(key, val []byte, atMs int64) [][]byte {
+	return [][]byte{[]byte("SET"), key, val, []byte("PXAT"), []byte(strconv.FormatInt(atMs, 10))}
 }
 
-// getexForm rewrites GETEX into the expiry change it made, which is all a replica
-// or an AOF needs: the value it returned was already in the dataset. Redis
-// propagates the same PEXPIREAT/PERSIST pair.
-func getexForm(args [][]byte, nowMs int64) [][]byte {
-	o, errMsg := parseGetExOpts(args, nowMs)
-	if errMsg != "" || !o.apply {
-		return args
-	}
+// getexWireForm renders GETEX as the expiry change it made, which is all a replica or an
+// AOF needs: the value it returned was already in the dataset. Redis propagates the same
+// PEXPIREAT/PERSIST pair. It is only reached when the expiry actually moved, so o.apply
+// is implied.
+func getexWireForm(key []byte, o getExOpts) [][]byte {
 	if o.persist {
-		return [][]byte{[]byte("PERSIST"), args[1]}
+		return [][]byte{[]byte("PERSIST"), key}
 	}
-	return pexpireat(args[1], o.atMs)
-}
-
-func pexpireat(key []byte, atMs int64) [][]byte {
-	return [][]byte{[]byte("PEXPIREAT"), key, []byte(strconv.FormatInt(atMs, 10))}
+	return pexpireatForm(key, o.atMs)
 }

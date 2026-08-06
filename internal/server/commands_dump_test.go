@@ -550,8 +550,10 @@ func TestRestoreReplayable(t *testing.T) {
 	rc := &binClient{t: t, s: replica}
 	for _, key := range []string{"h", "st", "hll"} {
 		payload := c.do("DUMP", key)
-		// Exactly what the master would ship, deadline rewrite included.
-		wire := propagationForm(cmdArgs("RESTORE", key, "0", payload), time.Now())
+		// Exactly what the master would ship: a ttl of 0 names no deadline, so there is
+		// nothing to rewrite and cmdRestore propagates the command verbatim. (The rewritten
+		// form is covered by TestRestorePropagatesAbsoluteDeadline above.)
+		wire := cmdArgs("RESTORE", key, "0", payload)
 		replica.applyCommand(resp.NewWriter(io.Discard), wire)
 	}
 	for _, check := range []string{"HGETALL h", "XRANGE st - +", "XINFO GROUPS st", "GET hll"} {

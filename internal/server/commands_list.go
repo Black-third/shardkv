@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"strings"
 
 	"github.com/Black-third/shardkv/internal/resp"
@@ -9,6 +10,8 @@ import (
 func init() {
 	register("LPUSH", -3, true, cmdLPush)
 	register("RPUSH", -3, true, cmdRPush)
+	register("LPUSHX", -3, true, cmdLPushX)
+	register("RPUSHX", -3, true, cmdRPushX)
 	register("LPOP", -2, true, cmdLPop)
 	register("RPOP", -2, true, cmdRPop)
 	register("LRANGE", 4, false, cmdLRange)
@@ -41,6 +44,37 @@ func cmdRPush(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 	w.WriteInt(int64(n))
 	return true
+}
+
+// cmdLPushX and cmdRPushX push only onto a list that already exists, replying with 0 and
+// creating nothing otherwise. The reply is the new length either way, so a caller can tell
+// "I appended" from "there was no queue" without a second round trip.
+//
+// They report dirty only when they actually pushed -- the whole point of the conditional
+// form is that it often does nothing, and a no-op that propagated would put an LPUSHX in
+// the AOF that recreates nothing but costs a record to replay (invariant 2).
+func cmdLPushX(s *Server, w *resp.Writer, args [][]byte) bool {
+	return pushX(s, w, args, true)
+}
+
+func cmdRPushX(s *Server, w *resp.Writer, args [][]byte) bool {
+	return pushX(s, w, args, false)
+}
+
+func pushX(s *Server, w *resp.Writer, args [][]byte, left bool) bool {
+	var n int
+	var err error
+	if left {
+		n, err = s.store.LPushX(string(args[1]), args[2:]...)
+	} else {
+		n, err = s.store.RPushX(string(args[1]), args[2:]...)
+	}
+	if err != nil {
+		writeStoreErr(w, err)
+		return false
+	}
+	w.WriteInt(int64(n))
+	return n > 0
 }
 
 func cmdLPop(s *Server, w *resp.Writer, args [][]byte) bool {
@@ -244,9 +278,17 @@ func cmdLPos(s *Server, w *resp.Writer, args [][]byte) bool {
 		switch strings.ToUpper(string(args[i])) {
 		case "RANK":
 			if n == 0 {
-				w.WriteError("ERR RANK can't be zero. Use 1 to start searching from " +
-					"the first matching element in the head of the list or a negative " +
-					"rank to start searching from the tail. A rank of zero is invalid.")
+				w.WriteError("ERR RANK can't be zero: use 1 to start from the first match, " +
+					"2 from the second ... or use negative to start from the end of the list")
+				return false
+			}
+			// A negative rank counts from the tail, so the search negates it -- and the smallest
+			// int64 negates to itself. Redis refuses that one value by name for exactly this
+			// reason, and so does every other command here that takes a count it will negate
+			// (see parseRandomCount).
+			if n == math.MinInt {
+				w.WriteError("ERR value is out of range, value must between " +
+					"-9223372036854775807 and 9223372036854775807")
 				return false
 			}
 			rank = n

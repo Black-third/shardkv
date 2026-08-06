@@ -49,13 +49,13 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 - **Six data types** — strings, lists, hashes, sets, **sorted sets backed by a
   hand-written skip list** with O(log n) insertion, deletion and rank queries, and
-  **streams** with consumer groups. 198 commands, including the set algebra
-  (`SINTER`/`SUNION`/`SDIFF` and their `*STORE` forms), score and rank range
-  queries, the positional list operations, and the cursor iterators for every
-  collection. Lexicographic *ranges* (`ZRANGEBYLEX` and its family) and the sorted-set
-  algebra (`ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFF`) are **not** implemented — see
-  [Compatibility](#compatibility-what-is-missing) for the full list of what a client
-  may expect and not find.
+  **streams** with consumer groups. 222 commands, including both set algebras
+  (`SINTER`/`SUNION`/`SDIFF` and `ZUNION`/`ZINTER`/`ZDIFF` with their `*STORE` forms,
+  `WEIGHTS` and `AGGREGATE`), score, rank *and* lexicographic range queries
+  (`ZRANGEBYLEX`, `ZRANGE ... BYSCORE|BYLEX|REV|LIMIT`, `ZRANGESTORE`), `SORT` with its
+  `BY`/`GET` patterns, `LCS`, the positional list operations, and the cursor iterators for
+  every collection. See [Compatibility](#compatibility-what-is-missing) for what a client
+  may still expect and not find.
 - **Cluster mode** — CRC16-XMODEM hash slots with hash tags, `MOVED`/`ASK`/
   `CROSSSLOT`/`TRYAGAIN`/`CLUSTERDOWN` redirects, the `CLUSTER` administration
   surface (`NODES`/`SLOTS`/`SHARDS` in the exact formats clients parse), and live
@@ -199,11 +199,14 @@ of goroutines and TCP clients — passes under the Go race detector.
   replication backlog, the AOF itself — are each bounded, with the overflow answered
   by a visible disconnect or a compaction rather than by unbounded memory.
 
-  One path is **not** bounded, and it is worth naming rather than leaving to be
-  discovered: there is no `maxclients`, no idle timeout and no per-client read
-  deadline, and every accepted connection gets a goroutine. A caller that opens
-  connections and never closes them will exhaust memory. See
-  [Compatibility](#compatibility-what-is-missing).
+  The connection table is bounded too. `-maxclients` (default 10000, as in Redis) is
+  checked *before* a goroutine is spent on an accepted connection, and a refused client is
+  told `-ERR max number of clients reached` and then hung up on rather than left to report
+  "connection reset". An optional `-timeout` closes idle connections, and it exempts the
+  four kinds that are silent by design — a replica feed, a Pub/Sub subscriber, a `MONITOR`
+  feed and a client parked in `BLPOP` — because reaping those would break exactly the
+  clients that are working correctly. `INFO clients` reports `connected_clients`,
+  `maxclients` and `rejected_connections`.
 - **Self-registering command table** — each command declares an arity and either
   a `write` flag, an effect handler, or a session handler for the connection-control
   commands. The `write` flag is what automatically drives both AOF persistence and
@@ -242,32 +245,33 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 ## Commands
 
-198 commands, with Redis's replies, error strings, and edge-case behaviour
+222 commands, with Redis's replies, error strings, and edge-case behaviour
 (missing keys, empty collections, negative indexes, wrong-type errors). Every
 reply is available in both RESP2 and RESP3; where the two differ, the RESP3 shape
 is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
 
 | Group   | Commands |
 | ------- | -------- |
-| Strings | `SET key val [NX\|XX] [GET] [KEEPTTL] [EX s\|PX ms\|EXAT ts\|PXAT ts]` · `GET` · `GETEX key [EX s\|PX ms\|EXAT ts\|PXAT ts\|PERSIST]` · `GETSET` · `GETDEL` · `SETNX` · `SETEX` · `PSETEX` · `APPEND` · `STRLEN` · `SETRANGE` · `GETRANGE`/`SUBSTR` · `INCR` · `DECR` · `INCRBY` · `DECRBY` · `INCRBYFLOAT` · `MSET` · `MGET` |
-| Keys    | `DEL` · `UNLINK` · `EXISTS` · `TOUCH` · `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT key n [NX\|XX\|GT\|LT]` · `PERSIST` · `TTL` · `PTTL` · `TYPE` · `RENAME` · `RENAMENX` · `COPY key dst [DB n] [REPLACE]` · `RANDOMKEY` · `OBJECT ENCODING\|REFCOUNT\|IDLETIME` · `KEYS pattern` · `SCAN cursor [MATCH p] [COUNT n]` |
-| Lists   | `LPUSH` · `RPUSH` · `LPOP key [count]` · `RPOP key [count]` · `LRANGE` · `LLEN` · `LINDEX` · `LSET` · `LINSERT key BEFORE\|AFTER pivot v` · `LREM` · `LTRIM` · `LPOS key v [RANK n] [COUNT n] [MAXLEN n]` · `RPOPLPUSH` · `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` · `LMPOP numkeys key... LEFT\|RIGHT [COUNT n]` |
+| Strings | `SET key val [NX\|XX] [GET] [KEEPTTL] [EX s\|PX ms\|EXAT ts\|PXAT ts]` · `GET` · `GETEX key [EX s\|PX ms\|EXAT ts\|PXAT ts\|PERSIST]` · `GETSET` · `GETDEL` · `SETNX` · `SETEX` · `PSETEX` · `APPEND` · `STRLEN` · `SETRANGE` · `GETRANGE`/`SUBSTR` · `INCR` · `DECR` · `INCRBY` · `DECRBY` · `INCRBYFLOAT` · `MSET` · `MGET` · `LCS key1 key2 [LEN\|IDX] [MINMATCHLEN n] [WITHMATCHLEN]` |
+| Keys    | `DEL` · `UNLINK` · `EXISTS` · `TOUCH` · `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT key n [NX\|XX\|GT\|LT]` · `PERSIST` · `TTL` · `PTTL` · `TYPE` · `RENAME` · `RENAMENX` · `COPY key dst [DB n] [REPLACE]` · `RANDOMKEY` · `OBJECT ENCODING\|REFCOUNT\|IDLETIME` · `KEYS pattern` · `SCAN cursor [MATCH p] [COUNT n] [TYPE t]` · `EXPIRETIME` · `PEXPIRETIME` · `SORT`/`SORT_RO key [BY pat] [LIMIT off n] [GET pat...] [ASC\|DESC] [ALPHA] [STORE dst]` |
+| Lists   | `LPUSH` · `RPUSH` · `LPUSHX` · `RPUSHX` · `LPOP key [count]` · `RPOP key [count]` · `LRANGE` · `LLEN` · `LINDEX` · `LSET` · `LINSERT key BEFORE\|AFTER pivot v` · `LREM` · `LTRIM` · `LPOS key v [RANK n] [COUNT n] [MAXLEN n]` · `RPOPLPUSH` · `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` · `LMPOP numkeys key... LEFT\|RIGHT [COUNT n]` |
 | Blocking | `BLPOP key... timeout` · `BRPOP key... timeout` · `BLMOVE src dst LEFT\|RIGHT LEFT\|RIGHT timeout` · `BRPOPLPUSH src dst timeout` · `BZPOPMIN key... timeout` · `BZPOPMAX key... timeout` · `BLMPOP timeout numkeys key... LEFT\|RIGHT [COUNT n]` · `BZMPOP timeout numkeys key... MIN\|MAX [COUNT n]` |
-| Hashes  | `HSET` · `HGET` · `HDEL` · `HGETALL` · `HLEN` · `HKEYS` · `HVALS` · `HEXISTS` · `HMGET` · `HSTRLEN` · `HSETNX` · `HINCRBY` · `HINCRBYFLOAT` · `HRANDFIELD key [count [WITHVALUES]]` · `HSCAN` |
+| Hashes  | `HSET` · `HMSET` · `HGET` · `HDEL` · `HGETALL` · `HLEN` · `HKEYS` · `HVALS` · `HEXISTS` · `HMGET` · `HSTRLEN` · `HSETNX` · `HINCRBY` · `HINCRBYFLOAT` · `HRANDFIELD key [count [WITHVALUES]]` · `HSCAN key cursor [MATCH p] [COUNT n] [NOVALUES]` |
 | Sets    | `SADD` · `SREM` · `SMEMBERS` · `SISMEMBER` · `SMISMEMBER` · `SCARD` · `SPOP key [count]` · `SRANDMEMBER key [count]` · `SMOVE` · `SINTER` · `SUNION` · `SDIFF` · `SINTERSTORE` · `SUNIONSTORE` · `SDIFFSTORE` · `SINTERCARD numkeys key... [LIMIT n]` · `SSCAN` |
-| Sorted  | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member...` · `ZINCRBY` · `ZSCORE` · `ZMSCORE` · `ZREM key member...` · `ZCARD` · `ZCOUNT` · `ZLEXCOUNT` · `ZRANK` · `ZREVRANK` · `ZRANGE [WITHSCORES]` · `ZREVRANGE` · `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT off n]` · `ZREVRANGEBYSCORE` · `ZREMRANGEBYRANK` · `ZREMRANGEBYSCORE` · `ZRANDMEMBER key [count [WITHSCORES]]` · `ZPOPMIN key [count]` · `ZPOPMAX key [count]` · `ZMPOP numkeys key... MIN\|MAX [COUNT n]` · `ZSCAN` |
+| Sorted  | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member...` · `ZINCRBY` · `ZSCORE` · `ZMSCORE` · `ZREM key member...` · `ZCARD` · `ZCOUNT` · `ZLEXCOUNT` · `ZRANK key member [WITHSCORE]` · `ZREVRANK` · `ZRANGE key start stop [BYSCORE\|BYLEX] [REV] [LIMIT off n] [WITHSCORES]` · `ZREVRANGE` · `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT off n]` · `ZREVRANGEBYSCORE` · `ZRANGEBYLEX key min max [LIMIT off n]` · `ZREVRANGEBYLEX` · `ZRANGESTORE dst src min max [BYSCORE\|BYLEX] [REV] [LIMIT off n]` · `ZREMRANGEBYRANK` · `ZREMRANGEBYSCORE` · `ZREMRANGEBYLEX` · `ZRANDMEMBER key [count [WITHSCORES]]` · `ZPOPMIN key [count]` · `ZPOPMAX key [count]` · `ZMPOP numkeys key... MIN\|MAX [COUNT n]` · `ZSCAN` |
+| Sorted algebra | `ZUNIONSTORE dst numkeys key... [WEIGHTS w...] [AGGREGATE SUM\|MIN\|MAX]` · `ZINTERSTORE` · `ZDIFFSTORE dst numkeys key...` · `ZUNION numkeys key... [WEIGHTS w...] [AGGREGATE ...] [WITHSCORES]` · `ZINTER` · `ZDIFF numkeys key... [WITHSCORES]` · `ZINTERCARD numkeys key... [LIMIT n]` |
 | Streams | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] n [LIMIT c]] <*\|ms-*\|id> field val...` · `XLEN` · `XRANGE key start end [COUNT n]` · `XREVRANGE` · `XDEL key id...` · `XTRIM key MAXLEN\|MINID [=\|~] n [LIMIT c]` · `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` · `XREAD [COUNT n] [BLOCK ms] STREAMS key... id...` |
 | Stream groups | `XGROUP CREATE key g <id\|$> [MKSTREAM] [ENTRIESREAD n]` · `XGROUP SETID\|DESTROY\|CREATECONSUMER\|DELCONSUMER` · `XREADGROUP GROUP g c [COUNT n] [BLOCK ms] [NOACK] STREAMS key... <id\|>>...` · `XACK key g id...` · `XPENDING key g [[IDLE ms] start end count [consumer]]` · `XCLAIM key g c min-idle id... [IDLE ms] [TIME ms] [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id]` · `XAUTOCLAIM key g c min-idle start [COUNT n] [JUSTID]` · `XINFO STREAM\|GROUPS\|CONSUMERS` |
 | Bitmaps | `SETBIT key offset 0\|1` · `GETBIT key offset` · `BITCOUNT key [start end [BYTE\|BIT]]` · `BITPOS key 0\|1 [start [end [BYTE\|BIT]]]` · `BITOP AND\|OR\|XOR\|NOT dst src...` · `BITFIELD key [GET type off] [SET type off v] [INCRBY type off n] [OVERFLOW WRAP\|SAT\|FAIL]...` · `BITFIELD_RO` |
 | HyperLogLog | `PFADD key [element...]` · `PFCOUNT key [key...]` · `PFMERGE dst [src...]` · `PFDEBUG GETREG\|ENCODING\|TODENSE key` · `PFSELFTEST` |
-| Geo     | `GEOADD key [NX\|XX] [CH] lon lat member...` · `GEOPOS key [member...]` · `GEODIST key m1 m2 [m\|km\|ft\|mi]` · `GEOHASH key [member...]` · `GEOSEARCH key <FROMMEMBER m\|FROMLONLAT lon lat> <BYRADIUS r unit\|BYBOX w h unit> [ASC\|DESC] [COUNT n [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]` · `GEOSEARCHSTORE dst src ... [STOREDIST]` |
+| Geo     | `GEOADD key [NX\|XX] [CH] lon lat member...` · `GEOPOS key [member...]` · `GEODIST key m1 m2 [m\|km\|ft\|mi]` · `GEOHASH key [member...]` · `GEOSEARCH key <FROMMEMBER m\|FROMLONLAT lon lat> <BYRADIUS r unit\|BYBOX w h unit> [ASC\|DESC] [COUNT n [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]` · `GEOSEARCHSTORE dst src ... [STOREDIST]` · `GEORADIUS key lon lat radius unit [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n [ANY]] [ASC\|DESC] [STORE dst] [STOREDIST dst]` · `GEORADIUSBYMEMBER key member radius unit ...` · `GEORADIUS_RO` · `GEORADIUSBYMEMBER_RO` |
 | Tx      | `MULTI` · `EXEC` · `DISCARD` · `WATCH` · `UNWATCH` |
 | Pub/Sub | `SUBSCRIBE` · `UNSUBSCRIBE` · `PSUBSCRIBE` · `PUNSUBSCRIBE` · `PUBLISH` · `PUBSUB CHANNELS [pattern]\|NUMSUB [ch...]\|NUMPAT` |
-| Connection | `AUTH [username] password` · `HELLO [2\|3 [AUTH u p] [SETNAME n]]` · `PING` · `SELECT index` · `RESET` · `QUIT` · `CLIENT ID\|GETNAME\|SETNAME\|LIST\|INFO\|KILL\|UNBLOCK id [TIMEOUT\|ERROR]` |
+| Connection | `AUTH [username] password` · `HELLO [2\|3 [AUTH u p] [SETNAME n]]` · `PING` · `SELECT index` · `RESET` · `QUIT` · `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|LIST\|INFO\|KILL\|UNBLOCK id [TIMEOUT\|ERROR]\|REPLY ON\|OFF\|SKIP` |
 | Databases | `SELECT index` · `SWAPDB index1 index2` · `MOVE key db` · `COPY key dst [DB n] [REPLACE]` · `FLUSHDB` · `FLUSHALL` · `DBSIZE` |
 | Server  | `INFO [section...]` · `DBSIZE` · `FLUSHDB` · `FLUSHALL` · `SWAPDB` · `MOVE` · `CONFIG GET\|SET\|RESETSTAT` · `COMMAND [COUNT\|INFO\|DOCS\|GETKEYS\|HELP]` · `DEBUG PROTOCOL\|SLEEP\|OBJECT\|CHANGE-REPL-ID\|HELP` · `BGREWRITEAOF` · `LASTSAVE` · `SHUTDOWN [NOSAVE]` |
-| Observability | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` · `MONITOR` · `LATENCY HISTORY event\|LATEST\|RESET [event...]\|HELP` · `MEMORY USAGE key [SAMPLES n]\|DOCTOR\|HELP` · `COMMAND GETKEYS cmd args...` · `INFO commandstats` · `INFO latencystats` |
-| Replication | `REPLICAOF host port\|NO ONE` · `SLAVEOF` · `PSYNC replid offset` · `REPLCONF listening-port\|ACK` · `WAIT numreplicas timeout` |
+| Observability | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` · `MONITOR` · `LATENCY HISTORY event\|LATEST\|HISTOGRAM [cmd...]\|RESET [event...]\|HELP` · `MEMORY USAGE key [SAMPLES n]\|DOCTOR\|HELP` · `COMMAND GETKEYS cmd args...` · `INFO commandstats` · `INFO latencystats` |
+| Replication | `REPLICAOF host port\|NO ONE` · `SLAVEOF` · `ROLE` · `PSYNC replid offset` · `REPLCONF listening-port\|ACK` · `WAIT numreplicas timeout` |
 | Cluster | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` · `CLUSTER ADDSLOTS slot...\|DELSLOTS\|ADDSLOTSRANGE start end...\|DELSLOTSRANGE` · `CLUSTER SETSLOT slot IMPORTING\|MIGRATING\|STABLE\|NODE id` · `CLUSTER COUNTKEYSINSLOT slot\|GETKEYSINSLOT slot count` · `CLUSTER MEET ip port [bus-port]\|FORGET id\|REPLICATE id\|RESET [HARD\|SOFT]` · `ASKING` · `READONLY` · `READWRITE` |
 | Migration | `DUMP key` · `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]` · `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH pw\|AUTH2 user pw] [KEYS key...]` |
 
@@ -497,7 +501,22 @@ Every flag:
 -slowlog-max-len 128            how many slow-log entries are retained
 -latency-monitor-threshold 0    milliseconds an event must take to be sampled
                                 (0 disables the latency monitor)
+-maxclients 10000               simultaneous connections; further ones are refused
+                                with -ERR max number of clients reached, and closed
+-timeout 0                      seconds a client may be idle before being closed
+                                (0 = never; replicas, subscribers, monitors and
+                                blocked clients are exempt)
 ```
+
+`CONFIG GET`/`SET` reach the same settings at runtime under Redis's names, plus the
+representation thresholds `OBJECT ENCODING` reports from — `hash-max-listpack-entries`,
+`hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`,
+`set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`,
+`zset-max-listpack-value` and `hll-sparse-max-bytes`, each also answering to its older
+`ziplist` spelling. Those are real settings rather than remembered numbers: lowering one
+changes what `OBJECT ENCODING` says about a value, and `hll-sparse-max-bytes` genuinely
+moves the point at which a HyperLogLog stops being sparse. See
+[OBJECT ENCODING](#object-encoding-and-the-representation-thresholds).
 
 Pub/Sub, in two terminals:
 
@@ -798,9 +817,20 @@ The rest of the decisions:
   is still there afterwards — and is stopped by a read deadline set in the past,
   followed by a handshake that guarantees the peek has finished before the connection's
   goroutine reads again.
-- **`FLUSHALL` and `FLUSHDB` do not unblock anyone.** They remove keys; there is
-  nothing to serve, so waiters keep waiting. Nor does a key expiring: an expired list
-  has no element to hand over.
+- **A wakeup is filtered by type, so the wrong kind of value does not release a client.**
+  A waiter is signalled by anything that creates one of its keys, and what appeared may be
+  a string: `ZADD k 0 x; DEL k; SET k v` wakes a `BZPOPMIN`, which then has nothing it can
+  serve. Answering `WRONGTYPE` there would fail a command whose own arguments were never
+  wrong, over a value that is already gone by the time the client reads the error — so the
+  client stays blocked and a later `ZADD` serves it, which is what Redis does. A refusal
+  that *is* about the command still lands: `BRPOPLPUSH` onto a string destination answers
+  `WRONGTYPE` when its source finally receives an element.
+- **`FLUSHALL` and `FLUSHDB` release an `XREADGROUP` and nobody else.** They remove keys, so
+  a `BLPOP` waiter is signalled, finds no list, and goes back to sleep. `XREADGROUP` is
+  different in kind: it waits on a consumer *group*, and a flush destroyed it, so the client
+  is now waiting for something that can never arrive and is told so (`NOGROUP`). The same
+  reasoning releases it when its key is deleted or overwritten with another type. A key
+  merely *expiring* releases nobody: an expired list has no element to hand over.
 - **A demotion to replica unblocks everyone**, with the same `-UNBLOCKED` error Redis
   uses. These are write commands, and a replica refuses writes, so waiting for one to
   succeed would be waiting for something that can no longer happen.
@@ -1234,6 +1264,20 @@ cells describe.
 can be searched again — or distances with `STOREDIST`, which makes it an ordinary sorted
 set ordered by proximity.
 
+`GEORADIUS`, `GEORADIUSBYMEMBER` and their `_RO` forms are the pre-6.2 spelling of the same
+search, and they are here because a decade of client code sends them. They are the same
+search over a different argument layout, sharing one implementation with `GEOSEARCH` rather
+than duplicating it — with one difference worth naming: their `STORE` and `STOREDIST` each
+take a *key operand*, where `GEOSEARCHSTORE`'s `STOREDIST` is a bare flag. The `_RO` forms
+are the same commands with both refused, which is what lets a client send a radius search to
+a replica.
+
+```bash
+redis-cli -p 6380 georadius Sicily 15 37 200 km withdist asc
+redis-cli -p 6380 georadiusbymember Sicily Palermo 200 km count 1
+redis-cli -p 6380 georadius Sicily 15 37 200 km storedist by_distance
+```
+
 ## Observability
 
 ```bash
@@ -1248,6 +1292,7 @@ redis-cli -p 6380 slowlog reset
 redis-cli -p 6380 config set latency-monitor-threshold 100
 redis-cli -p 6380 latency latest        # event, last timestamp, last ms, max ms
 redis-cli -p 6380 latency history command
+redis-cli -p 6380 latency histogram get set   # per-command cumulative distribution
 redis-cli -p 6380 latency reset
 
 # per-command statistics and approximate percentiles, both excluded from a bare INFO
@@ -1282,6 +1327,12 @@ Four things are worth knowing about this surface:
 - **Blocked time is not slow time.** A `BLPOP` that waited five seconds for a push does
   not enter the slow log: the wait is subtracted before the threshold is tested, because
   waiting for a client is not work the server did slowly.
+- **`LATENCY HISTOGRAM` and `INFO latencystats` read the same measurements.** There is one
+  histogram per command — 64 power-of-two buckets on the table entry — and the two commands
+  are two views of it: percentiles for `INFO`, the cumulative distribution for `LATENCY
+  HISTOGRAM`. Redis's buckets are `hdr_histogram`'s and so are finer; both are
+  approximations, and reporting this one's real boundaries beats interpolating onto Redis's
+  and implying a precision the data does not have.
 
 `MEMORY USAGE` is an estimate and is documented as one — Go offers no portable way to ask
 the allocator how large a live object graph is — but it is exact about the payload, which
@@ -1434,6 +1485,19 @@ arity/existence (a bad command makes the whole `EXEC` fail with `EXECABORT`).
 or another — between `WATCH` and `EXEC`, `EXEC` aborts and returns a null array,
 the basis for lock-free check-and-set patterns.
 
+Two edges of that rule are worth stating, because both are places a naive implementation
+silently gets wrong:
+
+- **A watched key that merely *expired* also aborts**, and it has to be checked at `EXEC`
+  rather than reported by an event. A key past its deadline is already invisible to every
+  read, but nothing has removed it yet, so there is no write to invalidate the `WATCH` with
+  until a read or the janitor gets to it. `EXEC` therefore re-tests every key that was live
+  when it was watched. Redis checks the same thing at the same moment, for the same reason.
+- **A flush invalidates only the keys that were there.** `FLUSHALL` and `FLUSHDB` abort a
+  transaction watching a key they actually emptied, and leave one watching an absent key
+  alone — otherwise `FLUSHALL` would be a way to fail every open transaction on the server
+  regardless of what it touched.
+
 ## Eviction
 
 ```bash
@@ -1486,12 +1550,15 @@ documented as approximate anyway.
   agreement. That lock is skipped entirely for a pure cache, so the default
   config keeps concurrent-write throughput.
 - **Absolute deadlines on the wire.** Relative-TTL writes are rewritten to
-  absolute (`PEXPIREAT`, `SET ... PXAT`) before they reach the AOF/replicas, and
-  the master synthesizes a `DEL` when it expires/evicts a key, so replicas and
-  replayed AOFs don't drift on TTL boundaries. The handler and the rewrite read
-  the *same* clock and run the same overflow-checked arithmetic, so the instant
-  written to memory and the instant put on the wire are identical by construction
-  rather than by coincidence.
+  absolute (`PEXPIREAT`, `SET ... PXAT`, `RESTORE ... ABSTTL`) before they reach
+  the AOF/replicas, and the master synthesizes a `DEL` when it expires/evicts a
+  key, so replicas and replayed AOFs don't drift on TTL boundaries. The rewrite is
+  built from the deadline the handler *already resolved and already wrote to
+  memory* — one clock reading per command, with no clock anywhere on the
+  propagation path — so the two instants are the same value, not two computations
+  of it. Reading the same clock twice is not sufficient and was the earlier bug:
+  the second reading happened after the handler ran, so a replica's copy of a key
+  outlived the master's by however long the write took (74 ms with a large value).
 - **Chunked snapshots.** `Dump` emits a large collection as a run of bounded
   commands (the first creates the key, the rest append, the `PEXPIREAT` comes
   last) instead of one command per key. One command per key is not merely
@@ -1827,11 +1894,11 @@ cannot release, because release is a registered script — the lock expires by T
 Verified against redis-py 6.4. The same applies to Redisson, BullMQ, Sidekiq and most
 Lua-based rate limiters. If you need those, you need Redis.
 
-**Commands a client may expect and not find**, verified absent: `SORT`/`SORT_RO`;
-`ZRANGEBYLEX`/`ZREVRANGEBYLEX`/`ZREMRANGEBYLEX` and `ZRANGE ... BYLEX` (`ZLEXCOUNT`
-exists, so a lex range can be *counted* but not retrieved); the sorted-set algebra
-`ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZUNION`/`ZINTER`/`ZDIFF`/`ZRANGESTORE`;
-`LPUSHX`/`RPUSHX`; `EXPIRETIME`/`PEXPIRETIME`; `SAVE`/`BGSAVE`; `WAITAOF`; `ACL`.
+**Commands a client may expect and not find**, verified absent: `SAVE`/`BGSAVE`
+(there is no RDB — see below); `WAITAOF`; `ACL`; `OBJECT FREQ` (there is no LFU); the
+sharded Pub/Sub family `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`; `CLIENT NO-EVICT`/
+`NO-TOUCH`/`PAUSE`/`UNPAUSE`; the hash-field expiry family `HEXPIRE`/`HPEXPIRE`/
+`HTTL`/`HPERSIST` added in 7.4.
 
 **No RDB, in either direction.** A full resync ships a stream of RESP commands rather
 than an RDB payload, and `DUMP`/`RESTORE` use a self-describing `SHARDKV1` format that
@@ -1841,9 +1908,16 @@ deliberate — a subtly wrong listpack encoding would produce a payload real Red
 cannot load an existing Redis dataset into this server**, and `redis-cli --rdb`,
 `redis-shake` and live cutover from Redis do not work.
 
-**No connection ceiling.** There is no `maxclients`, no idle timeout and no per-client
-read deadline; each accepted connection gets a goroutine. A client that opens
-connections without closing them will exhaust memory.
+**`OBJECT ENCODING` is derived, not remembered.** <a id="object-encoding-and-the-representation-thresholds"></a>
+The thresholds are real configuration — `CONFIG SET hash-max-listpack-entries 3` genuinely
+changes what a four-field hash reports — but the name is computed from the value's *current*
+contents and the *current* thresholds, because this store keeps one representation per type
+and so has no conversion to remember having done. Redis converts on write and never converts
+back, which shows up in two places: raising a threshold here can make a value report
+`listpack` again where Redis would still say `hashtable`, and lowering one changes the
+answer without any write having happened. Every reading taken at the moment a value is built
+agrees with Redis, which is what the `foreach encoding {listpack hashtable}` loops in its
+own test suite ask for.
 
 **Two introspection replies differ deliberately.** Both are cosmetic, both would cost
 real state or a fiction to "fix", and both are named here rather than left to surprise
@@ -1898,6 +1972,12 @@ along. A suite without a reference column would have recorded that as a server b
 | **redis-py 8** (hiredis parser) | 85 | **78** | `EVAL`; `Lock` (releases via a Lua script); `SORT`; `ZUNIONSTORE`; `ZRANGE BYLEX`; `SCAN TYPE`; `RPUSHX` |
 | **go-redis v9** (RESP3 by default) | 66 | **57** | the same set, plus `ROLE`, `EXPIRETIME`, `ZRANGE BYSCORE` — and one cluster-`SCAN` check that has not reproduced (see below) |
 
+Every failure in those last two rows except `EVAL` and `Lock` has since been implemented —
+`SORT`, `ZUNIONSTORE`, `ZRANGE BYLEX`/`BYSCORE`, `SCAN TYPE`, `RPUSHX`, `ROLE` and
+`EXPIRETIME` are all present now — so the table understates the current state and will be
+re-measured with the harness rather than edited by hand. Scripting is the only remaining
+cause, and it is not going to change.
+
 Every failure in that table is a command or option this server does not implement, listed
 above — not a reply this server gets wrong. The one exception is honest to record: under a
 run with three suites competing for the machine, go-redis's cluster `SCAN` found 62 of 64
@@ -1912,19 +1992,52 @@ three-node topology from `CLUSTER SLOTS`/`SHARDS`, route by slot, follow `MOVED`
 pipeline per node and stitch the replies back together, and raise `CROSSSLOT` for a
 multi-key command that spans slots — against this server exactly as against Redis.
 
-And on Redis's own suite, against this commit: **293 of its assertions pass**, across the
-23 unit files that cover the implemented surface. The honest part of that number is its
-denominator. Only five of those files run to completion; the other eighteen abort part-way,
-because Redis's suite calls something absent and the suite ends a file at the first such
-call. The largest single cause is not a command at all — Redis's type tests open by setting
-an encoding threshold (`CONFIG SET hash-max-listpack-value`, `set-max-intset-entries`, …)
-to exercise both of Redis's internal representations, and there is only one representation
-per type here, so `unit/type/hash`, `list`, `set` and `zset` stop on their first line and
-contribute nothing. For calibration, on the files that do run: `unit/type/string` 72 of the
-80 assertions real Redis passes, `unit/type/incr` 32 of 33, `unit/expire` 18 of 65.
+And on Redis's own suite, against this commit: **about 1180 of its assertions pass**, across
+the 23 unit files that cover the implemented surface, with 17 of those files now running to
+completion. Measured per file, one invocation each:
 
-Quoting "293" without that paragraph would be the same dishonesty as a benchmark table with
-the losses removed.
+| file | ok | err | stops early on |
+| --- | --- | --- | --- |
+| `type/zset` | 315 | 1 | — |
+| `type/set` | 112 | 2 | — |
+| `type/string` | 79 | 0 | — |
+| `type/list` | 77 | 0 | — |
+| `type/hash` | 71 | 2 | — |
+| `type/stream` | 57 | 15 | — |
+| `geo` | 58 | 6 | — |
+| `expire` | 58 | 0 | — |
+| `bitops` | 49 | 0 | — |
+| `keyspace` | 45 | 1 | — |
+| `type/stream-cgroups` | 41 | 11 | `XINFO STREAM FULL` |
+| `type/incr` | 32 | 0 | — |
+| `sort` | 32 | 0 | `EVAL` |
+| `pubsub` | 29 | 1 | `EVAL` |
+| `multi` | 23 | 0 | `CONFIG SET lua-time-limit` |
+| `hyperloglog` | 22 | 3 | — |
+| `scan` | 21 | 1 | — |
+| `bitfield` | 18 | 0 | — |
+| `protocol` | 16 | 3 | — |
+| `slowlog` | 11 | 0 | — |
+| `dump` | 8 | 1 | — |
+| `latency-monitor` | 6 | 0 | `EVAL` |
+| `quit` | 3 | 0 | — |
+
+The honest part of that number is what is *still* missing, and the shape of it changed. The
+largest single cause used to be the encoding thresholds: Redis's type tests open by setting
+one (`CONFIG SET hash-max-listpack-entries`, `set-max-intset-entries`, …) to exercise both of
+its internal representations, and with the thresholds hard-coded here `unit/type/hash`,
+`list`, `set` and `zset` stopped on their first line and contributed nothing. Those four now
+account for 575 of the assertions above. What remains is mostly scripting — four files end at
+an `EVAL` or a `lua-time-limit`, and no amount of work short of an interpreter changes that.
+
+The `err` column is worth reading rather than summing. `type/stream`'s fifteen are almost all
+one thing: approximate trimming (`XADD … MAXLEN ~`, `XTRIM … LIMIT`) is defined in terms of
+Redis's macro-nodes, and a stream stored as a sorted slice has none to trim by, so it trims
+*exactly* — which the tests measure and find different. `type/hash`'s two and `type/set`'s two
+are field ordering (a Go map has none) and the derived-encoding difference described below.
+
+Quoting a number without that paragraph would be the same dishonesty as a benchmark table
+with the losses removed.
 
 The other half is `test/compat/tcl/`, which points **Redis's own TCL test suite** at this
 server in external mode (`--host`/`--port`). This is the highest-authority signal available

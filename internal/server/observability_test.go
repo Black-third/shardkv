@@ -35,8 +35,19 @@ func TestSlowlog(t *testing.T) {
 	}
 	got := c.cmd("SLOWLOG GET 1")
 	// [[id timestamp usec [args...] addr name]]
-	if !strings.Contains(got, "SLOWLOG LEN") && !strings.Contains(got, "SET foo bar") {
-		t.Errorf("SLOWLOG GET 1 = %q; want the most recent command", got)
+	//
+	// SLOWLOG GET returns newest first, so the single entry asked for is the command
+	// immediately before this one -- the SLOWLOG LEN above, not the SET. Verified against
+	// redis:7.2-alpine, which answers the same entry for the same sequence.
+	//
+	// This was two negations joined by &&, which is an OR of the negations: it failed only
+	// if *neither* command appeared, and "SLOWLOG LEN" always does. A slow log that
+	// returned the oldest entry, or the wrong entry, or one entry of a hundred, all passed.
+	if !strings.Contains(got, "SLOWLOG LEN") {
+		t.Errorf("SLOWLOG GET 1 = %q; want the most recent command (SLOWLOG LEN)", got)
+	}
+	if strings.Contains(got, "SET foo bar") {
+		t.Errorf("SLOWLOG GET 1 = %q; want one entry, newest first, not the older SET", got)
 	}
 	if !strings.Contains(got, "127.0.0.1:") {
 		t.Errorf("SLOWLOG GET 1 = %q; want the client address in the entry", got)

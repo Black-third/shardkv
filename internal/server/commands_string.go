@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"time"
@@ -10,9 +11,12 @@ import (
 )
 
 func init() {
-	register("SET", -3, true, cmdSet)
+	// SET and GETEX propagate the effect they had rather than their own text: an EX/PX
+	// operand is relative to the instant the handler resolved it, and only the handler
+	// knows that instant. See propagation.go.
+	registerEffect("SET", -3, cmdSet)
 	register("GET", 2, false, cmdGet)
-	register("GETEX", -2, true, cmdGetEx)
+	registerEffect("GETEX", -2, cmdGetEx)
 	register("INCR", 2, true, cmdIncr)
 	register("DECR", 2, true, cmdDecr)
 	register("INCRBY", 3, true, cmdIncrBy)
@@ -22,8 +26,8 @@ func init() {
 	register("MSETNX", -3, true, cmdMSetNX)
 	register("MGET", -2, false, cmdMGet)
 	register("SETNX", 3, true, cmdSetNX)
-	register("SETEX", 4, true, cmdSetEx)
-	register("PSETEX", 4, true, cmdPSetEx)
+	registerEffect("SETEX", 4, cmdSetEx)
+	registerEffect("PSETEX", 4, cmdPSetEx)
 	register("GETSET", 3, true, cmdGetSet)
 	register("GETDEL", 2, true, cmdGetDel)
 	register("APPEND", 3, true, cmdAppend)
@@ -33,10 +37,15 @@ func init() {
 	register("SUBSTR", 4, false, cmdGetRange) // legacy alias
 }
 
-// setOpts is the parsed option tail of SET. atMs is only meaningful with
-// hasDeadline, and is already absolute: the relative EX/PX operand is resolved
-// against the caller-supplied clock reading, so the handler and propagationForm
-// derive the identical instant from the identical arithmetic.
+// setOpts is the parsed option tail of SET. atMs is only meaningful with hasDeadline, and
+// is already absolute: the relative EX/PX operand is resolved against the caller-supplied
+// clock reading.
+//
+// That resolved value is the *only* one there is. It is what the store is given and what
+// setWireForm renders for the AOF and the replicas, so memory and the wire cannot name
+// different instants. They used to: the wire form was rebuilt from a second reading of
+// the same clock, taken after this handler had run, and the two differed by however long
+// the write took.
 type setOpts struct {
 	nx, xx      bool
 	get         bool
@@ -113,14 +122,15 @@ func expireUnit(name string) (unitMs int64, rel bool) {
 	}
 }
 
-// cmdSet implements SET with its full option set. It resolves any relative expiry
-// against the store's clock -- the same one propagationForm uses -- so the deadline
-// in memory equals the deadline on the wire.
-func cmdSet(s *Server, w *resp.Writer, args [][]byte) bool {
+// cmdSet implements SET with its full option set. It takes one reading of the store's
+// clock, resolves any relative expiry against it, and propagates the absolute form built
+// from that same reading -- so the deadline in memory *is* the deadline on the wire, not
+// merely computed the same way.
+func cmdSet(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	o, errMsg := parseSetOpts(args, s.store.Now().UnixMilli())
 	if errMsg != "" {
 		w.WriteError(errMsg)
-		return false
+		return nil
 	}
 	opts := store.SetOptions{
 		NX:          o.nx,
@@ -135,7 +145,7 @@ func cmdSet(s *Server, w *resp.Writer, args [][]byte) bool {
 	old, oldOK, set, err := s.store.SetWithOptions(string(args[1]), args[2], opts)
 	if err != nil {
 		writeStoreErr(w, err)
-		return false
+		return nil
 	}
 	switch {
 	case o.get && oldOK:
@@ -147,39 +157,45 @@ func cmdSet(s *Server, w *resp.Writer, args [][]byte) bool {
 	default:
 		w.WriteSimple("OK")
 	}
-	return set
+	// An NX/XX that did not fire wrote nothing, so there is nothing to propagate -- the
+	// same "dirty" decision this handler reported before, expressed as the presence of an
+	// effect.
+	if !set {
+		return nil
+	}
+	return [][][]byte{setWireForm(args, o)}
 }
 
-func cmdSetEx(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdSetEx(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return setex(s, w, args, "setex", 1000)
 }
 
-func cmdPSetEx(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdPSetEx(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return setex(s, w, args, "psetex", 1)
 }
 
 // setex applies SETEX/PSETEX: a SET whose TTL operand comes before the value.
-// unitMs is that operand's unit; name only shapes the error reply. Like SET it
-// resolves the deadline against the store's clock, so the absolute SET this
-// propagates as carries the very instant written to memory.
-func setex(s *Server, w *resp.Writer, args [][]byte, name string, unitMs int64) bool {
+// unitMs is that operand's unit; name only shapes the error reply. Like SET it takes one
+// reading of the store's clock and hands the absolute deadline it resolved to both the
+// store and the SET it propagates as, so the two cannot name different instants.
+func setex(s *Server, w *resp.Writer, args [][]byte, name string, unitMs int64) [][][]byte {
 	n, ok := parseInt64(args[2])
 	if !ok {
 		w.WriteError("ERR value is not an integer or out of range")
-		return false
+		return nil
 	}
 	if n <= 0 {
 		w.WriteError("ERR invalid expire time in '" + name + "' command")
-		return false
+		return nil
 	}
 	atMs, ok := deadlineMs(s.store.Now().UnixMilli(), n, unitMs, true)
 	if !ok {
 		w.WriteError("ERR invalid expire time in '" + name + "' command")
-		return false
+		return nil
 	}
 	s.store.SetDeadline(string(args[1]), args[3], time.UnixMilli(atMs))
 	w.WriteSimple("OK")
-	return true
+	return [][][]byte{setexWireForm(args[1], args[3], atMs)}
 }
 
 // getExOpts is the parsed option of GETEX. apply says whether the expiry is
@@ -227,14 +243,19 @@ func parseGetExOpts(args [][]byte, nowMs int64) (getExOpts, string) {
 	return o, "ERR syntax error"
 }
 
-// cmdGetEx reads a string and rewrites its expiry in the same step. It reports
-// dirty only when the expiry actually moved: GETEX with no option, or a PERSIST on
-// a key that never expired, changes nothing and must not reach the AOF.
-func cmdGetEx(s *Server, w *resp.Writer, args [][]byte) bool {
+// cmdGetEx reads a string and rewrites its expiry in the same step. It propagates only
+// when the expiry actually moved: GETEX with no option, or a PERSIST on a key that never
+// expired, changes nothing and must not reach the AOF.
+//
+// What it propagates is the expiry change alone (PEXPIREAT or PERSIST), carrying the
+// absolute deadline resolved from this handler's single clock reading -- not the relative
+// EX/PX operand the client sent, which a replica would resolve against a later instant of
+// its own.
+func cmdGetEx(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	o, errMsg := parseGetExOpts(args, s.store.Now().UnixMilli())
 	if errMsg != "" {
 		w.WriteError(errMsg)
-		return false
+		return nil
 	}
 	var deadline time.Time
 	if o.apply && !o.persist {
@@ -243,14 +264,19 @@ func cmdGetEx(s *Server, w *resp.Writer, args [][]byte) bool {
 	v, ok, changed, err := s.store.GetEx(string(args[1]), deadline, o.apply)
 	if err != nil {
 		writeStoreErr(w, err)
-		return false
+		return nil
 	}
 	if !ok {
 		w.WriteNull()
-		return false
+		return nil
 	}
 	w.WriteBulk(v)
-	return changed
+	// changed can only be true when the expiry was applied, which is what lets the wire
+	// form assume o.apply.
+	if !changed {
+		return nil
+	}
+	return [][][]byte{getexWireForm(args[1], o)}
 }
 
 func cmdSetRange(s *Server, w *resp.Writer, args [][]byte) bool {
@@ -303,14 +329,19 @@ func cmdIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 		w.WriteError("ERR value is not a valid float")
 		return nil
 	}
-	f, err := s.store.IncrByFloat(string(args[1]), delta)
+	// The store returns the text it stored, and that exact text is what is replied and
+	// what is propagated. Formatting the float again here is what went wrong before: an
+	// increment result is spelled by Redis's human formatter (never an exponent) while a
+	// score uses the other one, so re-formatting produced a reply and a propagated SET
+	// that disagreed with the bytes actually in memory -- leaving a master and its replica
+	// holding different text for the same key, silently.
+	_, val, err := s.store.IncrByFloat(string(args[1]), delta)
 	if err != nil {
 		writeStoreErr(w, err)
 		return nil
 	}
-	val := []byte(formatFloat(f))
-	w.WriteBulk(val)
-	return [][][]byte{{[]byte("SET"), args[1], val, []byte("KEEPTTL")}}
+	w.WriteBulk([]byte(val))
+	return [][][]byte{{[]byte("SET"), args[1], []byte(val), []byte("KEEPTTL")}}
 }
 
 func cmdIncrBy(s *Server, w *resp.Writer, args [][]byte) bool {
@@ -490,4 +521,118 @@ func cmdMGet(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 	}
 	return false
+}
+
+// --- LCS ----------------------------------------------------------------------
+
+func init() {
+	register("LCS", -3, false, cmdLCS)
+}
+
+// cmdLCS implements LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN].
+//
+// Three reply shapes, and which one is chosen is the whole of the interface:
+//
+//   - bare: the subsequence itself, as a bulk string.
+//   - LEN: just its length, for a caller measuring similarity who does not need the text.
+//   - IDX: a map of "matches" (the aligned byte ranges, from the end of both values back
+//     towards the start) and "len" (the *whole* subsequence's length, not the filtered
+//     one). WITHMATCHLEN adds each run's length as a third element; MINMATCHLEN drops the
+//     runs shorter than a given length while leaving "len" alone.
+//
+// LEN and IDX together are refused, with Redis's message: they ask for two different
+// replies, and IDX already carries the length.
+func cmdLCS(s *Server, w *resp.Writer, args [][]byte) bool {
+	wantLen, wantIdx, withMatchLen := false, false, false
+	minMatchLen := 0
+	for i := 3; i < len(args); i++ {
+		switch strings.ToUpper(string(args[i])) {
+		case "LEN":
+			wantLen = true
+		case "IDX":
+			wantIdx = true
+		case "WITHMATCHLEN":
+			withMatchLen = true
+		case "MINMATCHLEN":
+			if i+1 >= len(args) {
+				w.WriteError("ERR syntax error")
+				return false
+			}
+			n, ok := parseInt(args[i+1])
+			if !ok {
+				w.WriteError("ERR value is not an integer or out of range")
+				return false
+			}
+			minMatchLen = n
+			i++
+		default:
+			w.WriteError("ERR syntax error")
+			return false
+		}
+	}
+	if wantLen && wantIdx {
+		w.WriteError("ERR If you want both the length and indexes, please just use IDX.")
+		return false
+	}
+
+	res, err := s.store.LCS(string(args[1]), string(args[2]), wantIdx)
+	if err != nil {
+		if errors.Is(err, store.ErrNotString) {
+			w.WriteError("ERR " + err.Error())
+			return false
+		}
+		writeStoreErr(w, err)
+		return false
+	}
+	switch {
+	case wantIdx:
+		writeLCSMatches(w, res, minMatchLen, withMatchLen)
+	case wantLen:
+		w.WriteInt(int64(res.Len))
+	default:
+		// The empty subsequence is an empty bulk string, not a null: the two values have
+		// nothing in common, which is an answer rather than an absence. WriteBulk maps a nil
+		// slice to a null, so the empty case is spelled out. WITHMATCHLEN without IDX is
+		// accepted and has nothing to describe, as in Redis.
+		if res.Seq == nil {
+			res.Seq = []byte{}
+		}
+		w.WriteBulk(res.Seq)
+	}
+	return false
+}
+
+// writeLCSMatches renders the IDX reply: a map in RESP3, the flat four-element array a
+// RESP2 client has always received.
+func writeLCSMatches(w *resp.Writer, res store.LCSResult, minMatchLen int, withMatchLen bool) {
+	kept := make([]store.LCSMatch, 0, len(res.Matches))
+	for _, m := range res.Matches {
+		if m.Len >= minMatchLen {
+			kept = append(kept, m)
+		}
+	}
+	w.WriteMapHeader(2)
+	w.WriteBulk([]byte("matches"))
+	w.WriteArrayHeader(len(kept))
+	for _, m := range kept {
+		if withMatchLen {
+			w.WriteArrayHeader(3)
+		} else {
+			w.WriteArrayHeader(2)
+		}
+		w.WriteArrayHeader(2)
+		w.WriteInt(int64(m.AStart))
+		w.WriteInt(int64(m.AEnd))
+		w.WriteArrayHeader(2)
+		w.WriteInt(int64(m.BStart))
+		w.WriteInt(int64(m.BEnd))
+		if withMatchLen {
+			w.WriteInt(int64(m.Len))
+		}
+	}
+	// The length reported is the whole subsequence's, even when MINMATCHLEN filtered runs
+	// out of the reply. That is Redis's behaviour and the useful one: the filter is about
+	// which alignments are worth looking at, not about how similar the two values are.
+	w.WriteBulk([]byte("len"))
+	w.WriteInt(int64(res.Len))
 }

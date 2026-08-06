@@ -9,13 +9,19 @@ hand-written, which is the point of the project.
 ```
 cmd/shardkv        entrypoint: flags, signal handling, AOF/replication wiring
 internal/store     sharded store, typed values, skip-list sorted set, LRU eviction, snapshot
+                   encoding.go (the representation thresholds OBJECT ENCODING reports from)
+                   zsetalgebra.go (ZUNION/ZINTER/ZDIFF, lex ranges, ZRANGESTORE, SORT's source)
+                   lcs.go (longest common subsequence + the aligned match ranges)
                    stream.go (ms-seq ids, entries, consumer groups, PELs)
                    bitmap.go (bit addressing over the string type, BITOP, BITFIELD)
                    hyperloglog.go (Redis's HYLL format: sparse/dense, murmur64a, tau/sigma)
                    memory.go (the per-key footprint estimate MEMORY USAGE reports)
 internal/resp      RESP protocol reader/writer (+ fuzz target)
 internal/server    TCP server, command table + handlers, transactions, replication
-                   observability.go (slow log, MONITOR, latency monitor, per-command stats)
+                   limits.go (maxclients, the idle reaper, the dirty-change counter)
+                   commands_sort.go (SORT/SORT_RO: the data-dependent key set)
+                   observability.go (slow log, MONITOR, latency monitor, per-command stats,
+                   LATENCY HISTOGRAM)
                    geohash.go (52-bit geohash, haversine, the nine-cell search area)
                    cluster_slots.go (CRC16-XMODEM, hash tags, key -> slot)
                    cluster.go (copy-on-write slot map, node table, nodes.conf, MEET)
@@ -46,6 +52,10 @@ Break one of these and the failure is silent divergence between a master, its
 replicas, and its AOF — not a crash. Every one of them has tests; if you change
 this area, read them first.
 
+The last two are the exceptions to that framing: 14 costs a client a hang and 15 costs the
+whole process a panic. They are here because both were *reached from a client* with no
+special privilege, and because both look like ordinary arithmetic until they are not.
+
 1. **Writes are totally ordered when propagation is active.** A write holds
    `propMu` across *both* the store mutation and the propagation, so the order
    applied to memory is exactly the order written to the AOF and shipped to
@@ -59,12 +69,29 @@ this area, read them first.
    for a no-op write propagates noise; returning `false` for a real change loses
    it.
 
-3. **Deadlines are absolute on the wire.** Relative TTLs (`EXPIRE`, `SET EX`,
-   `SETEX`, `GETEX EX`, …) are rewritten to absolute form (`PEXPIREAT`,
-   `SET … PXAT`) by `propagationForm` before reaching the AOF or a replica, so a
-   replay reconstructs the same expiry instant however much later it happens.
-   Server-side "now" always comes from `store.Now()`, never `time.Now()`, so an
-   injected clock keeps memory and the wire in agreement.
+3. **Deadlines are absolute on the wire, and derived from exactly one clock reading.**
+   Relative TTLs (`EXPIRE`, `PEXPIRE`, `SET EX|PX`, `SETEX`, `PSETEX`, `GETEX EX|PX`,
+   `RESTORE`'s ttl) are rewritten to absolute form (`PEXPIREAT`, `SET … PXAT`,
+   `RESTORE … ABSTTL`) before reaching the AOF or a replica, so a replay reconstructs
+   the same expiry instant however much later it happens. Server-side "now" always
+   comes from `store.Now()`, never `time.Now()`, so an injected clock keeps memory and
+   the wire in agreement.
+
+   The same clock is not enough: it has to be the same *reading*. Each of those
+   commands is registered with `registerEffect`, resolves its deadline once, hands that
+   one value to both the store and the wire form it returns (`propagation.go` holds the
+   builders — `pexpireatForm`, `setWireForm`, `setexWireForm`, `getexWireForm`, and
+   `restoreForm` beside its handler), and nothing on the propagation path reads a clock
+   at all: `wireForm` takes no time argument, and neither does `execExec`. That is the
+   point. The rewrite used to re-derive the deadline from a second `store.Now()` taken
+   *after* the handler had run, so the wire deadline exceeded the in-memory one by the
+   handler's own execution time — measured at up to 74 ms with a large value, and
+   growing with a command's position inside `MULTI`. Every replica silently outlived its
+   master on every volatile key, with both copies internally consistent.
+   `TestExpiryDeadlineTakesExactlyOneClockReading` pins it with a clock that advances on
+   every reading, which turns the skew into an exact equality instead of a race to
+   measure. The absolute forms (`EXPIREAT`, `PEXPIREAT`, `SET EXAT|PXAT`,
+   `RESTORE … ABSTTL`) derive nothing from a reading and are tested as controls.
 
 4. **Non-deterministic commands propagate their effect, not their text.**
    `SPOP`, `ZPOPMIN`/`ZPOPMAX`, `INCRBYFLOAT`, `HINCRBYFLOAT` register with
@@ -247,6 +274,52 @@ this area, read them first.
     keep disagreeing visibly instead of silently swapping ownership. See the README's
     Cluster section for the full boundary.
 
+    `SORT` is the command that shows where this rule's limit is, and the answer it gets is
+    the same one Redis gives. Its `BY` and `GET` patterns name keys that are *not in its
+    arguments*: the pattern is expanded per element, so the key set is decided by the data
+    and cannot be known before the command runs. There is therefore no way to route by
+    those keys, and the only safe answer is to refuse a pattern that might leave the slot --
+    which is what `sortClusterCheck` does, allowing only a pattern whose hash tag hashes to
+    the sorted key's own slot. `commandKeys` reports the collection and the `STORE`
+    destination, and nothing else, deliberately.
+
+14. **A blocked client is woken by anything that creates its key, and what appeared may be
+    the wrong kind of thing.** A client parked in `BZPOPMIN` is signalled by the `SET` in
+    `ZADD k 0 x; DEL k; SET k v`, because the wakeup is driven by `affectedKeys` and knows
+    nothing about types. Retrying the command then would answer `WRONGTYPE` about a value
+    that is already gone by the time the client reads it, failing a command whose own
+    arguments were never wrong.
+
+    So a wakeup is filtered by the type the command can serve (`blockSpec.wantType`) before
+    anything is attempted: unless one of the keys it waits on now holds a value of that type,
+    nothing runs and the client stays at the head of its queue. Redis filters the same way
+    (`getBlockedTypeByType`). What must *not* be filtered is the retry's own outcome:
+    `BRPOPLPUSH` onto a string destination has to answer `WRONGTYPE` when its source finally
+    receives an element, because that is a real problem with the command rather than a
+    spurious wakeup. A blanket "discard errors on retry" hangs that client forever, which is
+    exactly what happened before the type filter replaced it.
+
+    `XREADGROUP` is the one command that opts out of the filter (`wakeOnAnyChange`), and the
+    reason is that what it waits on is not the key's *contents* but a consumer group attached
+    to the key. A key deleted, overwritten with another type, or removed by `FLUSHALL`/
+    `FLUSHDB`/`SWAPDB` has destroyed that group, so the client is waiting for something that
+    can never arrive and has to be told (`NOGROUP`, or `WRONGTYPE`). That is why the flush
+    commands signal waiters at all -- a `BLPOP` woken by a flush finds nothing and sleeps
+    again, which is the behaviour it always had, reached differently.
+
+15. **A count a command will negate must reject the smallest int64.** `-math.MinInt64` is
+    itself, so a negation wraps silently and the value stays negative -- and `make([]T, 0, n)`
+    with a negative capacity is a *panic*, which takes the whole process down and every
+    client with it. Three families negate a count (`SRANDMEMBER`/`HRANDFIELD`/`ZRANDMEMBER`
+    via `parseRandomCount`, and `LPOS ... RANK`), and Redis refuses exactly this value by
+    name in each. The same arithmetic hazard is what made `SETRANGE key 9223372036854775807 A`
+    panic: `offset+len(val) > maxStringLen` overflowed to a negative, passed the guard, and
+    then sliced. Both were reachable from any client with no authentication beyond what the
+    server already required.
+
+    The general rule: an operand that is about to be negated, or added to a length, is
+    checked for overflow *before* the arithmetic, not after.
+
 ## Adding a command
 
 1. Add the store method next to its type's existing ones (`internal/store/`),
@@ -255,13 +328,18 @@ this area, read them first.
 2. Add the handler in the matching `internal/server/commands_*.go`, registered
    with the right arity and `write` flag (`registerEffect` if it is
    non-deterministic).
-3. If it takes a relative expiry, add its rewrite to `propagationForm`.
+3. If it takes a relative expiry, register it with `registerEffect` and return the
+   absolute wire form built from the deadline it already resolved (invariant 3). Never
+   read the clock a second time to build that form.
 4. If it writes more than one key, add it to `affectedKeys` (and, if it writes a
-   second *database*, to `crossDBTarget`).
+   second *database*, to `crossDBTarget`). A destination that is not at a fixed position --
+   `SORT ... STORE`, `GEORADIUS ... STORE|STOREDIST` -- needs its own extractor, because the
+   default of "argument 1" would miss it silently in both `WATCH` and cluster routing.
 5. Test it at the wire level: happy path, missing key, empty collection, wrong
    type, out-of-range index, arity error, and the exact error strings Redis
    returns. Add a replica-convergence test if propagation is involved.
-6. Update the README's Commands table.
+6. Update the README's Commands table, and its count from `COMMAND COUNT` rather than by
+   hand.
 
 ## Verifying against a real client
 

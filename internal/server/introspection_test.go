@@ -93,21 +93,43 @@ func TestConfigGetSet(t *testing.T) {
 		{"CONFIG SET repl-backlog-size 65536", "+OK"},
 		{"CONFIG GET repl-backlog-size", "[repl-backlog-size 65536]"},
 		// Rejected values leave the setting alone.
-		{"CONFIG SET maxkeys not-a-number", "-ERR CONFIG SET failed - argument couldn't be parsed into an integer, or is out of range, for 'maxkeys'"},
+		{"CONFIG SET maxkeys not-a-number", "-ERR CONFIG SET failed (possibly related to argument 'maxkeys') - argument couldn't be parsed into an integer, or is out of range"},
 		{"CONFIG GET maxkeys", "[maxkeys 1000]"},
-		{"CONFIG SET notify-keyspace-events bogus", "-ERR CONFIG SET failed - argument couldn't be parsed into an integer, or is out of range, for 'notify-keyspace-events'"},
+		{"CONFIG SET notify-keyspace-events bogus", "-ERR CONFIG SET failed (possibly related to argument 'notify-keyspace-events') - Invalid event class character. Use 'Ag$lshzxeKEtmdn'."},
 		{"CONFIG GET notify-keyspace-events", "[notify-keyspace-events AKE]"},
 		// A setting fixed at startup is refused rather than silently ignored.
-		{"CONFIG SET appendonly yes", "-ERR CONFIG SET failed - can't set immutable config 'appendonly'"},
-		{"CONFIG SET port 1234", "-ERR CONFIG SET failed - can't set immutable config 'port'"},
+		{"CONFIG SET appendonly yes", "-ERR CONFIG SET failed (possibly related to argument 'appendonly') - can't set immutable config"},
+		{"CONFIG SET port 1234", "-ERR CONFIG SET failed (possibly related to argument 'port') - can't set immutable config"},
 		// And an unknown one is named in the error.
 		{"CONFIG SET made-up 1", "-ERR Unknown option or number of arguments for CONFIG SET - 'made-up'"},
-		{"CONFIG BOGUS", "-ERR Unknown CONFIG subcommand or wrong number of arguments for 'BOGUS'"},
+		// Measured on redis:7.2. Every container command answers an unknown subcommand with
+		// this one sentence; this test previously asserted the older, longer wording, which
+		// no Redis 7 emits.
+		{"CONFIG BOGUS", "-ERR unknown subcommand 'BOGUS'. Try CONFIG HELP."},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {
 			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
 		}
+	}
+
+	// HELP is the one subcommand every container command has, so an error here means the
+	// dispatch has no default arm at all -- which is how the unknown-subcommand text above
+	// came to be wrong in the first place. Assert it is a listing, and that it names what
+	// this server implements rather than what Redis implements.
+	help := c.cmd("CONFIG HELP")
+	if strings.HasPrefix(help, "-ERR") {
+		t.Fatalf("CONFIG HELP = %q; want a listing", help)
+	}
+	for _, want := range []string{"GET <pattern>", "SET <directive> <value>", "RESETSTAT", "HELP"} {
+		if !contains(help, want) {
+			t.Errorf("CONFIG HELP does not mention %q: %q", want, help)
+		}
+	}
+	// CONFIG REWRITE is not implemented here, so HELP must not advertise it. A help text
+	// that lists commands the server does not have is worse than no help text.
+	if contains(help, "REWRITE") {
+		t.Errorf("CONFIG HELP advertises REWRITE, which this server does not implement: %q", help)
 	}
 
 	// requirepass round-trips through CONFIG SET, and takes effect for new connections.
@@ -421,7 +443,9 @@ func TestCommandIntrospection(t *testing.T) {
 	if got := c.cmd("COMMAND DOCS nosuchcommand"); got != "[]" {
 		t.Errorf("COMMAND DOCS of an unknown command = %q; want an empty map", got)
 	}
-	if got := c.cmd("COMMAND BOGUS"); !contains(got, "Unknown subcommand") {
+	// redis:7.2 spells this exactly one way, lower-cased and naming the container to ask
+	// for help. Matching on a substring of the old wording is what let it drift.
+	if got := c.cmd("COMMAND BOGUS"); got != "-ERR unknown subcommand 'BOGUS'. Try COMMAND HELP." {
 		t.Errorf("COMMAND BOGUS = %q", got)
 	}
 }
@@ -578,7 +602,7 @@ func TestSelectAndDBSize(t *testing.T) {
 		{"SELECT 0", "+OK"},
 		{"DBSIZE", ":2"}, // the same database, so the same keys
 		{"CONFIG GET databases", "[databases 16]"},
-		{"CONFIG SET databases 32", "-ERR CONFIG SET failed - can't set immutable config 'databases'"},
+		{"CONFIG SET databases 32", "-ERR CONFIG SET failed (possibly related to argument 'databases') - can't set immutable config"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {
@@ -749,5 +773,42 @@ func TestResetClearsConnectionState(t *testing.T) {
 	}
 	if got := c.cmd("CLIENT GETNAME"); got != "(nil)" {
 		t.Errorf("CLIENT GETNAME after RESET = %q; want the name cleared", got)
+	}
+}
+
+// TestContainerFlagReachesEveryRegistrar pins the one thing containerCommands cannot
+// enforce about itself: that a command listed there actually carries the flag in the
+// table.
+//
+// There are four registrars, and each builds a *command literal by hand. Two of them --
+// registerEffect and registerBlocking -- silently omitted `container`, so XGROUP (which
+// is in containerCommands *and* registered with registerEffect, because its effect ships
+// concrete stream ids) filed its statistics as cmdstat_xgroup instead of
+// cmdstat_xgroup|create. Nothing reported it: the command worked, the counter existed,
+// and it just aggregated the wrong things. That is invariant 12's "a statistic must not
+// lie", and the failure mode of a hand-copied struct literal.
+//
+// Asserting over the whole set rather than over XGROUP means a fifth registrar, or a new
+// container command registered through the wrong one, fails here rather than in a metric
+// nobody is reading.
+func TestContainerFlagReachesEveryRegistrar(t *testing.T) {
+	for name := range containerCommands {
+		cmd, ok := commandTable[name]
+		if !ok {
+			t.Errorf("containerCommands lists %q, which is not in the command table", name)
+			continue
+		}
+		if !cmd.container {
+			t.Errorf("%q is a container command but its table entry has container=false, so its "+
+				"statistics are filed under the bare name instead of per subcommand", name)
+		}
+	}
+	// And the converse, so the flag cannot be set by hand on something the set does not
+	// list -- that would file a per-subcommand counter for a command whose first argument
+	// is data, such as SET or GEOADD.
+	for name, cmd := range commandTable {
+		if cmd.container && !containerCommands[name] {
+			t.Errorf("%q has container=true but is not in containerCommands", name)
+		}
 	}
 }

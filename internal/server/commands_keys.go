@@ -13,13 +13,19 @@ func init() {
 	register("UNLINK", -2, true, cmdDel) // no lazy free here: DEL already unlinks
 	register("EXISTS", -2, false, cmdExists)
 	register("TOUCH", -2, false, cmdTouch)
-	register("EXPIRE", -3, true, cmdExpire)
-	register("PEXPIRE", -3, true, cmdPExpire)
-	register("EXPIREAT", -3, true, cmdExpireAt)
-	register("PEXPIREAT", -3, true, cmdPExpireAt)
+	// The whole expire family propagates the absolute PEXPIREAT it decided on rather than
+	// its own text: EXPIRE's and PEXPIRE's operands are relative to the instant the
+	// handler resolved them, and all four carry NX/XX/GT/LT flags a replica must not
+	// re-evaluate. See propagation.go.
+	registerEffect("EXPIRE", -3, cmdExpire)
+	registerEffect("PEXPIRE", -3, cmdPExpire)
+	registerEffect("EXPIREAT", -3, cmdExpireAt)
+	registerEffect("PEXPIREAT", -3, cmdPExpireAt)
 	register("PERSIST", 2, true, cmdPersist)
 	register("TTL", 2, false, cmdTTL)
 	register("PTTL", 2, false, cmdPTTL)
+	register("EXPIRETIME", 2, false, cmdExpireTime)
+	register("PEXPIRETIME", 2, false, cmdPExpireTime)
 	register("TYPE", 2, false, cmdType)
 	register("KEYS", 2, false, cmdKeys)
 	register("RENAME", 3, true, cmdRename)
@@ -59,51 +65,53 @@ func parseExpireCond(args [][]byte) (store.ExpireCond, string) {
 }
 
 // expire applies one of the four expire commands. unitMs is the operand's unit in
-// milliseconds and rel says whether it is relative to now; name only shapes the
-// error reply. The deadline is computed from the store's clock -- the same clock
-// propagationForm rewrites the command against -- so the instant written to memory
-// and the instant shipped to the AOF and replicas are identical.
+// milliseconds and rel says whether it is relative to now; name only shapes the error
+// reply. It takes one reading of the store's clock and hands the absolute deadline it
+// resolved to both the store and the PEXPIREAT it returns as its effect, so the instant
+// in memory and the instant on the wire are the same value rather than two computations
+// of it. (For the already-absolute forms the reading goes unused -- deadlineMs ignores it
+// when rel is false -- which is why EXPIREAT and PEXPIREAT could never skew.)
 //
-// A condition that rejects the new deadline replies 0 and is not dirty, so nothing
-// is propagated: the flags are evaluated once, on the master, and the absolute
-// PEXPIREAT that ships carries no flag for a replica to re-evaluate.
-func expire(s *Server, w *resp.Writer, args [][]byte, name string, unitMs int64, rel bool) bool {
+// A condition that rejects the new deadline replies 0 and produces no effect, so nothing
+// is propagated: the flags are evaluated once, on the master, and the PEXPIREAT that
+// ships carries no flag for a replica to re-evaluate.
+func expire(s *Server, w *resp.Writer, args [][]byte, name string, unitMs int64, rel bool) [][][]byte {
 	n, ok := parseInt64(args[2])
 	if !ok {
 		w.WriteError("ERR value is not an integer or out of range")
-		return false
+		return nil
 	}
 	cond, errMsg := parseExpireCond(args)
 	if errMsg != "" {
 		w.WriteError(errMsg)
-		return false
+		return nil
 	}
 	atMs, ok := deadlineMs(s.store.Now().UnixMilli(), n, unitMs, rel)
 	if !ok {
 		w.WriteError("ERR invalid expire time in '" + name + "' command")
-		return false
+		return nil
 	}
 	if s.store.ExpireAtCond(string(args[1]), time.UnixMilli(atMs), cond) {
 		w.WriteInt(1)
-		return true
+		return [][][]byte{pexpireatForm(args[1], atMs)}
 	}
 	w.WriteInt(0)
-	return false
+	return nil
 }
 
-func cmdExpire(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdExpire(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return expire(s, w, args, "expire", 1000, true)
 }
 
-func cmdPExpire(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdPExpire(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return expire(s, w, args, "pexpire", 1, true)
 }
 
-func cmdExpireAt(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdExpireAt(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return expire(s, w, args, "expireat", 1000, false)
 }
 
-func cmdPExpireAt(s *Server, w *resp.Writer, args [][]byte) bool {
+func cmdPExpireAt(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	return expire(s, w, args, "pexpireat", 1, false)
 }
 
@@ -346,6 +354,38 @@ func cmdTTL(s *Server, w *resp.Writer, args [][]byte) bool {
 	default:
 		// Round to the nearest second, as Redis does, rather than truncating.
 		w.WriteInt((ms + 500) / 1000)
+	}
+	return false
+}
+
+// cmdExpireTime and cmdPExpireTime report the *absolute* instant a key expires at, in
+// seconds and in milliseconds, with TTL's two sentinels: -1 for a key with no expiry and
+// -2 for one that is not there.
+//
+// The seconds form truncates rather than rounding, which is where it differs from TTL:
+// TTL reports a duration and rounds to the nearest second so that a 999ms TTL does not
+// read as 0, while EXPIRETIME reports a point in time, and the second a deadline falls
+// in is the one it is inside -- rounding it up would name an instant after the key is
+// already gone.
+func cmdExpireTime(s *Server, w *resp.Writer, args [][]byte) bool {
+	return expireTime(s, w, args, true)
+}
+
+func cmdPExpireTime(s *Server, w *resp.Writer, args [][]byte) bool {
+	return expireTime(s, w, args, false)
+}
+
+func expireTime(s *Server, w *resp.Writer, args [][]byte, seconds bool) bool {
+	ms, hasTTL, ok := s.store.ExpireTimeMillis(string(args[1]))
+	switch {
+	case !ok:
+		w.WriteInt(-2)
+	case !hasTTL:
+		w.WriteInt(-1)
+	case seconds:
+		w.WriteInt(ms / 1000)
+	default:
+		w.WriteInt(ms)
 	}
 	return false
 }

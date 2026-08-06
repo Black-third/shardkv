@@ -166,7 +166,9 @@ func TestBitField(t *testing.T) {
 		{"BITFIELD bf GET u8 -1", "-ERR bit offset is not an integer or out of range"},
 		{"BITFIELD bf OVERFLOW BOGUS SET u8 0 1", "-ERR Invalid OVERFLOW type specified"},
 		{"BITFIELD bf BOGUS u8 0", "-ERR syntax error"},
-		{"BITFIELD bf", "-ERR wrong number of arguments for 'bitfield' command"},
+		// No operations is an empty batch, not an arity error: Redis answers with an empty
+		// array, and does not create the key.
+		{"BITFIELD bf", "[]"},
 
 		// i64 is supported (unlike u64), so a full-width signed counter works.
 		{"BITFIELD wide SET i64 0 9223372036854775807 GET i64 0", "[:0 :9223372036854775807]"},
@@ -175,7 +177,10 @@ func TestBitField(t *testing.T) {
 		// BITFIELD_RO is the replica-safe subset.
 		{"BITFIELD_RO bf GET u8 0", "[:255]"},
 		{"BITFIELD_RO bf SET u8 0 1", "-ERR BITFIELD_RO only supports the GET subcommand"},
-		{"BITFIELD_RO bf OVERFLOW SAT GET u8 0", "-ERR BITFIELD_RO only supports the GET subcommand"},
+		// OVERFLOW is accepted by the read-only form: it selects how a *write* would clamp,
+		// and with no write in the list it selects nothing. Checked against redis:7.2, which
+		// answers this with the GET's value and not an error.
+		{"BITFIELD_RO bf OVERFLOW SAT GET u8 0", "[:255]"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {

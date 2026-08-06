@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -142,8 +143,15 @@ func TestSetWithOptions(t *testing.T) {
 	}
 }
 
-// TestIncrByFloatFormatting pins that a float round-trips through the stored decimal
-// form: the value the store keeps is the one a later increment reads back.
+// TestIncrByFloatFormatting pins the text an increment stores: the value the store keeps
+// is the one a later increment reads back, the one the server replies, and the one it
+// propagates.
+//
+// Redis spells an increment result with its "human" formatter, which never uses an
+// exponent -- unlike a sorted-set score, which does outside roughly 1e-6..1e18. Every
+// expectation below was read off redis:7.2 rather than reasoned about; the small-value
+// case previously asserted "2e-06", which is what Go's 'g' verb produces and not what
+// Redis stores.
 func TestIncrByFloatFormatting(t *testing.T) {
 	s := New(8)
 	cases := []struct {
@@ -155,19 +163,30 @@ func TestIncrByFloatFormatting(t *testing.T) {
 		{"10.5", 0.1, "10.6"},
 		{"5", -5, "0"},
 		{"3.0e3", 200, "3200"},
-		{"0.000001", 0.000001, "2e-06"},
+		// redis:7.2: SET a 0.000001; INCRBYFLOAT a 0.000001 -> "0.000002", and GET agrees.
+		{"0.000001", 0.000001, "0.000002"},
+		// And below the exponent threshold a score would use, an increment still does not.
+		// redis:7.2: SET b 0.0000001; INCRBYFLOAT b 0.0000001 -> "0.0000002".
+		{"0.0000001", 0.0000001, "0.0000002"},
+		// A large value stays decimal too -- this is the case that was reaching the AOF as
+		// "1.71798691855e+10" while the reply said otherwise.
+		{"17179869184", 1.5, "17179869185.5"},
 	}
 	for _, tc := range cases {
 		s.Del("k")
 		if tc.start != "" {
 			s.Set("k", []byte(tc.start), 0)
 		}
-		f, err := s.IncrByFloat("k", tc.delta)
+		// The store returns the text it stored, and that same text is what the server
+		// replies and propagates -- so asserting on it here covers all three at once.
+		// Re-formatting the float instead is what let the reply and the stored bytes
+		// drift apart.
+		_, text, err := s.IncrByFloat("k", tc.delta)
 		if err != nil {
 			t.Fatalf("IncrByFloat(%q, %v): %v", tc.start, tc.delta, err)
 		}
-		if got := formatFloat(f); got != tc.want {
-			t.Errorf("IncrByFloat(%q, %v) = %s; want %s", tc.start, tc.delta, got, tc.want)
+		if text != tc.want {
+			t.Errorf("IncrByFloat(%q, %v) = %s; want %s", tc.start, tc.delta, text, tc.want)
 		}
 		v, _ := s.Get("k")
 		if string(v) != tc.want {
@@ -177,11 +196,11 @@ func TestIncrByFloatFormatting(t *testing.T) {
 
 	// A value that is not a number, and a result that is not finite, are refused.
 	s.Set("bad", []byte("hello"), 0)
-	if _, err := s.IncrByFloat("bad", 1); err != ErrNotFloat {
+	if _, _, err := s.IncrByFloat("bad", 1); !errors.Is(err, ErrNotFloat) {
 		t.Errorf("IncrByFloat on a non-number = %v; want ErrNotFloat", err)
 	}
 	s.Set("huge", []byte("1e308"), 0)
-	if _, err := s.IncrByFloat("huge", 1e308); err != ErrNaN {
+	if _, _, err := s.IncrByFloat("huge", 1e308); !errors.Is(err, ErrNaN) {
 		t.Errorf("IncrByFloat overflowing = %v; want ErrNaN", err)
 	}
 	if v, _ := s.Get("huge"); string(v) != "1e308" {

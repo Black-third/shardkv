@@ -74,6 +74,11 @@ func run() error {
 	slowlogSlower := flag.Int64("slowlog-log-slower-than", 10000,
 		"microseconds a command must take to be recorded in the slow log (negative disables, 0 logs all)")
 	slowlogMaxLen := flag.Int64("slowlog-max-len", 128, "how many entries the slow log retains")
+	maxClients := flag.Int("maxclients", 10000,
+		"maximum simultaneous client connections (further ones are refused and closed)")
+	clientTimeout := flag.Int64("timeout", 0,
+		"seconds a client may be idle before being disconnected (0 = never; replicas, "+
+			"subscribers, monitors and blocked clients are exempt)")
 	latencyThreshold := flag.Int64("latency-monitor-threshold", 0,
 		"milliseconds an event must take to be recorded by the latency monitor (0 disables)")
 	clusterEnabled := flag.Bool("cluster-enabled", false,
@@ -118,6 +123,8 @@ func run() error {
 	srv.SetAOFRewritePolicy(*aofRewriteMinSize, *aofRewritePerc)
 	srv.SetSlowlogPolicy(*slowlogSlower, *slowlogMaxLen)
 	srv.SetLatencyThresholdMs(*latencyThreshold)
+	srv.SetMaxClients(*maxClients)
+	srv.SetClientTimeoutSecs(*clientTimeout)
 	srv.SetShutdownHook(shutdown)
 	if !srv.SetNotifyKeyspaceEvents(*notifyEvents) {
 		return fmt.Errorf("invalid -notify-keyspace-events %q: use the flag characters K E g $ l s h z x e A", *notifyEvents)

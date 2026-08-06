@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,6 +12,18 @@ import (
 	"github.com/Black-third/shardkv/internal/resp"
 	"github.com/Black-third/shardkv/internal/store"
 )
+
+// isPositiveTTL reports whether a TTL reply names a live expiry, which is the property
+// "the key is still volatile after a replay" actually needs. Testing it as `!= ":-1" &&
+// != ":-2"` accepted every error reply as well, so a replay that produced the wrong type
+// or no key at all passed.
+func isPositiveTTL(reply string) bool {
+	if !strings.HasPrefix(reply, ":") {
+		return false
+	}
+	n, err := strconv.Atoi(reply[1:])
+	return err == nil && n > 0
+}
 
 // directClient runs commands against a Server in-process and returns the reply in the
 // same flattened form readReply gives a socket client, so a live server and one rebuilt
@@ -149,9 +162,13 @@ func TestAOFReplaysPropagatedForms(t *testing.T) {
 		t.Errorf("HGETALL: live %q != replayed %q", want, got)
 	}
 	// The volatile keys must still be volatile, not silently made permanent.
+	//
+	// Asserted positively. Rejecting only ":-1" and ":-2" let every *other* reply through,
+	// including "-WRONGTYPE ..." and "-ERR unknown command" -- so a replay that reconstructed
+	// the wrong type, or no key at all, reported a live expiry.
 	for _, key := range []string{"withttl", "keepttl", "setex", "psetex", "getex", "expnx", "expgt", "copydst"} {
-		if got := rc.cmd("TTL " + key); got == ":-1" || got == ":-2" {
-			t.Errorf("replayed key %q has TTL %q; want a live expiry", key, got)
+		if got := rc.cmd("TTL " + key); !isPositiveTTL(got) {
+			t.Errorf("replayed key %q has TTL %q; want a positive live expiry", key, got)
 		}
 	}
 	// And the persisted one must still be permanent.
@@ -199,8 +216,8 @@ func TestAOFRewriteRoundTripsWidenedDataset(t *testing.T) {
 			t.Errorf("%q: live %q != replayed %q", cmd, want, got)
 		}
 	}
-	if got := rc.cmd("TTL vol"); got == ":-1" || got == ":-2" {
-		t.Errorf("rewritten TTL = %q; want a live expiry", got)
+	if got := rc.cmd("TTL vol"); !isPositiveTTL(got) {
+		t.Errorf("rewritten TTL = %q; want a positive live expiry", got)
 	}
 	// The infinite scores have to survive the text form they are dumped in.
 	if got := rc.cmd("ZSCORE infzset big"); got != "inf" {

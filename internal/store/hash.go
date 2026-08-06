@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"strconv"
 	"time"
+
+	"github.com/Black-third/shardkv/internal/resp"
 )
 
 // This file extends the hash type whose HSet/HGet/HDel core lives in types.go
@@ -164,7 +166,7 @@ func (s *Store) HIncrBy(key, field string, delta int64) (int64, error) {
 // HIncrByFloat adds delta to the float at field and returns the result, stored in
 // the shortest round-trippable form. ErrHashNotFloat reports a field that is not a
 // number and ErrNaN a result that is not finite.
-func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, error) {
+func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, string, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -172,23 +174,24 @@ func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, error) 
 
 	e, err := s.hashForWrite(sh, key, now)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	var cur float64
 	if have, ok := e.dict[field]; ok {
-		parsed, perr := strconv.ParseFloat(string(have), 64)
-		if perr != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-			return 0, ErrHashNotFloat
+		parsed, ok := resp.ParseDouble(string(have))
+		if !ok || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, "", ErrHashNotFloat
 		}
 		cur = parsed
 	}
 	sum := cur + delta
 	if math.IsNaN(sum) || math.IsInf(sum, 0) {
-		return 0, ErrNaN
+		return 0, "", ErrNaN
 	}
-	e.dict[field] = []byte(formatFloat(sum))
+	text := formatIncrFloat(sum)
+	e.dict[field] = []byte(text)
 	s.touch(e, now)
-	return sum, nil
+	return sum, text, nil
 }
 
 // hashForWrite returns the hash at key in an already-locked shard, creating it if
@@ -249,6 +252,13 @@ func (s *Store) HRandField(key string, count int, withValues bool) ([][]byte, er
 // It never mutates pool's backing array beyond the copy it makes.
 func pickMembers(pool []string, count int) []string {
 	if len(pool) == 0 || count == 0 {
+		return nil
+	}
+	if count == math.MinInt {
+		// -count wraps back to itself, and make([]string, 0, negative) is a panic. The
+		// server refuses this operand before it gets here (see parseRandomCount); the guard
+		// is here as well because "one integer from any client kills the process" is not a
+		// failure mode that should depend on a caller remembering to check.
 		return nil
 	}
 	if count < 0 {

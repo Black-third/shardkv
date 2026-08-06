@@ -53,6 +53,14 @@ func init() {
 }
 
 func cmdPing(s *Server, w *resp.Writer, args [][]byte) bool {
+	// PING takes at most one argument. The table's arity cannot express that on its own --
+	// -1 means "at least one", which is every count -- so the upper bound is checked here,
+	// as Redis checks it: `PING a b` is an arity error rather than an echo of the first of
+	// them, which is what it would silently have been.
+	if len(args) > 2 {
+		w.WriteError("ERR wrong number of arguments for 'ping' command")
+		return false
+	}
 	if len(args) > 1 {
 		w.WriteBulk(args[1])
 	} else {
@@ -310,7 +318,12 @@ func infoClients(s *Server, b *strings.Builder) {
 	connected := len(s.clients)
 	s.clientMu.Unlock()
 	fmt.Fprintf(b, "connected_clients:%d\r\n", connected)
+	fmt.Fprintf(b, "maxclients:%d\r\n", s.MaxClients())
 	fmt.Fprintf(b, "total_connections_received:%d\r\n", s.totalConns.Load())
+	// What a caller polls to tell "clients cannot connect" from "clients are not
+	// connecting": a non-zero value here is the only visible trace of the maxclients
+	// refusal, since the refused connection is gone.
+	fmt.Fprintf(b, "rejected_connections:%d\r\n", s.RejectedConnections())
 	// What an operator polls to see whether a queue has consumers waiting on it, and
 	// what a test polls to know that every client has actually reached the wait before
 	// it pushes.
@@ -329,6 +342,13 @@ func infoPersistence(s *Server, b *strings.Builder) {
 	fmt.Fprintf(b, "aof_current_size:%d\r\n", size)
 	fmt.Fprintf(b, "aof_last_bgrewrite_status:%s\r\n", s.aofRewriteStatus())
 	fmt.Fprintf(b, "rdb_last_save_time:%d\r\n", s.lastSave.Load())
+	// How many writes have changed the dataset since it was last written out in full.
+	// Redis counts changes since its last RDB save; here the equivalent event is a
+	// successful AOF rewrite, which is also what rdb_last_save_time above reports. See
+	// noteDirty for what one "change" counts as.
+	fmt.Fprintf(b, "rdb_changes_since_last_save:%d\r\n", s.DirtyChanges())
+	fmt.Fprintf(b, "rdb_bgsave_in_progress:%d\r\n", 0)
+	fmt.Fprintf(b, "rdb_last_bgsave_status:%s\r\n", "ok")
 }
 
 func infoStats(s *Server, b *strings.Builder) {
@@ -359,8 +379,7 @@ func infoStats(s *Server, b *strings.Builder) {
 // command would be ~180 lines of zeroes on a fresh server, and Redis omits them for
 // the same reason.
 func infoCommandStats(s *Server, b *strings.Builder) {
-	for _, name := range commandNames() {
-		c := commandTable[name]
+	for _, c := range statsEntries() {
 		calls := c.calls.Load()
 		rejected, failed := c.rejected.Load(), c.failed.Load()
 		if calls == 0 && rejected == 0 {
@@ -384,8 +403,7 @@ func infoCommandStats(s *Server, b *strings.Builder) {
 // and never under-report. See command.percentileUs for why an approximation is the
 // right trade here -- Redis's own version is one too.
 func infoLatencyStats(s *Server, b *strings.Builder) {
-	for _, name := range commandNames() {
-		c := commandTable[name]
+	for _, c := range statsEntries() {
 		if c.calls.Load() == 0 {
 			continue
 		}
@@ -604,8 +622,7 @@ func cmdCommand(s *Server, w *resp.Writer, args [][]byte) bool {
 		// commands whose keys are not at a fixed position -- which is why it consults
 		// commandKeys rather than the coarse first/last/step triple COMMAND INFO reports.
 		if len(args) < 3 {
-			w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-				string(args[1]) + "'. Try COMMAND HELP.")
+			writeUnknownSubcommand(w, "COMMAND", args[1])
 			return false
 		}
 		keys, errMsg := commandGetKeys(args[2:])
@@ -630,8 +647,7 @@ func cmdCommand(s *Server, w *resp.Writer, args [][]byte) bool {
 		})
 
 	default:
-		w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try COMMAND HELP.")
+		writeUnknownSubcommand(w, "COMMAND", args[1])
 	}
 	return false
 }

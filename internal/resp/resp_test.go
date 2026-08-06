@@ -260,6 +260,81 @@ func TestFormatDouble(t *testing.T) {
 	}
 }
 
+// TestParseDouble pins the reading half against the same reference the formatting half
+// was pinned against. The expectations below were measured on redis:7.2-alpine, each
+// through a command that parses a double (ZADD for the operand cases, INCRBYFLOAT on a
+// planted value for the stored-value ones).
+//
+// The underscore rows are the reason the function exists. strconv.ParseFloat implements
+// Go's float *literal* grammar, in which "1_0" is a well-formed 10, so every parse site
+// that reached for it accepted a spelling Redis rejects -- and dropped the separator
+// silently, turning a mistyped thousands separator into a value two orders of magnitude
+// out.
+func TestParseDouble(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+		ok   bool
+	}{
+		// Redis: "ERR value is not a valid float" for every underscored form.
+		{"1_0", 0, false},
+		{"1_000.5", 0, false},
+		{"1_", 0, false},
+		{"_1", 0, false},
+		{"1__0", 0, false},
+		{"1e_5", 0, false},
+		// Everything Redis's strtod accepts and Go's grammar spells the same way.
+		{"1", 1, true},
+		{"+5", 5, true},
+		{".5", 0.5, true},
+		{"5.", 5, true},
+		{"0.0", 0, true},
+		{"-0", 0, true},
+		{"1e-7", 1e-7, true},
+		{"17179869185.5", 17179869185.5, true},
+		{"0x1p3", 8, true}, // the hex form both accept
+		{"inf", math.Inf(1), true},
+		{"-inf", math.Inf(-1), true},
+		{"infinity", math.Inf(1), true},
+		// Malformed, rejected by both.
+		{"", 0, false},
+		{"1e", 0, false},
+		{" 1", 0, false},
+		{"1 ", 0, false},
+		{"abc", 0, false},
+		{"1e400", 0, false}, // overflow: Redis rejects on ERANGE, Go on ErrRange
+	}
+	for _, tc := range cases {
+		got, ok := ParseDouble(tc.in)
+		if ok != tc.ok {
+			t.Errorf("ParseDouble(%q) ok = %v; want %v", tc.in, ok, tc.ok)
+			continue
+		}
+		if ok && got != tc.want {
+			t.Errorf("ParseDouble(%q) = %v; want %v", tc.in, got, tc.want)
+		}
+	}
+	// NaN parses -- the callers reject it, since which error they report differs by
+	// command -- but it must be a NaN rather than silently becoming a number.
+	if got, ok := ParseDouble("nan"); !ok || !math.IsNaN(got) {
+		t.Errorf("ParseDouble(%q) = %v, %v; want NaN, true", "nan", got, ok)
+	}
+	// Whatever FormatDouble spells, ParseDouble must read back unchanged: the two halves
+	// are one decision, and a value that does not survive the round trip is a value a
+	// replica reconstructs differently from its master.
+	for _, f := range []float64{17179869185.5, 3.1415926535, 1e-7, 1e19, 1.5e300, 0.005, 0, -2.5, 1 << 52} {
+		back, ok := ParseDouble(FormatDouble(f))
+		if !ok || back != f {
+			t.Errorf("ParseDouble(FormatDouble(%v) = %q) = %v, %v", f, FormatDouble(f), back, ok)
+		}
+	}
+	for _, f := range []float64{math.Inf(1), math.Inf(-1)} {
+		if back, ok := ParseDouble(FormatDouble(f)); !ok || back != f {
+			t.Errorf("ParseDouble(FormatDouble(%v) = %q) = %v, %v", f, FormatDouble(f), back, ok)
+		}
+	}
+}
+
 // TestReadCommandInlineQuoting covers the inline parser's quoting.
 //
 // This was the worst bug found in the client-facing parser, because it was silent: the

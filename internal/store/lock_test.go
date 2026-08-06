@@ -87,16 +87,31 @@ func TestCrossShardWritesCannotDeadlock(t *testing.T) {
 		t.Fatal("two-key writes with swapped arguments deadlocked: the shards are not being locked in index order")
 	}
 
-	// Nothing may have leaked out of the sets the moves shuffle members between.
+	// Nothing may have leaked out of the sets the moves shuffle members between -- and
+	// nothing may have drained *away* from them either. Only the membership check used to
+	// be here, and it lived inside the loop over the reply, so a bug that emptied both sets
+	// left nothing to iterate and the test passed. "y" is the anchor: reset() puts it in
+	// both sets and no SMove above ever names it, so after the last reset it is in both,
+	// whatever order the goroutines interleaved in.
 	for _, key := range []string{setA, setB} {
 		members, err := s.SMembers(key)
 		if err != nil {
 			t.Fatalf("SMembers(%q): %v", key, err)
 		}
+		if len(members) == 0 {
+			t.Errorf("set %q was emptied; the moves must only shuffle members between the two", key)
+		}
+		found := false
 		for _, m := range members {
 			if m != "x" && m != "y" && m != "z" {
 				t.Errorf("set %q holds unexpected member %q", key, m)
 			}
+			if m == "y" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("set %q lost %q, which nothing here moves: %v", key, "y", members)
 		}
 	}
 }

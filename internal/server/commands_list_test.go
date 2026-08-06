@@ -106,9 +106,8 @@ func TestLPos(t *testing.T) {
 	c := dialTx(t, addr)
 	defer c.close()
 
-	const rankZeroErr = "-ERR RANK can't be zero. Use 1 to start searching from " +
-		"the first matching element in the head of the list or a negative rank to " +
-		"start searching from the tail. A rank of zero is invalid."
+	const rankZeroErr = "-ERR RANK can't be zero: use 1 to start from the first match, " +
+		"2 from the second ... or use negative to start from the end of the list"
 
 	cases := []struct{ cmd, want string }{
 		{"RPUSH p a b c 1 2 3 c c", ":8"},

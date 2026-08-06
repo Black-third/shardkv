@@ -59,15 +59,17 @@ func cmdSetBit(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteError("ERR bit is not an integer or out of range")
 		return false
 	}
-	old, err := s.store.SetBit(string(args[1]), offset, v == 1)
+	old, changed, err := s.store.SetBit(string(args[1]), offset, v == 1)
 	if err != nil {
 		writeBitErr(w, err)
 		return false
 	}
 	w.WriteInt(int64(old))
-	// Always dirty, even when the bit already had that value: SETBIT also grows the
-	// string, so "the bit did not change" does not mean "the value did not change".
-	return true
+	// Dirty when the key was created, the value grew, or the bit flipped -- see
+	// Store.SetBit. "The bit did not change" is not the same as "the value did not
+	// change", but it is not always different either, and reporting a change that did
+	// not happen puts a record in the AOF that reconstructs nothing.
+	return changed
 }
 
 func cmdGetBit(s *Server, w *resp.Writer, args [][]byte) bool {
@@ -88,8 +90,11 @@ func cmdGetBit(s *Server, w *resp.Writer, args [][]byte) bool {
 // parseBitRange parses the "[start end [BYTE|BIT]]" tail BITCOUNT and BITPOS share.
 // present reports whether a range was given at all, and hasEnd whether an explicit end
 // was -- BITPOS treats "start only" differently from "start and end".
-func parseBitRange(args [][]byte, from int) (r store.BitRange, hasEnd bool, errMsg string) {
+func parseBitRange(args [][]byte, from int, unitBeforeEnd bool) (r store.BitRange, hasEnd bool, errMsg string) {
 	rest := args[from:]
+	if len(rest) > 3 {
+		return r, false, "ERR syntax error"
+	}
 	if len(rest) == 0 {
 		return r, false, ""
 	}
@@ -99,6 +104,30 @@ func parseBitRange(args [][]byte, from int) (r store.BitRange, hasEnd bool, errM
 	}
 	r.Present = true
 	r.Start = start
+
+	// The BYTE|BIT keyword is checked before the end operand for BITPOS and after it for
+	// BITCOUNT, which is the order each of Redis's two implementations happens to use --
+	// and it is observable: `BITPOS k 0 1 junk junk2` answers "syntax error" while
+	// `BITCOUNT k 0 junk junk2` answers "not an integer". Verified both ways against
+	// redis:7.2. Normalizing the two would make one of them report the wrong mistake.
+	unit := func() string {
+		if len(rest) < 3 {
+			return ""
+		}
+		switch strings.ToUpper(string(rest[2])) {
+		case "BYTE":
+			return ""
+		case "BIT":
+			r.Bits = true
+			return ""
+		}
+		return "ERR syntax error"
+	}
+	if unitBeforeEnd {
+		if msg := unit(); msg != "" {
+			return r, false, msg
+		}
+	}
 	if len(rest) == 1 {
 		// BITPOS accepts a start on its own, meaning "to the end of the value". BITCOUNT
 		// does not, and rejects it by passing a from index that makes this case impossible.
@@ -111,18 +140,10 @@ func parseBitRange(args [][]byte, from int) (r store.BitRange, hasEnd bool, errM
 	}
 	r.End = end
 	hasEnd = true
-	switch len(rest) {
-	case 2:
-	case 3:
-		switch strings.ToUpper(string(rest[2])) {
-		case "BYTE":
-		case "BIT":
-			r.Bits = true
-		default:
-			return r, false, "ERR syntax error"
+	if !unitBeforeEnd {
+		if msg := unit(); msg != "" {
+			return r, false, msg
 		}
-	default:
-		return r, false, "ERR syntax error"
 	}
 	return r, hasEnd, ""
 }
@@ -136,7 +157,7 @@ func cmdBitCount(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteError("ERR syntax error")
 		return false
 	}
-	r, _, errMsg := parseBitRange(args, 2)
+	r, _, errMsg := parseBitRange(args, 2, false)
 	if errMsg != "" {
 		w.WriteError(errMsg)
 		return false
@@ -152,12 +173,20 @@ func cmdBitCount(s *Server, w *resp.Writer, args [][]byte) bool {
 
 // cmdBitPos implements BITPOS key bit [start [end [BYTE|BIT]]].
 func cmdBitPos(s *Server, w *resp.Writer, args [][]byte) bool {
+	// Two different refusals, as in Redis: an operand that is not a number at all is "not
+	// an integer", and one that is a number but is neither 0 nor 1 names the bit. A client
+	// that sent a variable holding the wrong *kind* of thing and one that sent 2 have made
+	// different mistakes.
 	bit, ok := parseInt64(args[2])
-	if !ok || (bit != 0 && bit != 1) {
+	if !ok {
+		w.WriteError("ERR value is not an integer or out of range")
+		return false
+	}
+	if bit != 0 && bit != 1 {
 		w.WriteError("ERR The bit argument must be 1 or 0.")
 		return false
 	}
-	r, hasEnd, errMsg := parseBitRange(args, 3)
+	r, hasEnd, errMsg := parseBitRange(args, 3, true)
 	if errMsg != "" {
 		w.WriteError(errMsg)
 		return false
@@ -257,9 +286,11 @@ func parseBitField(args [][]byte, readOnly bool) ([]store.BitFieldOp, string) {
 	for i := 2; i < len(args); {
 		switch strings.ToUpper(string(args[i])) {
 		case "OVERFLOW":
-			if readOnly {
-				return nil, "ERR BITFIELD_RO only supports the GET subcommand"
-			}
+			// Accepted by BITFIELD_RO as well, which is Redis's behaviour: the read-only form
+			// refuses the operations that write, and OVERFLOW is not one -- it only chooses how
+			// a later SET or INCRBY would clamp, and with none of those in the list it selects
+			// nothing. Verified against redis:7.2, which answers BITFIELD_RO k OVERFLOW SAT
+			// with an empty array rather than an error.
 			if i+1 >= len(args) {
 				return nil, "ERR syntax error"
 			}
@@ -333,9 +364,6 @@ func parseBitField(args [][]byte, readOnly bool) ([]store.BitFieldOp, string) {
 			return nil, "ERR syntax error"
 		}
 	}
-	if len(ops) == 0 {
-		return nil, "ERR wrong number of arguments for 'bitfield' command"
-	}
 	return ops, ""
 }
 
@@ -359,6 +387,14 @@ func bitField(s *Server, w *resp.Writer, args [][]byte, readOnly bool) bool {
 	ops, errMsg := parseBitField(args, readOnly)
 	if errMsg != "" {
 		w.WriteError(errMsg)
+		return false
+	}
+	// No operations is not an arity error: BITFIELD is a batch, and an empty batch has an
+	// empty result. Redis answers with an empty array and does not create the key -- and
+	// answering it here, before the store is consulted, is what keeps it from being
+	// recorded as a keyspace miss for a key nobody asked about.
+	if len(ops) == 0 {
+		w.WriteArrayHeader(0)
 		return false
 	}
 	results, changed, err := s.store.BitField(string(args[1]), ops)

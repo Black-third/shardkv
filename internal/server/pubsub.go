@@ -45,6 +45,21 @@ var subscriberCommands = map[string]bool{
 	"RESET":        true,
 }
 
+// writeSubscriberPong answers PING for a RESP2 connection in subscriber mode: the
+// two-element ["pong", <payload>] array Redis sends there, with an empty payload when the
+// caller gave none. See the call site in executeCommand for why it lives here.
+func writeSubscriberPong(w *resp.Writer, args [][]byte) {
+	w.BeginPush()
+	defer w.EndPush()
+	w.WritePushHeader(2)
+	w.WriteBulk([]byte("pong"))
+	if len(args) > 1 {
+		w.WriteBulk(args[1])
+		return
+	}
+	w.WriteBulk([]byte{})
+}
+
 // subscribeCommands are the four commands that enter or leave subscriber mode. They
 // are the ones a MULTI refuses, because what a connection is allowed to run must not
 // change halfway through a batch.
@@ -175,6 +190,10 @@ func (s *Server) pumpMessages(sess *session, w *resp.Writer) {
 // every frame this server pushes is a bulk string except the subscription count,
 // which writeSubscribeReply writes itself.
 func writePush(w *resp.Writer, msg [][]byte) {
+	// Out-of-band, so it is delivered even with CLIENT REPLY OFF in force. See
+	// resp.Writer.BeginPush.
+	w.BeginPush()
+	defer w.EndPush()
 	w.WritePushHeader(len(msg))
 	for _, part := range msg {
 		w.WriteBulk(part)
@@ -301,6 +320,8 @@ func (s *Server) publishMessage(channel string, payload []byte) int {
 // out-of-band event as a delivered message (a server-initiated UNSUBSCRIBE would
 // arrive with no command to attach it to), so RESP3 tags it the same way.
 func writeSubscribeReply(w *resp.Writer, kind string, name []byte, total int) {
+	w.BeginPush()
+	defer w.EndPush()
 	w.WritePushHeader(3)
 	w.WriteBulk([]byte(kind))
 	w.WriteBulk(name)
@@ -436,9 +457,19 @@ func cmdPubSub(s *Server, w *resp.Writer, args [][]byte) bool {
 		s.subMu.Unlock()
 		w.WriteInt(int64(n))
 
+	case "HELP":
+		writeSubcommandHelp(w, "PUBSUB", []string{
+			"CHANNELS [<pattern>]",
+			"    Return the currently active channels matching a <pattern> (default: '*').",
+			"NUMPAT",
+			"    Return number of subscriptions to patterns.",
+			"NUMSUB [<channel> ...]",
+			"    Return the number of subscribers for the specified channels, excluding",
+			"    pattern subscriptions(default: no channels).",
+		})
+
 	default:
-		w.WriteError("ERR Unknown PUBSUB subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "PUBSUB", args[1])
 	}
 	return false
 }

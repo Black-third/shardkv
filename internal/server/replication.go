@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,71 @@ const (
 func init() {
 	registerSession("REPLCONF", -1, cmdReplConf)
 	register("WAIT", 3, false, cmdWait)
+	register("ROLE", 1, false, cmdRole)
+}
+
+// cmdRole reports this server's replication role in the shape a client library parses,
+// which is why it exists separately from INFO replication: INFO is a text blob a client
+// has to scrape, while ROLE is a typed reply, and go-redis (among others) calls it to
+// decide whether the connection it has is writable.
+//
+// The two shapes are Redis's:
+//
+//	master:  ["master", <offset>, [[ip, port, offset], ...]]
+//	replica: ["slave", <master ip>, <master port>, <link state>, <offset>]
+//
+// The replica's port and each replica's offset are bulk strings rather than integers, and
+// the role word is "slave" rather than "replica" -- both are Redis's encoding, and a
+// client matching on either would break if this normalized them. (INFO says "role:master"
+// or "role:replica"; ROLE says "master" or "slave". That inconsistency is Redis's too.)
+func cmdRole(s *Server, w *resp.Writer, args [][]byte) bool {
+	s.mu.Lock()
+	role, master := s.role, s.masterAddr
+	offset, slaveOffset, linkUp := s.replOffset, s.slaveOffset, s.masterLinkUp
+	replicas := make([]*replicaConn, 0, len(s.replicas))
+	for rc := range s.replicas {
+		replicas = append(replicas, rc)
+	}
+	s.mu.Unlock()
+
+	if role == "replica" {
+		host, port := master, "0"
+		if h, p, err := net.SplitHostPort(master); err == nil {
+			host, port = h, p
+		}
+		w.WriteArrayHeader(5)
+		w.WriteBulk([]byte("slave"))
+		w.WriteBulk([]byte(host))
+		p, _ := strconv.Atoi(port)
+		w.WriteInt(int64(p))
+		// Redis reports one of "none", "connect", "connecting", "sync" or "connected". This
+		// link is either up or it is being retried, and there is no partial state in between
+		// worth reporting as though it were finer-grained than it is.
+		state := "connect"
+		if linkUp {
+			state = "connected"
+		}
+		w.WriteBulk([]byte(state))
+		w.WriteInt(slaveOffset)
+		return false
+	}
+
+	sort.Slice(replicas, func(i, j int) bool { return replicas[i].port < replicas[j].port })
+	w.WriteArrayHeader(3)
+	w.WriteBulk([]byte("master"))
+	w.WriteInt(offset)
+	w.WriteArrayHeader(len(replicas))
+	for _, rc := range replicas {
+		host := rc.addr
+		if h, _, err := net.SplitHostPort(rc.addr); err == nil {
+			host = h
+		}
+		w.WriteArrayHeader(3)
+		w.WriteBulk([]byte(host))
+		w.WriteBulk([]byte(rc.port))
+		w.WriteBulk([]byte(strconv.FormatInt(rc.ack.Load(), 10)))
+	}
+	return false
 }
 
 // keepalive is the no-op command a master periodically writes to each replica

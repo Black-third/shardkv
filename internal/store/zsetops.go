@@ -476,32 +476,49 @@ func (s *Store) ZCount(key string, r ScoreRange) (int, error) {
 	return n, nil
 }
 
-// LexRange is the member interval ZLEXCOUNT selects: each end is either infinite
-// (Redis's "-" and "+"), inclusive ("[member"), or exclusive ("(member").
+// LexBound is one end of a lexicographic range: either an infinity -- Redis's "-" for the
+// smallest possible member and "+" for the largest -- or a member with an inclusive
+// ("[member") or exclusive ("(member") comparison.
+//
+// Both infinities are legal at *either* end, which is why this is a bound rather than a
+// pair of "unbounded" flags. `ZLEXCOUNT key + -` is a well-formed query whose answer is 0
+// (nothing is both above the largest member and below the smallest), and Redis answers 0
+// rather than rejecting it -- so a range has to be able to express a lower bound of
+// positive infinity, and its own test suite asks for exactly that.
+type LexBound struct {
+	NegInf bool // "-": below every member
+	PosInf bool // "+": above every member
+	Excl   bool
+	Member string
+}
+
+// LexRange is the member interval the lexicographic commands select.
 type LexRange struct {
-	Min, Max         string
-	MinInf, MaxInf   bool // unbounded below / above
-	MinExcl, MaxExcl bool
+	Min, Max LexBound
 }
 
 func (r LexRange) aboveMin(m string) bool {
 	switch {
-	case r.MinInf:
+	case r.Min.NegInf:
 		return true
-	case r.MinExcl:
-		return m > r.Min
+	case r.Min.PosInf:
+		return false
+	case r.Min.Excl:
+		return m > r.Min.Member
 	}
-	return m >= r.Min
+	return m >= r.Min.Member
 }
 
 func (r LexRange) belowMax(m string) bool {
 	switch {
-	case r.MaxInf:
+	case r.Max.PosInf:
 		return true
-	case r.MaxExcl:
-		return m < r.Max
+	case r.Max.NegInf:
+		return false
+	case r.Max.Excl:
+		return m < r.Max.Member
 	}
-	return m <= r.Max
+	return m <= r.Max.Member
 }
 
 // ZLexCount returns how many members fall inside the lexicographic range r.
