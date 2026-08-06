@@ -1,0 +1,68 @@
+name: Feature request
+description: A command, option or capability that is not implemented yet.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things shape what gets built here, so it is worth knowing them before you
+        write:
+
+        1. **No third-party dependencies in the server.** Everything — the RESP codec,
+           the skip list, the AOF, replication, the HyperLogLog — is hand-written, and
+           that is the point of the project rather than an accident. A request that can
+           only be met by vendoring a library (a Lua interpreter, for instance) will be
+           declined on those grounds and documented as a known gap instead.
+        2. **A feature has to be able to survive replication and an AOF replay.** Most of
+           the difficulty in this codebase is not the command; it is making the command
+           propagate in a form that reconstructs the same state later, on another
+           machine. See the thirteen invariants in `CLAUDE.md`.
+
+  - type: input
+    id: what
+    attributes:
+      label: What is missing
+      description: The command, subcommand or option, spelled as it appears on the wire.
+      placeholder: SORT key [BY pattern] [GET pattern ...] [STORE dst]
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: What are you trying to do
+      description: >
+        The application-level goal, not only the command. It matters because there is
+        often another command already here that does the job, and because knowing the
+        use case is what decides which corners of the semantics have to be exact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: blocked
+    attributes:
+      label: What is blocked without it
+      description: >
+        Especially useful: a client library or framework that will not work at all
+        without this. "redis-py's Lock needs EVAL" is a much stronger case than "SORT
+        would be nice", because it names something that is broken rather than absent.
+      placeholder: e.g. django-redis calls this on startup, so the whole cache backend fails.
+
+  - type: textarea
+    id: redis_behaviour
+    attributes:
+      label: Real Redis's behaviour
+      description: >
+        A transcript against a real Redis, including the edge cases: a missing key, an
+        empty collection, the wrong type, a negative index, and the exact error strings.
+        That transcript is most of the test suite the implementation will need.
+      render: shell
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This can be implemented without adding a third-party dependency to the server.
+        - label: I would be willing to open a pull request for it.
+          required: false

@@ -57,6 +57,100 @@ jobs:
       - name: Fuzz the RESP parser (short)
         run: go test -run=^$ -fuzz=FuzzReadCommand -fuzztime=20s ./internal/resp
 
+  # The Go tests prove the server does what this project believes Redis does. They
+  # cannot prove that a real client library agrees, because they are written against
+  # the same understanding as the server. This job drives the server with the clients
+  # applications actually use -- redis-py, ioredis, node-redis, go-redis, each in its
+  # own container -- and runs every check a second time against a real redis:7-alpine
+  # under identical code. The finding is the *difference* between those two columns:
+  # a check that fails against both is a quirk of the library or a bug in the check,
+  # and only one that passes against Redis and fails here is an incompatibility.
+  #
+  # It is a job of its own because it needs Docker and takes minutes rather than
+  # seconds, and it does not vary with the Go version, so running it inside the
+  # matrix would multiply the cost for the same answer.
+  compat:
+    runs-on: ubuntu-latest
+    name: client-library compatibility
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      # The client images are the slow part (npm install, go mod download, pip
+      # install), and they change only when a suite's Dockerfile does.
+      - name: Cache the client images
+        uses: actions/cache@v4
+        with:
+          path: /tmp/compat-images
+          key: compat-images-${{ hashFiles('test/compat/*/Dockerfile') }}
+
+      - name: Load cached client images
+        run: |
+          for tar in /tmp/compat-images/*.tar; do
+            [ -f "$tar" ] && docker load -i "$tar" || true
+          done
+
+      - name: Run the client-library suites
+        run: ./test/compat/run.sh
+
+      - name: Save the client images
+        if: always()
+        run: |
+          mkdir -p /tmp/compat-images
+          for suite in python ioredis noderedis goredis; do
+            docker image inspect "skcompat-$suite" >/dev/null 2>&1 \
+              && docker save -o "/tmp/compat-images/$suite.tar" "skcompat-$suite"
+          done
+
+      # The matrix and every suite's raw log, so a failure can be diagnosed from
+      # the run rather than reproduced first.
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-results
+          path: test/compat/.results/
+          retention-days: 14
+
+  # Redis's own test suite, in external mode. It is the highest-authority signal
+  # available to a Redis-compatible server -- assertions written by the people who
+  # define the behaviour, with no idea they are not talking to Redis -- and it is a
+  # separate job because it is the slowest thing here and because its result is
+  # reported as a count of assertions rather than as a pass or a fail.
+  #
+  # continue-on-error: this suite reaches well past what shardkv claims to
+  # implement (there is no Lua, no RDB, no cluster bus), so a red mark here would
+  # mean "not identical to Redis", which is already known and documented. The
+  # number of assertions passing is the thing to watch, and it is in the artifact.
+  compat-tcl:
+    runs-on: ubuntu-latest
+    name: redis tcl suite (external mode)
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Redis's unit tests against shardkv and against Redis
+        run: ./test/compat/run.sh tcl
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-tcl-results
+          path: test/compat/.results/
+          retention-days: 14
+
   # golangci-lint is part of the gate the project holds itself to (make lint), so CI
   # has to run it: a linter that only runs when someone remembers is a linter whose
   # findings accumulate. It is a job of its own rather than a step in the matrix

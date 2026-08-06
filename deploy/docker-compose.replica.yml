@@ -1,0 +1,92 @@
+# A primary and one replica: the replica issues PSYNC, receives a point-in-time
+# snapshot, then applies the live write stream. It refuses client writes (-READONLY) and
+# keeps an AOF of its own.
+#
+# Run it:
+#
+#     docker compose -f deploy/docker-compose.replica.yml up -d --build
+#
+# Watch the replication link come up, and see a write cross it:
+#
+#     docker run --rm --network shardkv-replica_default redis:7-alpine sh -c '
+#         redis-cli -h primary -p 6380 info replication
+#         redis-cli -h primary -p 6380 set greeting hello
+#         sleep 1
+#         redis-cli -h replica -p 6380 get greeting        # hello
+#         redis-cli -h replica -p 6380 set greeting nope   # READONLY ...
+#         redis-cli -h primary -p 6380 wait 1 1000         # (integer) 1
+#     '
+#
+# Host ports are 6380 (primary) and 6381 (replica) by default, both overridable:
+#
+#     PRIMARY_PORT=7380 REPLICA_PORT=7381 \
+#         docker compose -f deploy/docker-compose.replica.yml up -d
+#
+# Tear it down, dropping both AOF volumes:
+#
+#     docker compose -f deploy/docker-compose.replica.yml down -v
+
+name: shardkv-replica
+
+# Both nodes are the same binary with the same image; only the flags differ. The anchor
+# keeps the build definition in one place so `up` builds once.
+x-shardkv: &shardkv
+  image: shardkv:local
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  primary:
+    <<: *shardkv
+    ports:
+      - "${PRIMARY_PORT:-6380}:6380"
+    volumes:
+      - primary-data:/data
+    # -aof on the primary is not only about durability. A primary started without one
+    # begins totally ordering its writes against their propagation only at the first
+    # PSYNC, so a write already in flight at that instant can be missed by that first
+    # replica. With an AOF the ordering is in force from the start. See the README's
+    # Replication section, "Consistency model".
+    command:
+      - -addr
+      - ":6380"
+      - -aof
+      - /data/shardkv.aof
+      - -aofsync
+      - everysec
+      # How much of the write stream is retained for a partial resync. A replica that
+      # reconnects within this window gets +CONTINUE and only the bytes it missed; past
+      # it, a full snapshot. Write rate x tolerable disconnect window gives the number.
+      - -repl-backlog-size
+      - "1048576"
+
+  replica:
+    <<: *shardkv
+    ports:
+      - "${REPLICA_PORT:-6381}:6380"
+    volumes:
+      - replica-data:/data
+    depends_on:
+      primary:
+        # The image's HEALTHCHECK is an actual PING, so this waits for a server that
+        # answers commands. The replica retries its dial anyway -- this only removes the
+        # first failed attempt and the confusing log line that comes with it.
+        condition: service_healthy
+    command:
+      - -addr
+      - ":6380"
+      - -replicaof
+      - primary:6380
+      - -aof
+      - /data/shardkv.aof
+      - -aofsync
+      - everysec
+
+volumes:
+  primary-data:
+  replica-data:

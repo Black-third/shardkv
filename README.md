@@ -1891,6 +1891,41 @@ own fault, not the server's — including an expected `CLUSTER KEYSLOT` value ta
 Redis documentation's example that turned out to be wrong, where shardkv had been right all
 along. A suite without a reference column would have recorded that as a server bug.
 
+| library | checks | pass | fails, and why |
+| ------- | ------ | ---- | -------------- |
+| **node-redis 5** (RESP2 + RESP3) | 35 | **35** | none — identical to real Redis on every check, cluster client included |
+| **ioredis 5** | 39 + 1 n/a | **38** | `defineCommand` (Lua). The one skip is RESP3: ioredis 5 does not speak it |
+| **redis-py 8** (hiredis parser) | 85 | **78** | `EVAL`; `Lock` (releases via a Lua script); `SORT`; `ZUNIONSTORE`; `ZRANGE BYLEX`; `SCAN TYPE`; `RPUSHX` |
+| **go-redis v9** (RESP3 by default) | 66 | **57** | the same set, plus `ROLE`, `EXPIRETIME`, `ZRANGE BYSCORE` — and one cluster-`SCAN` check that has not reproduced (see below) |
+
+Every failure in that table is a command or option this server does not implement, listed
+above — not a reply this server gets wrong. The one exception is honest to record: under a
+run with three suites competing for the machine, go-redis's cluster `SCAN` found 62 of 64
+keys once. It has not reproduced, and a direct check of the same thing — 64 keys across
+three nodes, `SCAN` with `COUNT 20` per node — returns 64 of 64 with `DBSIZE` agreeing on
+every node. It is recorded here rather than dropped because "it went away" is not a
+diagnosis.
+
+The cluster clients are the part worth
+singling out: `RedisCluster`, `ioredis.Cluster` and `ClusterClient` all discover the
+three-node topology from `CLUSTER SLOTS`/`SHARDS`, route by slot, follow `MOVED`, split a
+pipeline per node and stitch the replies back together, and raise `CROSSSLOT` for a
+multi-key command that spans slots — against this server exactly as against Redis.
+
+And on Redis's own suite, against this commit: **293 of its assertions pass**, across the
+23 unit files that cover the implemented surface. The honest part of that number is its
+denominator. Only five of those files run to completion; the other eighteen abort part-way,
+because Redis's suite calls something absent and the suite ends a file at the first such
+call. The largest single cause is not a command at all — Redis's type tests open by setting
+an encoding threshold (`CONFIG SET hash-max-listpack-value`, `set-max-intset-entries`, …)
+to exercise both of Redis's internal representations, and there is only one representation
+per type here, so `unit/type/hash`, `list`, `set` and `zset` stop on their first line and
+contribute nothing. For calibration, on the files that do run: `unit/type/string` 72 of the
+80 assertions real Redis passes, `unit/type/incr` 32 of 33, `unit/expire` 18 of 65.
+
+Quoting "293" without that paragraph would be the same dishonesty as a benchmark table with
+the losses removed.
+
 The other half is `test/compat/tcl/`, which points **Redis's own TCL test suite** at this
 server in external mode (`--host`/`--port`). This is the highest-authority signal available
 to anything claiming Redis compatibility: assertions written by the people who define the

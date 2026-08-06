@@ -1,0 +1,14 @@
+# A blank issue is almost always a worse bug report than the form, so the forms are
+# the only route in -- except for the two things that must not become public issues.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Black-third/shardkv/security/advisories/new
+    about: >
+      Do not open a public issue for a vulnerability. Report it privately through a
+      GitHub security advisory, or by email — see SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/Black-third/shardkv/discussions
+    about: >
+      For "how does X work" and "should this be done differently", which are better as a
+      discussion than as an issue that has to be closed.

@@ -1,0 +1,195 @@
+# A three-node cluster: 16384 hash slots split evenly, keys routed by CRC16-XMODEM, and
+# MOVED/ASK redirects a cluster-aware client follows.
+#
+# Run it -- the `init` sidecar does the whole assembly and exits:
+#
+#     docker compose -f deploy/docker-compose.cluster.yml up -d --build
+#     docker compose -f deploy/docker-compose.cluster.yml logs init
+#
+# Then drive it with a cluster-aware client *on the compose network*, which is the part
+# that needs care -- see "About the addresses" below:
+#
+#     docker run --rm -it --network shardkv-cluster_default redis:7-alpine \
+#         redis-cli -c -h shardkv-1 -p 6380
+#     > SET foo bar                                        # -> Redirected to slot [12182] at shardkv-3:6380
+#     > MSET {user1000}.following 1 {user1000}.followers 2  # one slot, one node: OK
+#     > MGET foo hello                                     # CROSSSLOT: no node owns both
+#     > CLUSTER SLOTS
+#
+# Host ports are 7001-7003 by default, overridable (on macOS port 7000 belongs to the
+# AirPlay receiver, which is why the range starts at 7001):
+#
+#     NODE1_PORT=7301 NODE2_PORT=7302 NODE3_PORT=7303 \
+#         docker compose -f deploy/docker-compose.cluster.yml up -d
+#
+# Tear it down, dropping the AOFs and the nodes.conf files with them:
+#
+#     docker compose -f deploy/docker-compose.cluster.yml down -v
+#
+# ---------------------------------------------------------------------------------
+# About the addresses
+#
+# -cluster-announce-ip is what *clients* are redirected to, and it is set here to each
+# node's compose service name -- so a MOVED names `shardkv-3:6380`, which resolves for
+# any container on this network and for the nodes themselves. It does not resolve on
+# your host, so a redis-cli -c run on the host will follow a redirect into nothing:
+# drive the cluster from a container on the network (as above), or add
+#
+#     127.0.0.1 shardkv-1 shardkv-2 shardkv-3
+#
+# to /etc/hosts -- which still will not work, because the announced port is 6380 and the
+# host reaches the nodes on 7001-7003. The published ports are for single-node
+# inspection (INFO, CLUSTER NODES, a key you know this node owns), not for routing.
+#
+# CLUSTER MEET's host operand is different: it is dialled by the *node*, not by a
+# client, so it too is a service name here. Those two addresses coincide on a compose
+# network and routinely do not elsewhere; confusing them is the mistake to expect.
+#
+# ---------------------------------------------------------------------------------
+# Why there is an init container at all
+#
+# There is no cluster bus: no gossip, so configuration does not propagate, so every
+# node has to be told its slots by hand. CLUSTER MEET is the single exception, and it
+# is one-directional -- it *pulls* the peer's id, announced address and the slots the
+# peer claims (adopting only slots still unassigned locally, so MEET can never move a
+# slot) -- which is why the mesh below runs it on each node for each peer, both ways.
+# There is also no failure detection and no automatic failover: a node that dies stays
+# dead until an operator reassigns its slots. See the README's Cluster section for the
+# full boundary of what is and is not implemented.
+
+name: shardkv-cluster
+
+x-node: &node
+  image: shardkv:local
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  shardkv-1:
+    <<: *node
+    ports:
+      - "${NODE1_PORT:-7001}:6380"
+    volumes:
+      - node1-data:/data
+    command:
+      - -addr
+      - ":6380"
+      - -aof
+      - /data/shardkv.aof
+      - -cluster-enabled
+      # The node id and the slot map are persisted here, so a restarted node comes back
+      # as itself owning the same slots -- which is also what makes the init container
+      # safe to re-run.
+      - -cluster-config-file
+      - /data/nodes.conf
+      - -cluster-announce-ip
+      - shardkv-1
+
+  shardkv-2:
+    <<: *node
+    ports:
+      - "${NODE2_PORT:-7002}:6380"
+    volumes:
+      - node2-data:/data
+    command:
+      - -addr
+      - ":6380"
+      - -aof
+      - /data/shardkv.aof
+      - -cluster-enabled
+      - -cluster-config-file
+      - /data/nodes.conf
+      - -cluster-announce-ip
+      - shardkv-2
+
+  shardkv-3:
+    <<: *node
+    ports:
+      - "${NODE3_PORT:-7003}:6380"
+    volumes:
+      - node3-data:/data
+    command:
+      - -addr
+      - ":6380"
+      - -aof
+      - /data/shardkv.aof
+      - -cluster-enabled
+      - -cluster-config-file
+      - /data/nodes.conf
+      - -cluster-announce-ip
+      - shardkv-3
+
+  # Assembly, once, then it exits 0. redis:7-alpine is here only for its redis-cli:
+  # every command below is one a real redis-cli sends to a real cluster.
+  init:
+    image: redis:7-alpine
+    depends_on:
+      shardkv-1:
+        condition: service_healthy
+      shardkv-2:
+        condition: service_healthy
+      shardkv-3:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        NODES="shardkv-1 shardkv-2 shardkv-3"
+
+        # depends_on: service_healthy has already waited for a PING to succeed; this
+        # loop makes the script safe to run on its own (docker compose run --rm init).
+        for h in $$NODES; do
+          until [ "$$(redis-cli -h $$h -p 6380 PING 2>/dev/null)" = "PONG" ]; do
+            echo "waiting for $$h ..."
+            sleep 1
+          done
+        done
+
+        # Assign a third of the slot space to each node -- but only to a node that has
+        # none, because ADDSLOTSRANGE over an assigned slot is an error and the slot map
+        # survives a restart in nodes.conf. So this is idempotent: on a second `up` it
+        # reports what it found and changes nothing.
+        assign() {
+          assigned=$$(redis-cli -h "$$1" -p 6380 CLUSTER INFO \
+            | tr -d '\r' | awk -F: '/^cluster_slots_assigned:/ {print $$2}')
+          if [ "$$assigned" = "0" ]; then
+            echo "$$1: assigning slots $$2-$$3"
+            redis-cli -h "$$1" -p 6380 CLUSTER ADDSLOTSRANGE "$$2" "$$3"
+          else
+            echo "$$1: already knows $$assigned assigned slots, leaving the slot map alone"
+          fi
+        }
+        assign shardkv-1 0 5460
+        assign shardkv-2 5461 10922
+        assign shardkv-3 10923 16383
+
+        # The mesh. MEET is a one-directional pull, so every ordered pair gets one.
+        for a in $$NODES; do
+          for b in $$NODES; do
+            [ "$$a" = "$$b" ] || {
+              echo "$$a: MEET $$b"
+              redis-cli -h "$$a" -p 6380 CLUSTER MEET "$$b" 6380
+            }
+          done
+        done
+
+        echo
+        echo "--- CLUSTER INFO (shardkv-1) ---"
+        redis-cli -h shardkv-1 -p 6380 CLUSTER INFO \
+          | tr -d '\r' | grep -E 'cluster_state|cluster_slots_assigned|cluster_known_nodes'
+        echo "--- CLUSTER NODES (shardkv-1) ---"
+        redis-cli -h shardkv-1 -p 6380 CLUSTER NODES
+        echo
+        echo "cluster ready: 16384 slots across 3 nodes"
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
