@@ -74,7 +74,9 @@ func TestSlowlog(t *testing.T) {
 	if got := c.cmd("SLOWLOG HELP"); !strings.Contains(got, "GET [<count>]") {
 		t.Errorf("SLOWLOG HELP = %q", got)
 	}
-	if got := c.cmd("SLOWLOG NOPE"); !strings.HasPrefix(got, "-ERR Unknown SLOWLOG subcommand") {
+	// redis:7.2 spells every container's unknown subcommand this one way; the old
+	// per-container wording was this server's own.
+	if got := c.cmd("SLOWLOG NOPE"); got != "-ERR unknown subcommand 'NOPE'. Try SLOWLOG HELP." {
 		t.Errorf("SLOWLOG NOPE = %q", got)
 	}
 }

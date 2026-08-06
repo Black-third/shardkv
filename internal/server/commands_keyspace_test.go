@@ -192,13 +192,43 @@ func TestObjectCommand(t *testing.T) {
 		{"OBJECT ENCODING z", "listpack"},
 		{"OBJECT REFCOUNT n", ":1"},
 		{"OBJECT IDLETIME n", ":0"},
-		// Missing keys and malformed invocations.
-		{"OBJECT ENCODING ghost", "-ERR no such key"},
-		{"OBJECT REFCOUNT ghost", "-ERR no such key"},
-		{"OBJECT IDLETIME ghost", "-ERR no such key"},
-		{"OBJECT BOGUS n", "-ERR Unknown subcommand or wrong number of arguments for 'BOGUS'. Try OBJECT HELP."},
-		{"OBJECT ENCODING", "-ERR Unknown subcommand or wrong number of arguments for 'ENCODING'. Try OBJECT HELP."},
+		// Missing keys and malformed invocations. Every expectation here was measured
+		// against redis:7.2 (identically on amd64 and arm64); the three "no such key"
+		// errors below are what this test used to assert, and they were wrong.
+		//
+		// A missing key is a *null*, not an error: Redis resolves the key with
+		// objectCommandLookupOrReply, whose failure reply is shared.null. A client
+		// probing "is this key here, and how is it stored?" gets an answer rather than
+		// an exception.
+		{"OBJECT ENCODING ghost", "(nil)"},
+		{"OBJECT REFCOUNT ghost", "(nil)"},
+		{"OBJECT IDLETIME ghost", "(nil)"},
+		{"OBJECT FREQ ghost", "(nil)"},
+		// An unknown subcommand and a known one with the wrong argument count are
+		// different errors, and collapsing them told a client its subcommand did not
+		// exist when it had merely forgotten the key.
+		{"OBJECT BOGUS n", "-ERR unknown subcommand 'BOGUS'. Try OBJECT HELP."},
+		{"OBJECT ENCODING", "-ERR wrong number of arguments for 'object|encoding' command"},
+		{"OBJECT ENCODING a b", "-ERR wrong number of arguments for 'object|encoding' command"},
+		{"OBJECT REFCOUNT", "-ERR wrong number of arguments for 'object|refcount' command"},
 		{"OBJECT", "-ERR wrong number of arguments for 'object' command"},
+		// FREQ exists so that its refusal is the right refusal: this server has no LFU
+		// policy, and saying "unknown subcommand" would claim the command is absent.
+		{"OBJECT FREQ n", "-ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust."},
+		// REFCOUNT reports INT_MAX for a value Redis would have taken from its
+		// shared-integer table (the integers 0..9999), because their refcount is
+		// meaningless there. Nothing is shared here; this is reported so a client using
+		// REFCOUNT to detect sharing agrees with Redis.
+		{"SET small 100", "+OK"},
+		{"OBJECT REFCOUNT small", ":2147483647"},
+		{"SET edge 9999", "+OK"},
+		{"OBJECT REFCOUNT edge", ":2147483647"},
+		{"SET past 10000", "+OK"},
+		{"OBJECT REFCOUNT past", ":1"},
+		// "007" parses as 7 but is not the text a shared integer holds, and Redis keeps
+		// it as a string.
+		{"SET padded 007", "+OK"},
+		{"OBJECT REFCOUNT padded", ":1"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {

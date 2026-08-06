@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -307,15 +308,59 @@ func cmdRandomKey(s *Server, w *resp.Writer, args [][]byte) bool {
 	return false
 }
 
-// cmdObject implements OBJECT ENCODING|REFCOUNT|IDLETIME key.
+// sharedIntegerRefcount is what OBJECT REFCOUNT answers for a value Redis would have
+// taken from its shared-integer table. Redis preallocates the integers 0..9999 and hands
+// out the same object to every key holding one, so their refcount is meaningless and it
+// reports INT_MAX rather than a number that would change as unrelated keys came and went.
 //
-// REFCOUNT always answers 1: values here are never shared between keys (COPY makes
-// a deep copy), so the only honest answer is that one key holds the value.
+// shardkv shares nothing -- each key owns its bytes -- so this is reported for
+// compatibility rather than because anything is shared. It is not cosmetic: a client that
+// uses REFCOUNT to decide whether a value is shared (which is the only thing the field is
+// good for) would otherwise conclude that an integer key is private when on real Redis it
+// is not.
+const sharedIntegerRefcount = 2147483647
+
+const sharedIntegerMax = 9999
+
+// cmdObject implements OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ|HELP key.
+//
+// A missing key is a **null**, not an error. That is measured, not assumed: real Redis
+// resolves the key with objectCommandLookupOrReply, whose failure reply is
+// shared.null[resp], so `OBJECT ENCODING nosuchkey` answers $-1 in RESP2 and _ in RESP3.
+// Answering "ERR no such key" instead turns a routine "is this key here?" probe into an
+// error a client library may raise as an exception.
 func cmdObject(s *Server, w *resp.Writer, args [][]byte) bool {
 	sub := strings.ToUpper(string(args[1]))
-	if len(args) != 3 || (sub != "ENCODING" && sub != "REFCOUNT" && sub != "IDLETIME") {
-		w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try OBJECT HELP.")
+	if sub == "HELP" && len(args) == 2 {
+		writeSubcommandHelp(w, "OBJECT", []string{
+			"ENCODING <key>",
+			"    Return the kind of internal representation used in order to store the value",
+			"    associated with a <key>.",
+			"FREQ <key>",
+			"    Return the access frequency index of the <key>. The returned integer is",
+			"    proportional to the logarithm of the recent access frequency of the key.",
+			"IDLETIME <key>",
+			"    Return the idle time of the <key>, that is the approximated number of",
+			"    seconds elapsed since the last access to the key.",
+			"REFCOUNT <key>",
+			"    Return the number of references of the value associated with the specified",
+			"    <key>.",
+		})
+		return false
+	}
+	switch sub {
+	case "ENCODING", "REFCOUNT", "IDLETIME", "FREQ":
+		// A *known* subcommand given the wrong number of arguments is an arity error
+		// naming the subcommand -- "ERR wrong number of arguments for 'object|encoding'
+		// command" -- not an unknown-subcommand error. Collapsing the two told a client
+		// its subcommand did not exist when it had merely forgotten the key.
+		if len(args) != 3 {
+			w.WriteError("ERR wrong number of arguments for 'object|" +
+				strings.ToLower(sub) + "' command")
+			return false
+		}
+	default:
+		writeUnknownSubcommand(w, "OBJECT", args[1])
 		return false
 	}
 	key := string(args[2])
@@ -323,23 +368,51 @@ func cmdObject(s *Server, w *resp.Writer, args [][]byte) bool {
 	case "ENCODING":
 		enc, ok := s.store.Encoding(key)
 		if !ok {
-			w.WriteError("ERR no such key")
+			w.WriteNull()
 			return false
 		}
 		w.WriteBulk([]byte(enc))
 	case "REFCOUNT":
-		if !s.store.Exists(key) {
-			w.WriteError("ERR no such key")
+		raw, ok, err := s.store.GetString(key)
+		if err != nil || !ok {
+			// err is WRONGTYPE: a live key of some other type, which shares nothing, so
+			// one holder. Not a live string and no error means the key is absent.
+			if err == nil && !s.store.Exists(key) {
+				w.WriteNull()
+				return false
+			}
+			w.WriteInt(1)
+			return false
+		}
+		v := string(raw)
+		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil && n >= 0 && n <= sharedIntegerMax &&
+			v == strconv.FormatInt(n, 10) {
+			// The last clause matters: "007" parses as 7 but is not the text a shared
+			// integer object would hold, and Redis stores it as a string.
+			w.WriteInt(sharedIntegerRefcount)
 			return false
 		}
 		w.WriteInt(1)
 	case "IDLETIME":
 		idle, ok := s.store.IdleSeconds(key)
 		if !ok {
-			w.WriteError("ERR no such key")
+			w.WriteNull()
 			return false
 		}
 		w.WriteInt(idle)
+	case "FREQ":
+		// FREQ exists so that its refusal is the *right* refusal. Redis reports access
+		// frequency only under an LFU maxmemory policy, and answers this otherwise; this
+		// server has no LFU policy at all, so the answer is always this one. Reporting
+		// "unknown subcommand" instead would tell a client the command does not exist,
+		// when the truth is that the policy for it is not selected.
+		if !s.store.Exists(key) {
+			w.WriteNull()
+			return false
+		}
+		w.WriteError("ERR An LFU maxmemory policy is not selected, access frequency not " +
+			"tracked. Please note that when switching between policies at runtime LRU and LFU " +
+			"data will take some time to adjust.")
 	}
 	return false
 }
