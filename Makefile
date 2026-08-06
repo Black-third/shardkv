@@ -36,6 +36,18 @@ fuzz: ## Fuzz the RESP parser for $(FUZZTIME).
 bench: ## Run the store benchmarks with allocation counts.
 	$(GO) test -bench=. -benchmem ./internal/store
 
+.PHONY: bench-vs-redis
+bench-vs-redis: ## End-to-end throughput vs a real Redis (docker; reports its own variance).
+	./test/bench/vs-redis.sh
+
+.PHONY: compat
+compat: ## Drive the server with real client libraries in containers (docker).
+	./test/compat/run.sh
+
+.PHONY: compat-tcl
+compat-tcl: ## Run Redis's own TCL test suite against the server in external mode (docker).
+	./test/compat/run.sh tcl
+
 .PHONY: cover
 cover: ## Write a coverage profile and print the total.
 	$(GO) test -coverprofile=coverage.out -covermode=atomic ./...

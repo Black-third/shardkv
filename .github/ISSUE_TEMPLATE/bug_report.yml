@@ -1,0 +1,131 @@
+name: Bug report
+description: Something behaves differently from Redis, or differently from its own documentation.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful bug report for this project is a **difference**: the same commands
+        sent to shardkv and to a real Redis, with both replies pasted in. That single
+        comparison is usually the whole diagnosis, because wire compatibility is the
+        claim being tested.
+
+        If you have no Redis to hand, the official image needs no install:
+
+        ```
+        docker run --rm -d --name real-redis -p 6399:6379 redis:7-alpine
+        docker run --rm -i redis:7-alpine redis-cli -h host.docker.internal -p 6399
+        ```
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: The exact command sequence
+      description: >
+        Everything needed to reach the bug from an empty database, as commands rather
+        than prose. Include the client's own handshake if the problem happens on
+        connect.
+      render: shell
+      placeholder: |
+        FLUSHALL
+        ZADD board 1 alice 2 bob
+        ZRANGE board "(1" "+inf" BYSCORE
+    validations:
+      required: true
+
+  - type: textarea
+    id: shardkv_reply
+    attributes:
+      label: What shardkv replied
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: redis_reply
+    attributes:
+      label: What a real Redis replied
+      description: >
+        Paste the reply from a real Redis for the same sequence, and say which version.
+        If you could not run one, say so here instead and describe what you expected
+        and why.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Client library and version
+      description: >
+        The library, not the language: `redis-py 5.2.1`, `ioredis 5.4.1`,
+        `go-redis v9.7.0`, `redis-cli 7.2.5`, `raw socket`. Which library it is matters,
+        because they disagree about what a reply may look like.
+      placeholder: redis-py 5.2.1 (hiredis parser)
+    validations:
+      required: true
+
+  - type: input
+    id: protocol
+    attributes:
+      label: Protocol version
+      description: RESP2 or RESP3 — the reply *shapes* differ, so this narrows it a lot.
+      placeholder: RESP3 (HELLO 3)
+    validations:
+      required: true
+
+  - type: textarea
+    id: server
+    attributes:
+      label: Server version and flags
+      description: >
+        The full command line the server was started with, and the `# Server` section of
+        `INFO`. The flags matter: whether an AOF is enabled changes how writes are
+        ordered, and whether cluster mode is on changes which node may answer at all.
+      render: shell
+      placeholder: |
+        shardkv -addr :6380 -aof /data/shardkv.aof -cluster-enabled
+        $ redis-cli -p 6380 INFO server
+        ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area, if you know
+      multiple: true
+      options:
+        - Protocol / RESP2 or RESP3 reply shape
+        - A command's behaviour or error text
+        - Client library handshake (HELLO, CLIENT SETINFO, COMMAND DOCS, CONFIG GET)
+        - Transactions (MULTI/EXEC/WATCH)
+        - Blocking commands
+        - Pub/Sub or keyspace notifications
+        - Streams and consumer groups
+        - Persistence (AOF) — including a replay that did not reconstruct the data
+        - Replication — including a replica that diverged from its master
+        - Cluster mode (slots, MOVED/ASK, MIGRATE)
+        - Observability (INFO, SLOWLOG, MONITOR, LATENCY)
+        - Something else / not sure
+
+  - type: textarea
+    id: divergence
+    attributes:
+      label: Did anything diverge?
+      description: >
+        If a replica's data stopped matching its master's, or an AOF replay produced a
+        different dataset, say so here and it will be treated as the most serious kind
+        of bug this project can have. `DEBUG DIGEST`-style comparison is not available,
+        but `DBSIZE`, `KEYS *` and a spot-check of the disagreeing key are enough to
+        start.
+      placeholder: e.g. after 10 minutes the replica's DBSIZE was 4 lower than the master's.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the README's Commands table — the command is listed as implemented.
+        - label: I checked the README's "Known incompatibilities" section.
+          required: false

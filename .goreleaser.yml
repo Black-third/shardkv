@@ -1,0 +1,190 @@
+# GoReleaser configuration -- what `git tag vX.Y.Z && git push --tags` turns into a
+# release. Run `goreleaser check` to validate this file and `goreleaser release
+# --snapshot --clean` to build the whole matrix locally without publishing anything.
+#
+# https://goreleaser.com/customization/
+version: 2
+
+project_name: shardkv
+
+before:
+  hooks:
+    # No `go mod tidy` here: the module has no third-party dependencies and keeping it
+    # that way is a stated feature, so `verify` is the whole of dependency management.
+    # It is also the cheap place to notice a dependency having appeared by accident.
+    - go mod verify
+
+builds:
+  - id: shardkv
+    main: ./cmd/shardkv
+    binary: shardkv
+    env:
+      # A static binary: no cgo means the release archives run on any libc, including
+      # the Alpine image the Dockerfile builds on, and cross-compilation needs no
+      # toolchain beyond Go's own.
+      - CGO_ENABLED=0
+    flags:
+      # -trimpath keeps the build machine's directory layout out of the binary, which
+      # is both a privacy matter and what makes two builds of the same commit
+      # byte-identical.
+      - -trimpath
+    ldflags:
+      # No `-X` version stamping. The version INFO reports is `const Version` in
+      # internal/server/commands_admin.go, and the linker cannot rewrite a constant --
+      # it is folded into every use at compile time. Bump the constant in the commit
+      # you tag; a `-X` here would silently do nothing, which is worse than not
+      # trying. (Turning it into a `var` to allow stamping is a deliberate
+      # non-decision: a constant is what lets the compiler treat it as one.)
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Reproducibility: the binary's timestamp comes from the commit, not from when the
+    # release happened, so rebuilding a tag produces the same bytes.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: shardkv
+    # `formats` is the GoReleaser v2 spelling (v2.6+); older v2 releases called the
+    # same field `format` and took a single string.
+    formats:
+      - tar.gz
+    # Lower-case os/arch, version in the name: the Homebrew formula in
+    # packaging/homebrew/shardkv.rb interpolates exactly this shape, so changing it
+    # means changing that file too.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - CONTRIBUTING.md
+      - SECURITY.md
+      - src: deploy/*.yml
+        dst: deploy
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+source:
+  # A source archive alongside the binaries: it is what a distribution packager and
+  # anyone auditing a build actually wants, and it is covered by the same
+  # checksums.txt as the binaries. The default format is tar.gz.
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+
+snapshot:
+  # What an untagged local `--snapshot` build calls itself.
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # Ask GitHub for the commit list rather than shelling out to git: it resolves merge
+  # commits and PR titles the way the release page does.
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))?!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))?!?:.+$'
+      order: 1
+    - title: Performance
+      regexp: '^.*?perf(\(.+\))?!?:.+$'
+      order: 2
+    - title: Documentation
+      regexp: '^.*?docs?(\(.+\))?!?:.+$'
+      order: 3
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "^style:"
+      - "^refactor:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  # A tag like v0.4.0-rc.1 becomes a pre-release on its own; v0.4.0 does not.
+  prerelease: auto
+  name_template: "{{ .ProjectName }} {{ .Version }}"
+  footer: |
+    ---
+
+    ## Verifying a download
+
+    ```bash
+    # from the directory holding the archive and checksums.txt
+    shasum -a 256 -c checksums.txt --ignore-missing
+    ```
+
+    ## Container image
+
+    ```bash
+    docker pull ghcr.io/black-third/shardkv:{{ .Version }}
+    ```
+
+# ---------------------------------------------------------------------------------
+# SKELETON: this section does nothing useful until the tap repository exists.
+#
+# It publishes a Homebrew formula into github.com/Black-third/homebrew-tap (the
+# repository name is what makes `brew install black-third/tap/shardkv` work -- the
+# `homebrew-` prefix is stripped by brew). That repository does NOT exist yet, so
+# `skip_upload: true` is set below: GoReleaser will render the cask into
+# dist/homebrew/Casks/shardkv.rb, where you can read what it would have pushed, and push
+# nothing.
+#
+# To turn it on:
+#   1. create the public repo Black-third/homebrew-tap with Casks/ and Formula/
+#      directories;
+#   2. create a PAT with `contents: write` on that repo and add it to this repo's
+#      secrets as HOMEBREW_TAP_GITHUB_TOKEN (the default GITHUB_TOKEN is scoped to
+#      this repository and cannot push to another one);
+#   3. uncomment the `token:` line below and the matching env line in
+#      .github/workflows/release.yml;
+#   4. delete `skip_upload: true`.
+#
+# `homebrew_casks:` rather than the older `brews:`. GoReleaser deprecated `brews` --
+# `goreleaser check` fails on it -- because Homebrew itself now wants pre-built binaries
+# distributed as casks and reserves formulae for things built from source. The fields are
+# the same ones under a new key, with `binaries:` replacing the `install` script.
+#
+# The formula kept by hand in packaging/homebrew/shardkv.rb is the *source-build* route
+# (`brew install --HEAD`); this block is the binary route. Both exist deliberately: the
+# cask is what a user gets by default and needs no toolchain, and the formula is what
+# someone building the branch needs.
+# ---------------------------------------------------------------------------------
+homebrew_casks:
+  - name: shardkv
+    skip_upload: true
+    repository:
+      owner: Black-third
+      name: homebrew-tap
+      branch: main
+      # token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/Black-third/shardkv
+    description: >-
+      Concurrent, sharded, Redis-wire-compatible in-memory data-structure server,
+      with no third-party dependencies
+    binaries:
+      - shardkv
+    commit_author:
+      name: goreleaser-bot
+      email: bot@goreleaser.com
+    commit_msg_template: "shardkv: {{ .Tag }}"
+    # A cask installs an artifact; it has no `test do` block. The equivalent
+    # assurance -- start the server and get +PONG out of it -- lives in the
+    # hand-kept formula at packaging/homebrew/shardkv.rb, which is the route that
+    # builds from source and therefore the one that can be wrong on a given machine.
+    caveats: |
+      shardkv listens on :6380 by default, so it does not collide with a Redis on
+      6379. Persistence is off unless you pass -aof:
+
+        shardkv -addr :6380 -aof "$(brew --prefix)/var/shardkv/shardkv.aof"
