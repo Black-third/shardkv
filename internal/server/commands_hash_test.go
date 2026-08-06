@@ -102,9 +102,13 @@ func TestHashWriteCommands(t *testing.T) {
 		// An infinite operand is refused as an operand, which is where HINCRBYFLOAT's message
 		// differs from INCRBYFLOAT's -- Redis words the two differently and this follows it.
 		{"HINCRBYFLOAT fl f inf", "-ERR value is NaN or Infinity"},
-		{"HSET fbig f 1e308", ":1"},
-		{"HINCRBYFLOAT fbig f 1e308", "-ERR increment would produce NaN or Infinity"},
-		{"HGET fbig f", "1e308"},
+		// The non-finite result, whose boundary is long double's and not a float64's: this
+		// asserted that 1e308 + 1e308 overflowed, which was pinning the old float64
+		// implementation. Measured on redis:7.2 (amd64) that sum answers a 309-digit
+		// number, exactly as INCRBYFLOAT does, and the overflow is out at 1e4932.
+		{"HSET fbig f 1e4932", ":1"},
+		{"HINCRBYFLOAT fbig f 1e4932", "-ERR increment would produce NaN or Infinity"},
+		{"HGET fbig f", "1e4932"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {
