@@ -31,6 +31,15 @@ linters:
         - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteNullArray
         - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteArrayHeader
         - (*github.com/Black-third/shardkv/internal/resp.Writer).WriteCommand
+    misspell:
+      # "infinit" is not a misspelling of "infinite" here. It is a deliberately *truncated*
+      # "infinity", used in internal/store/longdouble.go and its test to pin that strtold
+      # consumes an operand whole or not at all -- a prefix of "infinity" must be refused
+      # rather than completed. The word appears in the data and in the comments explaining
+      # the data, so a nolint directive would have to be repeated on every line that
+      # mentions it.
+      ignore-rules:
+        - infinit
     staticcheck:
       checks:
         - all
