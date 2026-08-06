@@ -32,6 +32,7 @@ package server
 
 import (
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -323,18 +324,114 @@ func geoSearchRanges(lon, lat, radiusMeters float64) []scoreRange {
 	step := geoEstimateSteps(radiusMeters, lat)
 	center := geoEncodeStep(lon, lat, step)
 
-	cells := make([]geoHashBits, 0, 9)
+	// The nine cells are the centre and its neighbours, and they are only a valid cover if
+	// they actually extend past the radius in every direction. Near a cell edge they do
+	// not: the point sits close to one side of its own cell, so the ring on that side stops
+	// short and a member inside the radius is never visited. Redis checks the four cardinal
+	// neighbours for exactly this and widens the cells once when any of them falls short.
+	//
+	// This was measured, not inferred: without the check,
+	// `GEOSEARCH ... FROMLONLAT 179.9 0 BYRADIUS 5000 km` omitted a member that redis:7.2
+	// returns. The failure mode is the bad one -- a *missing* result from a search that
+	// reports success, rather than an error.
+	if step > 1 && !geoCoverReachesRadius(lon, lat, radiusMeters, center) {
+		step--
+		center = geoEncodeStep(lon, lat, step)
+	}
+
+	// A search area that reaches the top or bottom of the representable latitude range spans
+	// *every* longitude, and no ring of three columns can cover that. Meridians converge, so
+	// a circle whose northern edge is at 85 degrees is only a few hundred kilometres wide in
+	// longitude terms at that latitude while being global in longitude *degrees*.
+	//
+	// The check above cannot catch this, because moveY wraps the row index rather than
+	// clamping it: the "north" neighbour of a top-row cell is the bottom row, so the distance
+	// to it is half a world and the cover looks sufficient. Measured consequence, on a
+	// 172-member set: `FROMLONLAT -7.103421 53.468338 BYRADIUS 5000 km` omitted a member at
+	// 83.5 degrees north and 118 degrees east that redis:7.2 returns -- 4514 km away, well
+	// inside the radius, and both servers agree on that distance. The cover simply never
+	// visited it.
+	//
+	// Step 1 is the only cover that spans all longitudes (two columns of 180 degrees, and the
+	// ring of three wraps onto both), so a pole-reaching search scans the whole set and lets
+	// the per-candidate distance test do the work. That is the cost of being correct here,
+	// and it is bounded: such a circle genuinely does reach every meridian.
+	latDeltaDeg := (radiusMeters / earthRadiusMeters) * (180.0 / math.Pi)
+	if lat+latDeltaDeg >= geoLatMax || lat-latDeltaDeg <= geoLatMin {
+		center = geoEncodeStep(lon, lat, 1)
+	}
+
+	out := make([]scoreRange, 0, 9)
 	for dx := -1; dx <= 1; dx++ {
 		col := center.moveX(dx)
 		for dy := -1; dy <= 1; dy++ {
-			cells = append(cells, col.moveY(dy))
+			c := col.moveY(dy)
+			lo := c.align52()
+			hi := geoHashBits{bits: c.bits + 1, step: c.step}.align52()
+			out = append(out, scoreRange{min: float64(lo), max: float64(hi)})
 		}
 	}
-	out := make([]scoreRange, 0, 9)
-	for _, c := range cells {
-		lo := c.align52()
-		hi := geoHashBits{bits: c.bits + 1, step: c.step}.align52()
-		out = append(out, scoreRange{min: float64(lo), max: float64(hi)})
+	return mergeScoreRanges(out)
+}
+
+// geoCoverReachesRadius reports whether the nine cells around center extend at least
+// radiusMeters from the search point in all four cardinal directions.
+//
+// Only the four edge-adjacent neighbours are tested, which is what Redis tests: a corner
+// neighbour reaches further than either of the edges it touches, so an edge that reaches is
+// enough to make the corner reach too.
+func geoCoverReachesRadius(lon, lat, radiusMeters float64, center geoHashBits) bool {
+	_, _, _, northMax := geoCellBounds(center.moveY(1))
+	_, southMin, _, _ := geoCellBounds(center.moveY(-1))
+	_, _, eastMax, _ := geoCellBounds(center.moveX(1))
+	westMin, _, _, _ := geoCellBounds(center.moveX(-1))
+	return geoDistance(lon, lat, lon, northMax) >= radiusMeters &&
+		geoDistance(lon, lat, lon, southMin) >= radiusMeters &&
+		geoDistance(lon, lat, eastMax, lat) >= radiusMeters &&
+		geoDistance(lon, lat, westMin, lat) >= radiusMeters
+}
+
+// geoCellBounds returns the box a cell covers, in degrees, at the cell's own step.
+func geoCellBounds(h geoHashBits) (lonMin, latMin, lonMax, latMax float64) {
+	ilat, ilon := deinterleave64(h.bits)
+	scale := float64(uint64(1) << h.step)
+	latMin = geoLatMin + (float64(ilat)/scale)*(geoLatMax-geoLatMin)
+	latMax = geoLatMin + (float64(ilat+1)/scale)*(geoLatMax-geoLatMin)
+	lonMin = geoLonMin + (float64(ilon)/scale)*(geoLonMax-geoLonMin)
+	lonMax = geoLonMin + (float64(ilon+1)/scale)*(geoLonMax-geoLonMin)
+	return lonMin, latMin, lonMax, latMax
+}
+
+// mergeScoreRanges sorts the cover's ranges and merges any that touch or overlap, so no
+// score can fall in two of them.
+//
+// Without this a member is *returned more than once*. The nine cells stop being distinct as
+// soon as the step is small enough that the grid wraps around the world -- at step 1 there
+// are only two columns and two rows, so the ring repeats cells. Measured on a 172-member
+// set: `BYRADIUS 20000 km` answered with 331 entries, some members four times over. A
+// client iterating the reply then processes the same member repeatedly, and `COUNT n`
+// returns fewer than n distinct members while looking like it succeeded.
+//
+// Redis avoids the same thing by skipping a neighbour identical to the previously processed
+// one. Merging is strictly stronger: it also collapses ranges that *overlap* without being
+// equal, and it does not depend on duplicates being adjacent in the iteration order.
+func mergeScoreRanges(in []scoreRange) []scoreRange {
+	if len(in) < 2 {
+		return in
+	}
+	sort.Slice(in, func(i, j int) bool { return in[i].min < in[j].min })
+	out := in[:1]
+	for _, r := range in[1:] {
+		last := &out[len(out)-1]
+		if r.min <= last.max {
+			// Overlapping or touching: extend rather than add. Ranges are half-open, so
+			// "touching" (r.min == last.max) is also a merge and not a gap.
+			if r.max > last.max {
+				last.max = r.max
+			}
+			continue
+		}
+		out = append(out, r)
 	}
 	return out
 }

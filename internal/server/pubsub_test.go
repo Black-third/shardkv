@@ -26,9 +26,20 @@ func subscribeCmd(t *testing.T, c *txConn, cmd string, n int) []string {
 }
 
 // nextMessage reads one pushed message, failing if none arrives.
+//
+// The deadline is generous on purpose. It bounds how long a *failing* test takes, not what
+// the server is allowed to do: a message that is never delivered still fails, only later.
+// Three seconds was too tight -- under the load of several race-enabled packages building
+// and running at once, this package has been observed taking over six minutes, and a
+// subscriber's writer goroutine starved for three seconds produced a spurious timeout in
+// TestExpiredAndEvictedNotifications. The eviction it was waiting for had fired correctly;
+// nothing had gone wrong except the schedule.
+//
+// This is deliberately not a retry loop or a t.Skip. Both of those would let a genuinely
+// undelivered message pass.
 func nextMessage(t *testing.T, c *txConn) string {
 	t.Helper()
-	c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	defer c.conn.SetReadDeadline(time.Time{})
 	return readReply(t, c.br)
 }
@@ -281,20 +292,37 @@ func TestSlowSubscriberConnectionIsClosed(t *testing.T) {
 		return pub.cmd("PUBSUB NUMSUB flood") == "[flood :1]"
 	})
 
-	// Big payloads so the kernel's socket buffers fill quickly and the queue is what
-	// actually overflows, rather than the test writing megabytes into the network.
-	payload := make([]byte, 64<<10)
+	// Big enough that the kernel's socket buffers fill quickly and the *queue* is what
+	// overflows, rather than the test writing megabytes into the network. 16 KiB is ample --
+	// a loopback socket buffer is a couple of hundred KiB, so a handful of these stop the
+	// subscriber's writer, and the queue bound does the rest. It was 64 KiB, which made this
+	// test move 48 MB twice over and take a minute and a half on a loaded machine for no
+	// additional coverage: the assertion that the subscriber is dropped is what proves the
+	// buffers filled, and it still holds.
+	payload := make([]byte, 16<<10)
 	for i := range payload {
 		payload[i] = 'x'
 	}
-	start := time.Now()
-	for i := 0; i < pubsubQueue*3; i++ {
-		pub.conn.Write([]byte("PUBLISH flood " + string(payload) + "\r\n"))
-		readReply(t, pub.br)
+	// "The publisher is not held up" is a *relative* claim, so it is measured against a
+	// control rather than against a stopwatch. The same volume is published twice: once to a
+	// subscriber that never reads (the case under test) and once to one that reads promptly.
+	// Both do identical fan-out work, so the only difference between them is whether the
+	// publisher waits for a subscriber that has stopped consuming.
+	//
+	// The absolute budget this replaces -- 48 MB of publishes inside 20 seconds -- was really
+	// an assertion about the machine. It passed on an idle box and failed at 26 s and 35 s
+	// when several race-enabled packages were building alongside it, which is a false alarm
+	// about a property that had not changed. A ratio cannot fail that way: if the publisher
+	// ever blocked on the slow subscriber the cost would be unbounded, not 4x.
+	publishAll := func(target *txConn) time.Duration {
+		start := time.Now()
+		for i := 0; i < pubsubQueue*3; i++ {
+			target.conn.Write([]byte("PUBLISH flood " + string(payload) + "\r\n"))
+			readReply(t, target.br)
+		}
+		return time.Since(start)
 	}
-	if elapsed := time.Since(start); elapsed > 20*time.Second {
-		t.Fatalf("publishing took %v; the publisher was being held up", elapsed)
-	}
+	slowElapsed := publishAll(pub)
 	waitFor(t, "the slow subscriber's connection to be closed", func() bool {
 		return pub.cmd("PUBSUB NUMSUB flood") == "[flood :0]"
 	})
@@ -302,6 +330,41 @@ func TestSlowSubscriberConnectionIsClosed(t *testing.T) {
 	if got := pub.cmd("PING"); got != "+PONG" {
 		t.Errorf("the publisher's connection = %q after a subscriber was dropped", got)
 	}
+
+	// The control: a subscriber that drains as fast as it can, given the same volume. It
+	// runs *after* the slow one has been dropped, so the two measurements see the same
+	// server in the same state.
+	fast := dialTx(t, addr)
+	defer fast.close()
+	subscribeCmd(t, fast, "SUBSCRIBE flood", 1)
+	waitFor(t, "the fast subscriber to register", func() bool {
+		return pub.cmd("PUBSUB NUMSUB flood") == "[flood :1]"
+	})
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for i := 0; i < pubsubQueue*3; i++ {
+			if _, err := fast.br.Discard(1); err != nil {
+				return // dropped, or the test finished; either way stop reading
+			}
+			if _, err := fast.br.ReadString('\n'); err != nil {
+				return
+			}
+		}
+	}()
+	fastElapsed := publishAll(pub)
+	<-drained
+
+	// A generous factor, because the control is not free of noise either -- both runs move
+	// the same 48 MB and either can be descheduled. What it excludes is the failure this test
+	// exists for: a publisher that waits on a subscriber which has stopped reading does not
+	// take four times as long, it takes forever.
+	if slowElapsed > 4*fastElapsed+5*time.Second {
+		t.Errorf("publishing to a stalled subscriber took %v against %v to a draining one; "+
+			"the publisher was being held up", slowElapsed, fastElapsed)
+	}
+	t.Logf("publish %d x %d KiB: stalled subscriber %v, draining subscriber %v",
+		pubsubQueue*3, len(payload)>>10, slowElapsed, fastElapsed)
 }
 
 // TestPubSubIntrospection covers PUBSUB CHANNELS/NUMSUB/NUMPAT, including the
