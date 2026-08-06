@@ -20,6 +20,7 @@ import (
 
 	"github.com/Black-third/shardkv/internal/aof"
 	"github.com/Black-third/shardkv/internal/resp"
+	"github.com/Black-third/shardkv/internal/store"
 )
 
 func init() {
@@ -34,6 +35,11 @@ type configParam struct {
 	name string
 	get  func(*Server) string
 	set  func(*Server, string) bool // false: the value was not acceptable
+	// setErr replaces the generic "couldn't be parsed into an integer" detail for a
+	// parameter whose refusal is not about parsing. Redis words each of its refusals for
+	// the setting that made it, and a caller that is told the wrong reason looks in the
+	// wrong place.
+	setErr string
 }
 
 var configParams = []configParam{
@@ -54,9 +60,10 @@ var configParams = []configParam{
 		},
 	},
 	{
-		name: "notify-keyspace-events",
-		get:  func(s *Server) string { return s.NotifyKeyspaceEvents() },
-		set:  func(s *Server, v string) bool { return s.SetNotifyKeyspaceEvents(v) },
+		name:   "notify-keyspace-events",
+		get:    func(s *Server) string { return s.NotifyKeyspaceEvents() },
+		set:    func(s *Server, v string) bool { return s.SetNotifyKeyspaceEvents(v) },
+		setErr: "Invalid event class character. Use 'Ag$lshzxeKEtmdn'.",
 	},
 	{
 		name: "appendonly",
@@ -209,6 +216,142 @@ var configParams = []configParam{
 		name: "tls-replication",
 		get:  func(s *Server) string { _, repl := s.TLSConfigInUse(); return yesNo(repl) },
 	},
+	{
+		name: "maxclients",
+		get:  func(s *Server) string { return strconv.Itoa(s.MaxClients()) },
+		set: func(s *Server, v string) bool {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return false
+			}
+			s.SetMaxClients(n)
+			return true
+		},
+	},
+	{
+		// Seconds a client may be idle before the server closes it; 0 disables the check,
+		// which is Redis's default. See reapIdleClients for the connections it must never
+		// apply to.
+		name: "timeout",
+		get:  func(s *Server) string { return strconv.FormatInt(s.ClientTimeoutSecs(), 10) },
+		set: func(s *Server, v string) bool {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || n < 0 {
+				return false
+			}
+			s.SetClientTimeoutSecs(n)
+			return true
+		},
+	},
+	{
+		// The RDB snapshot schedule. There is no RDB here -- persistence is the AOF and
+		// nothing else -- so the schedule reads as empty, which is not a placeholder but the
+		// literal truth: no periodic dataset write is configured, and none would run.
+		// (A real Redis started with `--save ''` reads the same empty string.)
+		//
+		// It is settable, but only to a schedule that asks for nothing. "Turn snapshots
+		// off" is a state this server is genuinely in and can genuinely be asked for; any
+		// non-empty schedule is a durability promise it cannot keep, and accepting one
+		// would be exactly the "tune a number that changes no behaviour" this table exists
+		// to refuse. So the empty schedule succeeds and a non-empty one is rejected with
+		// Redis's own message for a schedule it will not take.
+		name:   "save",
+		get:    func(s *Server) string { return "" },
+		set:    func(s *Server, v string) bool { return strings.TrimSpace(v) == "" },
+		setErr: "Invalid save parameters",
+	},
+	{
+		// How many quicklist nodes at each end of a list are left uncompressed. This store
+		// holds a list as one doubly-linked deque with no nodes and no LZF compression, so
+		// like stream-node-max-entries the parameter is inert *because the structure it
+		// tunes does not exist here* -- not because it is accepted and ignored. It is
+		// settable and reports back what it was told, since a client that configures it
+		// should not be refused and should not be lied to about what it set.
+		name: "list-compress-depth",
+		get:  func(s *Server) string { return strconv.FormatInt(s.ListCompressDepth(), 10) },
+		set: func(s *Server, v string) bool {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || n < 0 {
+				return false
+			}
+			s.SetListCompressDepth(n)
+			return true
+		},
+	},
+	{
+		// Entries per macro-node in a stream's radix tree. This stream is a sorted slice
+		// of entries with no macro-nodes at all, so the parameter is genuinely inert here
+		// -- inert *because the structure it tunes does not exist*, which is a different
+		// claim from a threshold that is accepted and then ignored. It is settable so a
+		// client that configures it is not refused, and it reports back what it was told,
+		// because a value that read differently from what was set would be the misleading
+		// answer.
+		name: "stream-node-max-entries",
+		get:  func(s *Server) string { return strconv.FormatInt(s.StreamNodeMaxEntries(), 10) },
+		set: func(s *Server, v string) bool {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || n < 0 {
+				return false
+			}
+			s.SetStreamNodeMaxEntries(n)
+			return true
+		},
+	},
+}
+
+// encodingParams are the representation thresholds. Each is a real setting: it is read
+// by store.Encoding, so changing one genuinely changes what OBJECT ENCODING reports,
+// which is what Redis's `foreach encoding {listpack hashtable}` type tests manipulate.
+//
+// alias is the pre-7.0 `ziplist` spelling Redis still answers to, where one exists.
+// Redis reports both names from CONFIG GET and keeps one value behind them, so both are
+// generated as separate parameters over the same accessor rather than one name silently
+// rewriting the other.
+var encodingParams = []struct {
+	name  string
+	alias string
+	param store.EncodingParam
+	// signed allows the negative values list-max-listpack-size uses to mean "bound the
+	// listpack by bytes rather than by element count". Every other threshold is a count
+	// or a length, where a negative value has no meaning.
+	signed bool
+}{
+	{name: "hash-max-listpack-entries", alias: "hash-max-ziplist-entries", param: store.HashMaxListpackEntries},
+	{name: "hash-max-listpack-value", alias: "hash-max-ziplist-value", param: store.HashMaxListpackValue},
+	{name: "list-max-listpack-size", alias: "list-max-ziplist-size", param: store.ListMaxListpackSize, signed: true},
+	{name: "set-max-intset-entries", param: store.SetMaxIntsetEntries},
+	{name: "set-max-listpack-entries", param: store.SetMaxListpackEntries},
+	{name: "set-max-listpack-value", param: store.SetMaxListpackValue},
+	{name: "zset-max-listpack-entries", alias: "zset-max-ziplist-entries", param: store.ZSetMaxListpackEntries},
+	{name: "zset-max-listpack-value", alias: "zset-max-ziplist-value", param: store.ZSetMaxListpackValue},
+	{name: "hll-sparse-max-bytes", param: store.HLLSparseMaxBytes},
+}
+
+// init appends the encoding thresholds to the parameter table.
+//
+// They are applied to every database and read back from database 0, exactly as maxkeys
+// is: the setting is server-wide in Redis, and each database here is an independent
+// store that owns its own copy, so "the value in force" is only well defined if every
+// copy holds it.
+func init() {
+	for _, ep := range encodingParams {
+		p, signed := ep.param, ep.signed
+		get := func(s *Server) string { return strconv.FormatInt(s.DB(0).EncodingLimit(p), 10) }
+		set := func(s *Server, v string) bool {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || (n < 0 && !signed) {
+				return false
+			}
+			for i := 0; i < s.Databases(); i++ {
+				s.DB(i).SetEncodingLimit(p, n)
+			}
+			return true
+		}
+		configParams = append(configParams, configParam{name: ep.name, get: get, set: set})
+		if ep.alias != "" {
+			configParams = append(configParams, configParam{name: ep.alias, get: get, set: set})
+		}
+	}
 }
 
 func yesNo(b bool) string {
@@ -239,9 +382,18 @@ func cmdConfig(s *Server, w *resp.Writer, args [][]byte) bool {
 		s.resetStats()
 		w.WriteSimple("OK")
 
+	case "HELP":
+		writeSubcommandHelp(w, "CONFIG", []string{
+			"GET <pattern>",
+			"    Return parameters matching the glob-like <pattern> and their values.",
+			"SET <directive> <value>",
+			"    Set the configuration <directive> to <value>.",
+			"RESETSTAT",
+			"    Reset statistics reported by the INFO command.",
+		})
+
 	default:
-		w.WriteError("ERR Unknown CONFIG subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "CONFIG", args[1])
 	}
 	return false
 }
@@ -273,12 +425,17 @@ func configSet(s *Server, w *resp.Writer, name, value string) {
 			continue
 		}
 		if p.set == nil {
-			w.WriteError("ERR CONFIG SET failed - can't set immutable config '" + name + "'")
+			w.WriteError("ERR CONFIG SET failed (possibly related to argument '" + name +
+				"') - can't set immutable config")
 			return
 		}
 		if !p.set(s, value) {
-			w.WriteError("ERR CONFIG SET failed - argument couldn't be parsed into an integer, " +
-				"or is out of range, for '" + name + "'")
+			detail := "argument couldn't be parsed into an integer, or is out of range"
+			if p.setErr != "" {
+				detail = p.setErr
+			}
+			w.WriteError("ERR CONFIG SET failed (possibly related to argument '" + name +
+				"') - " + detail)
 			return
 		}
 		w.WriteSimple("OK")

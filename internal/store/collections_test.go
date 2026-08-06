@@ -236,3 +236,47 @@ func TestZRangeByScoreLimit(t *testing.T) {
 		t.Errorf("range over a missing key returned %v", got)
 	}
 }
+
+// TestFloatIncrementsRejectAnUnderscoredValue covers the stored-value half of the float
+// parse. A client can plant any string with SET or HSET, so the text these two read back
+// is not necessarily text this server wrote -- and Go's float grammar accepts a spelling
+// Redis refuses.
+//
+// Measured on redis:7.2-alpine: `SET a 1_0` then `INCRBYFLOAT a 1` answers
+// "ERR value is not a valid float", and `HSET h f 1_0` then `HINCRBYFLOAT h f 1` answers
+// "ERR hash value is not a float". Before ParseDouble both answered 11 here: the
+// underscore was silently dropped, the key was overwritten with a number a hundred times
+// too small, and nothing reported it.
+func TestFloatIncrementsRejectAnUnderscoredValue(t *testing.T) {
+	s := New(4)
+
+	for _, planted := range []string{"1_0", "1_000.5", "1_", "_1"} {
+		s.Set("k", []byte(planted), 0)
+		if _, _, err := s.IncrByFloat("k", 1); err != ErrNotFloat {
+			t.Errorf("IncrByFloat over a stored %q: err = %v; want ErrNotFloat", planted, err)
+		}
+		// The refusal must leave the value alone rather than half-applying.
+		if got, _, _ := s.GetString("k"); string(got) != planted {
+			t.Errorf("a refused IncrByFloat over %q left %q", planted, got)
+		}
+
+		if _, err := s.HSet("h", [2][]byte{[]byte("f"), []byte(planted)}); err != nil {
+			t.Fatalf("HSet: %v", err)
+		}
+		if _, _, err := s.HIncrByFloat("h", "f", 1); err != ErrHashNotFloat {
+			t.Errorf("HIncrByFloat over a stored %q: err = %v; want ErrHashNotFloat", planted, err)
+		}
+		if got, _, _ := s.HGet("h", "f"); string(got) != planted {
+			t.Errorf("a refused HIncrByFloat over %q left %q", planted, got)
+		}
+	}
+
+	// The spellings Redis does accept still work, so the check rejects underscores rather
+	// than anything that merely looks unusual.
+	for _, planted := range []string{"5", "+5", ".5", "5.", "1e1"} {
+		s.Set("ok", []byte(planted), 0)
+		if _, _, err := s.IncrByFloat("ok", 0); err != nil {
+			t.Errorf("IncrByFloat over a stored %q: %v", planted, err)
+		}
+	}
+}

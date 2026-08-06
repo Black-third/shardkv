@@ -146,6 +146,10 @@ func (s *Server) rewriteAOF() error {
 	}
 	s.aofRewriteOK.Store(true)
 	s.lastSave.Store(time.Now().Unix())
+	// The whole dataset is now on disk, so nothing the change counter was counting is
+	// still unsaved. This is the only event here that means what an RDB save means to
+	// Redis, which is why it is the only one that clears it.
+	s.clearDirtyChanges()
 	return nil
 }
 

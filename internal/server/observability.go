@@ -128,15 +128,30 @@ func (c *command) percentileUs(fraction float64) float64 {
 }
 
 // resetStatsFor clears every command's counters, for CONFIG RESETSTAT.
+//
+// A container's per-subcommand entries are *discarded* rather than zeroed, which is what
+// makes `LATENCY HISTOGRAM` report an empty histogram after a reset instead of a list of
+// commands with zero calls: an entry exists only because its subcommand has been run since
+// the last reset.
 func resetCommandStats() {
 	for _, c := range commandTable {
-		c.calls.Store(0)
-		c.usec.Store(0)
-		c.rejected.Store(0)
-		c.failed.Store(0)
-		for i := range c.latency {
-			c.latency[i].Store(0)
+		c.reset()
+		if !c.container {
+			continue
 		}
+		c.subMu.Lock()
+		c.subs = nil
+		c.subMu.Unlock()
+	}
+}
+
+func (c *command) reset() {
+	c.calls.Store(0)
+	c.usec.Store(0)
+	c.rejected.Store(0)
+	c.failed.Store(0)
+	for i := range c.latency {
+		c.latency[i].Store(0)
 	}
 }
 
@@ -238,7 +253,14 @@ func cmdSlowlog(s *Server, w *resp.Writer, args [][]byte) bool {
 				return false
 			}
 			// -1 means "everything", which is how a tool asks for the whole log without
-			// having had to call SLOWLOG LEN first and race a concurrent write.
+			// having had to call SLOWLOG LEN first and race a concurrent write. Anything
+			// below that is refused rather than treated as another spelling of it: a caller
+			// that computed -2 has a bug, and silently answering it with the whole log hides
+			// the bug behind a plausible reply.
+			if n < -1 {
+				w.WriteError("ERR count should be greater than or equal to -1")
+				return false
+			}
 			if n < 0 {
 				count = -1
 			} else {
@@ -436,12 +458,17 @@ func cmdLatency(s *Server, w *resp.Writer, args [][]byte) bool {
 			w.WriteInt(l.max)
 		}
 
+	case "HISTOGRAM":
+		latencyHistogram(w, args[2:])
+
 	case "HELP":
 		writeHelp(w, "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:", []string{
 			"HISTORY <event>",
 			"    Return time-latency samples for <event>.",
 			"LATEST",
 			"    Return the latest latency samples for all events.",
+			"HISTOGRAM [<command> ...]",
+			"    Return a cumulative distribution of latencies, per command.",
 			"RESET [<event> ...]",
 			"    Reset latency data of one or more <event> classes.",
 		})
@@ -451,6 +478,135 @@ func cmdLatency(s *Server, w *resp.Writer, args [][]byte) bool {
 			string(args[1]) + "'")
 	}
 	return false
+}
+
+// latencyHistogram answers LATENCY HISTOGRAM [command ...]: the per-command latency
+// distribution, as a cumulative histogram.
+//
+// It reports the same measurements INFO latencystats reads -- the per-command bucket
+// counts kept on the table entry -- in the shape Redis publishes them, which is a map of
+// command name to {calls, histogram_usec}, where histogram_usec maps a bucket's upper
+// bound in microseconds to the number of calls at or below it. Cumulative, so the last
+// value equals calls; that is what makes any percentile readable off it without the client
+// having to sum anything.
+//
+// A named command with no calls recorded is omitted rather than reported as empty, and so
+// is a name that is not a command at all -- an empty reply for "nothing has been measured"
+// is Redis's answer and the useful one for a monitoring agent that polls a fixed list.
+//
+// The bucket bounds are powers of two because that is the histogram this server keeps
+// (bucket i holds the calls whose duration has bit-length i, so it spans
+// [2^(i-1), 2^i - 1] and its upper bound is 2^i - 1). Redis's are hdr_histogram's, which
+// are finer; both are approximations, and reporting this one's real boundaries is better
+// than interpolating onto Redis's and implying a precision the data does not have.
+func latencyHistogram(w *resp.Writer, names [][]byte) {
+	type entry = statsEntry
+	var out []entry
+	if len(names) == 0 {
+		for _, c := range statsEntries() {
+			if c.calls.Load() > 0 {
+				out = append(out, entry{c.lowerName, c})
+			}
+		}
+		// statsEntries is already sorted by command name; sorting again puts a container's
+		// subcommands in overall alphabetical order, which is the order Redis's reply is in.
+		sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	} else {
+		for _, n := range names {
+			out = append(out, latencyHistogramFor(string(n))...)
+		}
+	}
+
+	w.WriteMapHeader(len(out))
+	for _, e := range out {
+		w.WriteBulk([]byte(e.name))
+		buckets, calls := e.cmd.cumulativeLatency()
+		w.WriteMapHeader(2)
+		w.WriteBulk([]byte("calls"))
+		w.WriteInt(calls)
+		w.WriteBulk([]byte("histogram_usec"))
+		w.WriteMapHeader(len(buckets))
+		for _, b := range buckets {
+			w.WriteInt(b.upperUs)
+			w.WriteInt(b.cumulative)
+		}
+	}
+}
+
+// latencyHistogramFor resolves one name a caller asked for into the entries to report.
+//
+// Three spellings, all of which Redis accepts: an ordinary command name; a container's name,
+// which expands to every subcommand of it that has been called (and not to the container
+// itself); and a fully qualified "container|subcommand". A name that is not a command, or one
+// with nothing recorded, contributes nothing -- an empty reply for "nothing measured" is what
+// lets a monitoring agent poll a fixed list.
+func latencyHistogramFor(name string) []statsEntry {
+	type entry = statsEntry
+	parent, sub, qualified := strings.Cut(name, "|")
+	c, ok := commandTable[strings.ToUpper(parent)]
+	if !ok {
+		return nil
+	}
+	if qualified {
+		for _, e := range c.subStats() {
+			if e.lowerName == c.lowerName+"|"+strings.ToLower(sub) && e.calls.Load() > 0 {
+				return []entry{{e.lowerName, e}}
+			}
+		}
+		return nil
+	}
+	if c.container {
+		var out []entry
+		for _, e := range c.subStats() {
+			if e.calls.Load() > 0 {
+				out = append(out, entry{e.lowerName, e})
+			}
+		}
+		return out
+	}
+	if c.calls.Load() == 0 {
+		return nil
+	}
+	return []entry{{c.lowerName, c}}
+}
+
+// statsEntry pairs a reported name with the entry holding its measurements. It is a named
+// type rather than an anonymous struct so that the two functions building these lists share
+// one shape.
+type statsEntry struct {
+	name string
+	cmd  *command
+}
+
+// latencyBucket is one point of a cumulative histogram: an upper bound in microseconds
+// and how many calls completed at or below it.
+type latencyBucket struct {
+	upperUs    int64
+	cumulative int64
+}
+
+// cumulativeLatency reads the command's histogram out as a cumulative distribution,
+// skipping the buckets nothing fell into. The total is taken from the buckets rather than
+// from the calls counter so that the reply is internally consistent: the two are separate
+// atomics, and a concurrent call landing between the two reads would otherwise produce a
+// histogram whose last value disagreed with the call count beside it.
+func (c *command) cumulativeLatency() ([]latencyBucket, int64) {
+	var out []latencyBucket
+	var total int64
+	for i := 0; i < latencyBuckets; i++ {
+		n := c.latency[i].Load()
+		if n == 0 {
+			continue
+		}
+		total += n
+		// Bucket 0 is "took less than a microsecond", whose highest represented value is 0.
+		var upper int64
+		if i > 0 {
+			upper = int64(1)<<uint(i) - 1
+		}
+		out = append(out, latencyBucket{upperUs: upper, cumulative: total})
+	}
+	return out, total
 }
 
 // --- MONITOR ------------------------------------------------------------------
@@ -669,7 +825,12 @@ func (s *Server) observeCommand(sess *session, cmd *command, args [][]byte, star
 			dur = 0
 		}
 	}
-	cmd.record(dur, w.ErrorsWritten() != errs0)
+	// Recorded against the subcommand for a container command, which is what Redis reports
+	// and the only figure that means anything for one: CONFIG GET and CONFIG RESETSTAT are
+	// not the same command in any sense a latency reading cares about. For everything else
+	// statsTarget returns the entry the dispatcher already holds, so this is still the same
+	// three atomic adds it was.
+	cmd.statsTarget(args).record(dur, w.ErrorsWritten() != errs0)
 
 	if t := s.slowlogThreshold.Load(); t >= 0 && dur.Microseconds() >= t {
 		s.recordSlowlog(sess, args, dur)
@@ -806,8 +967,13 @@ func commandKeys(name string, args [][]byte) []string {
 	switch name {
 	case "MGET", "EXISTS", "TOUCH", "WATCH", "SUNION", "SINTER", "SDIFF", "PFCOUNT":
 		return byteStrings(args[1:])
-	case "SUNIONSTORE", "SINTERSTORE", "SDIFFSTORE", "PFMERGE", "ZUNIONSTORE", "ZINTERSTORE":
+	case "SUNIONSTORE", "SINTERSTORE", "SDIFFSTORE", "PFMERGE":
 		return byteStrings(args[1:])
+	case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
+		// The destination, then the numkeys-counted inputs. The count itself is an operand
+		// and not a key, which is exactly why these cannot share the case above: reporting
+		// "2" as a key would route the command by the slot of a number in cluster mode.
+		return append([]string{string(args[1])}, numkeysKeys(args, 2)...)
 	case "BITOP":
 		// BITOP <op> <dest> <src...>: the operation sits where every other command puts
 		// its first key, which is exactly why it needs a case of its own.
@@ -815,7 +981,7 @@ func commandKeys(name string, args [][]byte) []string {
 			return nil
 		}
 		return byteStrings(args[2:])
-	case "SINTERCARD", "LMPOP", "ZMPOP", "ZDIFF", "ZUNION", "ZINTER":
+	case "SINTERCARD", "LMPOP", "ZMPOP", "ZDIFF", "ZUNION", "ZINTER", "ZINTERCARD":
 		return numkeysKeys(args, 1)
 	case "BLMPOP", "BZMPOP":
 		return numkeysKeys(args, 2)

@@ -59,6 +59,29 @@ func (s *Store) ExpireAtCond(key string, deadline time.Time, cond ExpireCond) bo
 	return true
 }
 
+// ExpireTimeMillis reports the absolute instant key expires at, as a Unix timestamp in
+// milliseconds. ok is false when the key is missing or expired; hasTTL is false when it
+// exists and never expires. It is what EXPIRETIME and PEXPIRETIME answer.
+//
+// It reads the deadline rather than deriving one from a remaining TTL, which is the whole
+// point of the two commands: a caller that has to reconstruct an absolute deadline from
+// `TTL` plus its own clock gets an answer that is wrong by however long the round trip
+// took, and wrong again if the two clocks disagree.
+func (s *Store) ExpireTimeMillis(key string) (unixMillis int64, hasTTL, ok bool) {
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	e := s.readEntry(sh, key, now)
+	if e == nil {
+		return 0, false, false
+	}
+	if e.expireAt.IsZero() {
+		return 0, false, true
+	}
+	return e.expireAt.UnixMilli(), true, true
+}
+
 // RandomKey returns an arbitrary live key. ok is false only when the store holds
 // no live keys at all.
 //
@@ -208,6 +231,10 @@ func (s *Store) SetIdleSeconds(key string, secs int64) bool {
 // content thresholds Redis switches its representations at: a client that asks in
 // order to decide whether a value is still cheap to scan gets the answer it
 // expects, even though this store uses one representation per type throughout.
+//
+// The thresholds are the configured ones (see encoding.go), not constants, because
+// they are configurable in Redis and a caller that lowers one expects the reported
+// name to follow.
 func (s *Store) Encoding(key string) (string, bool) {
 	sh := s.getShard(key)
 	now := s.clock()
@@ -234,39 +261,49 @@ func (s *Store) Encoding(key string) (string, bool) {
 		}
 		return "raw", true
 	case kindList:
-		if e.list.len() <= 128 {
-			return "listpack", true
+		var bytes int64
+		for el := e.list.l.Front(); el != nil; el = el.Next() {
+			bytes += int64(len(el.Value.([]byte)))
 		}
-		return "quicklist", true
+		if listExceedsListpack(s.encoding[ListMaxListpackSize].Load(), e.list.len(), bytes) {
+			return "quicklist", true
+		}
+		return "listpack", true
 	case kindHash:
+		maxVal := s.encoding[HashMaxListpackValue].Load()
 		for f, v := range e.dict {
-			if len(f) > 64 || len(v) > 64 {
+			if int64(len(f)) > maxVal || int64(len(v)) > maxVal {
 				return "hashtable", true
 			}
 		}
-		if len(e.dict) <= 128 {
+		if int64(len(e.dict)) <= s.encoding[HashMaxListpackEntries].Load() {
 			return "listpack", true
 		}
 		return "hashtable", true
 	case kindSet:
 		allInts := true
+		var longest int64
 		for m := range e.set {
 			if _, err := strconv.ParseInt(m, 10, 64); err != nil {
 				allInts = false
-				break
+			}
+			if int64(len(m)) > longest {
+				longest = int64(len(m))
 			}
 		}
 		switch {
-		case allInts && len(e.set) <= 512:
+		case allInts && int64(len(e.set)) <= s.encoding[SetMaxIntsetEntries].Load():
 			return "intset", true
-		case len(e.set) <= 128:
+		case int64(len(e.set)) <= s.encoding[SetMaxListpackEntries].Load() &&
+			longest <= s.encoding[SetMaxListpackValue].Load():
 			return "listpack", true
 		}
 		return "hashtable", true
 	case kindZSet:
-		if len(e.zset.dict) <= 128 {
+		if int64(len(e.zset.dict)) <= s.encoding[ZSetMaxListpackEntries].Load() {
+			maxVal := s.encoding[ZSetMaxListpackValue].Load()
 			for m := range e.zset.dict {
-				if len(m) > 64 {
+				if int64(len(m)) > maxVal {
 					return "skiplist", true
 				}
 			}

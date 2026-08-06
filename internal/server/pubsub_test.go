@@ -185,8 +185,10 @@ func TestSubscriberModeRejectsOtherCommands(t *testing.T) {
 		}
 	}
 	// The allowed ones still work.
-	if got := c.cmd("PING"); got != "+PONG" {
-		t.Errorf("PING in subscriber mode = %q", got)
+	// A subscribed RESP2 connection's PING is the two-element ["pong", ""] array Redis sends
+	// there rather than +PONG -- see writeSubscriberPong.
+	if got := c.cmd("PING"); got != "[pong ]" {
+		t.Errorf("PING in subscriber mode = %q; want [pong ]", got)
 	}
 	if got := c.cmd("RESET"); got != "+RESET" {
 		t.Errorf("RESET in subscriber mode = %q", got)

@@ -38,10 +38,16 @@ const (
 	notifyExpired                          // x: a key reaching its deadline
 	notifyEvicted                          // e: a key removed by the eviction policy
 	notifyStream                           // t: XADD, XTRIM, XGROUP-CREATE, ...
+	notifyNew                              // n: a key coming into existence
 )
 
-// notifyAll is Redis's "A": every class except the K/E delivery selectors, which say
-// where events go rather than which events exist.
+// notifyAll is Redis's "A": every class except the K/E delivery selectors (which say where
+// events go rather than which events exist) and except "n".
+//
+// "n" is excluded on purpose, in Redis and here. It reports a key *coming into existence*,
+// which is not a class of command but a property every creating write has, so it would fire
+// alongside almost every other event and double the traffic of "A" for a caller who almost
+// certainly did not ask for that. Redis's NOTIFY_ALL leaves it out with the same reasoning.
 const notifyAll = notifyGeneric | notifyString | notifyList | notifySet | notifyHash |
 	notifyZSet | notifyExpired | notifyEvicted | notifyStream
 
@@ -58,6 +64,7 @@ var notifyClasses = map[byte]notifyFlags{
 	'x': notifyExpired,
 	'e': notifyEvicted,
 	't': notifyStream,
+	'n': notifyNew,
 	'A': notifyAll,
 }
 
@@ -69,7 +76,7 @@ var notifyOrder = []struct {
 }{
 	{'g', notifyGeneric}, {'$', notifyString}, {'l', notifyList}, {'s', notifySet},
 	{'h', notifyHash}, {'z', notifyZSet}, {'x', notifyExpired}, {'e', notifyEvicted},
-	{'t', notifyStream}, {'K', notifyKeyspace}, {'E', notifyKeyevent},
+	{'t', notifyStream}, {'n', notifyNew}, {'K', notifyKeyspace}, {'E', notifyKeyevent},
 }
 
 // parseNotifyFlags parses a notify-keyspace-events specification, returning the flags
@@ -110,7 +117,7 @@ func (f notifyFlags) String() string {
 }
 
 // SetNotifyKeyspaceEvents enables the given notification classes, using Redis's flag
-// characters (K, E, g, $, l, s, h, z, x, e, A). An empty string disables
+// characters (K, E, g, $, l, s, h, z, x, e, t, n, A). An empty string disables
 // notifications, which is the default. It reports whether the specification was valid,
 // and leaves the current setting untouched when it was not.
 //
@@ -329,6 +336,54 @@ func (s *Server) notifyKeyspaceEvent(flags, class notifyFlags, event, key string
 	}
 	if flags&notifyKeyevent != 0 {
 		s.publishMessage("__keyevent@"+db+"__:"+event, []byte(key))
+	}
+}
+
+// newKeyWatch is the set of keys a write is about to touch that do not yet exist, captured
+// before the write runs. It is nil -- and costs nothing to produce -- unless the "n" class
+// is enabled.
+type newKeyWatch []string
+
+// watchNewKeys records which of a write's keys are absent, so that afterwards the ones that
+// have appeared can be reported as created.
+//
+// It is the only place in the notification surface that needs to look at the keyspace
+// *before* a command runs, and the reason is that "this key is new" is not a property of any
+// command: SET creates a key or overwrites one, and only the previous state distinguishes
+// the two. Redis knows the answer for free because its dbAdd is the single place a key is
+// inserted; here the write goes through whichever store method the type needs, so the
+// question has to be asked from outside.
+//
+// The cost is one existence probe per key, and it is paid only while the "n" class is on --
+// which is off by default and is excluded from "A", so the ordinary write path is one
+// atomic load away from this whole mechanism (invariant 12).
+func (s *Server) watchNewKeys(args [][]byte) newKeyWatch {
+	if notifyFlags(s.notifyFlags.Load())&notifyNew == 0 {
+		return nil
+	}
+	name := strings.ToUpper(string(args[0]))
+	var out newKeyWatch
+	for _, key := range affectedKeys(name, args) {
+		if !s.store.Exists(key) {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// notifyNewKeys reports every watched key that now exists as a "new" event.
+//
+// It fires before the command's own event, which is the order Redis uses: a consumer sees
+// the key appear and then sees what was done to it, rather than the other way round.
+func (s *Server) notifyNewKeys(w newKeyWatch) {
+	if len(w) == 0 {
+		return
+	}
+	flags := notifyFlags(s.notifyFlags.Load())
+	for _, key := range w {
+		if s.store.Exists(key) {
+			s.notifyKeyspaceEvent(flags, notifyNew, "new", key)
+		}
 	}
 }
 

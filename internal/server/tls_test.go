@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
@@ -203,8 +204,12 @@ func TestIncompleteTLSOptionsAreRejected(t *testing.T) {
 		{"cert without key", TLSOptions{CertFile: certPath}},
 		{"key without cert", TLSOptions{KeyFile: keyPath}},
 	} {
-		if _, err := tc.opts.ServerTLSConfig(); err == nil {
-			t.Errorf("%s: ServerTLSConfig succeeded; want ErrIncompleteTLS", tc.name)
+		// errors.Is against the sentinel, not merely err != nil: the message named
+		// ErrIncompleteTLS while accepting *any* failure, so an unreadable or malformed
+		// certificate -- a bug in writeSelfSignedCert, say -- would have satisfied the
+		// assertion that half-configured TLS is what got refused.
+		if _, err := tc.opts.ServerTLSConfig(); !errors.Is(err, ErrIncompleteTLS) {
+			t.Errorf("%s: ServerTLSConfig error = %v; want ErrIncompleteTLS", tc.name, err)
 		}
 		if !tc.opts.Enabled() {
 			t.Errorf("%s: Enabled() = false; half-configured TLS still means TLS was asked for", tc.name)

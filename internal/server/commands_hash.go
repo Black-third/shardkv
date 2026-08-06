@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"strings"
 
 	"github.com/Black-third/shardkv/internal/resp"
@@ -21,6 +22,9 @@ func init() {
 	register("HINCRBY", 4, true, cmdHIncrBy)
 	registerEffect("HINCRBYFLOAT", 4, cmdHIncrByFloat)
 	register("HRANDFIELD", -2, false, cmdHRandField)
+	// HMSET is HSET's predecessor: identical behaviour, a +OK reply instead of a count.
+	// Deprecated since 4.0 and still what a great deal of code sends.
+	register("HMSET", -4, true, cmdHMSet)
 }
 
 func cmdHSet(s *Server, w *resp.Writer, args [][]byte) bool {
@@ -38,6 +42,30 @@ func cmdHSet(s *Server, w *resp.Writer, args [][]byte) bool {
 		return false
 	}
 	w.WriteInt(int64(created))
+	return true
+}
+
+// cmdHMSet is HSET with Redis's older reply: +OK rather than the number of fields
+// created. It exists because HMSET is what a decade of client code and examples send, and
+// because a server that answers "unknown command" to it looks broken rather than modern.
+//
+// The arity is -4 rather than HSET's -3: HMSET has no single-pair-less form at all, so
+// `HMSET key` is an arity error while `HSET key` is one too, by the same rule stated
+// differently.
+func cmdHMSet(s *Server, w *resp.Writer, args [][]byte) bool {
+	if len(args)%2 != 0 {
+		w.WriteError("ERR wrong number of arguments for 'hmset' command")
+		return false
+	}
+	pairs := make([][2][]byte, 0, (len(args)-2)/2)
+	for i := 2; i < len(args); i += 2 {
+		pairs = append(pairs, [2][]byte{args[i], args[i+1]})
+	}
+	if _, err := s.store.HSet(string(args[1]), pairs...); err != nil {
+		writeStoreErr(w, err)
+		return false
+	}
+	w.WriteSimple("OK")
 	return true
 }
 
@@ -188,22 +216,29 @@ func cmdHIncrBy(s *Server, w *resp.Writer, args [][]byte) bool {
 // cannot drift, while replaying an addition relies on the replica reproducing the
 // master's floating-point arithmetic exactly.
 func cmdHIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
-	// Infinities in, NaN out -- see cmdIncrByFloat: an infinite operand parses, so the
-	// infinity is reported against the result it produces rather than against an operand
-	// that was well formed.
 	delta, ok := parseScore(args[3])
 	if !ok {
 		w.WriteError("ERR value is not a valid float")
 		return nil
 	}
-	f, err := s.store.HIncrByFloat(string(args[1]), string(args[2]), delta)
+	// An infinite *operand* is refused here, and named as the operand. That is where
+	// HINCRBYFLOAT differs from INCRBYFLOAT, which lets an infinity through and reports it
+	// against the result: Redis checks the operand in one and not the other, with two
+	// different messages, and its own hash test asserts on this one. The result is still
+	// checked in the store, which is what catches inf + -inf.
+	if math.IsInf(delta, 0) || math.IsNaN(delta) {
+		w.WriteError("ERR value is NaN or Infinity")
+		return nil
+	}
+	// The stored text is what is replied and what is propagated -- see cmdIncrByFloat for
+	// why re-formatting the float here was wrong.
+	_, val, err := s.store.HIncrByFloat(string(args[1]), string(args[2]), delta)
 	if err != nil {
 		writeStoreErr(w, err)
 		return nil
 	}
-	val := []byte(formatFloat(f))
-	w.WriteBulk(val)
-	return [][][]byte{{[]byte("HSET"), args[1], args[2], val}}
+	w.WriteBulk([]byte(val))
+	return [][][]byte{{[]byte("HSET"), args[1], args[2], []byte(val)}}
 }
 
 // cmdHRandField implements HRANDFIELD key [count [WITHVALUES]]. It is a read, so
@@ -228,11 +263,8 @@ func cmdHRandField(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteBulk(fields[0])
 		return false
 	}
-	count, ok := parseInt(args[2])
-	if !ok {
-		w.WriteError("ERR value is not an integer or out of range")
-		return false
-	}
+	// WITHVALUES is read before the count, because it halves the range the count may take:
+	// the reply carries a value per field, so Redis refuses at half the magnitude.
 	withValues := false
 	if len(args) == 4 {
 		if !strings.EqualFold(string(args[3]), "WITHVALUES") {
@@ -240,6 +272,11 @@ func cmdHRandField(s *Server, w *resp.Writer, args [][]byte) bool {
 			return false
 		}
 		withValues = true
+	}
+	count, errMsg := parseRandomCount(args[2], withValues)
+	if errMsg != "" {
+		w.WriteError(errMsg)
+		return false
 	}
 	out, err := s.store.HRandField(string(args[1]), count, withValues)
 	if err != nil {

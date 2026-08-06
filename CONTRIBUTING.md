@@ -150,8 +150,9 @@ the tests it names.** In one line each:
    *and* the propagation; lock order `propMu` → `mu`).
 2. The `write` flag drives durability, and a handler's `dirty` return decides whether a
    write is actually propagated.
-3. Deadlines are absolute on the wire (`propagationForm` rewrites relative TTLs), and
-   "now" always comes from `store.Now()`.
+3. Deadlines are absolute on the wire, derived from exactly one `store.Now()` reading —
+   the handler resolves the deadline and returns the absolute wire form built from that
+   same value; nothing on the propagation path reads a clock.
 4. Non-deterministic commands propagate their *effect*, not their text — including
    everything whose result depends on the clock.
 5. `Dump()` output must be replayable, chunked so no command exceeds the protocol's
@@ -181,7 +182,9 @@ The checklist, in order:
 2. **Handler** in the matching `internal/server/commands_*.go`, registered with the
    right arity and `write` flag — `registerEffect` instead if the result depends on
    randomness, map iteration order or the clock (invariant 4).
-3. **Relative expiry?** Add its rewrite to `propagationForm` (invariant 3).
+3. **Relative expiry?** Register it with `registerEffect` and return the absolute wire
+   form built from the deadline the handler already resolved — never from a second clock
+   reading (invariant 3).
 4. **More than one key?** Add it to `affectedKeys`, and to `crossDBTarget` if it writes
    a second database (invariants 7 and 8).
 5. **Test it at the wire level**: happy path, missing key, empty collection, wrong type,

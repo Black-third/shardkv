@@ -22,6 +22,23 @@ type scanOpts struct {
 	pattern    string
 	hasPattern bool
 	count      int
+	// typeFilter keeps only keys of that data type, for SCAN's TYPE option. It is the
+	// name TYPE reports (string/list/set/zset/hash/stream), matched case-insensitively as
+	// Redis matches it.
+	typeFilter string
+	// noValues drops the value from each pair, for HSCAN's NOVALUES option: a caller
+	// enumerating a hash's field names should not have to receive -- and pay to transfer
+	// -- every value alongside them.
+	noValues bool
+}
+
+// scanFlags says which of the options above the calling command accepts. TYPE is SCAN's
+// alone (a collection has one type, so filtering its elements by one is meaningless) and
+// NOVALUES is HSCAN's alone (only a hash has values to omit). Passing either to the wrong
+// command is a syntax error, which is Redis's answer too.
+type scanFlags struct {
+	allowType     bool
+	allowNoValues bool
 }
 
 // parseScanOpts parses the option tail of a cursor command, returning the RESP
@@ -29,13 +46,20 @@ type scanOpts struct {
 //
 // The options are strictly name/value pairs: a trailing name with no value, or one
 // stray extra argument, is a syntax error rather than something to ignore.
-func parseScanOpts(tail [][]byte) (scanOpts, string) {
+func parseScanOpts(tail [][]byte, f scanFlags) (scanOpts, string) {
 	o := scanOpts{count: 10}
-	if len(tail)%2 != 0 {
-		return o, "ERR syntax error"
-	}
-	for i := 0; i < len(tail); i += 2 {
-		switch strings.ToUpper(string(tail[i])) {
+	for i := 0; i < len(tail); i++ {
+		name := strings.ToUpper(string(tail[i]))
+		// NOVALUES is the one option with no operand, so the "options are name/value
+		// pairs" shortcut no longer holds and each option consumes what it needs.
+		if name == "NOVALUES" && f.allowNoValues {
+			o.noValues = true
+			continue
+		}
+		if i+1 >= len(tail) {
+			return o, "ERR syntax error"
+		}
+		switch name {
 		case "MATCH":
 			o.pattern = string(tail[i+1])
 			o.hasPattern = true
@@ -48,9 +72,15 @@ func parseScanOpts(tail [][]byte) (scanOpts, string) {
 				return o, "ERR syntax error"
 			}
 			o.count = int(min(n, math.MaxInt32))
+		case "TYPE":
+			if !f.allowType {
+				return o, "ERR syntax error"
+			}
+			o.typeFilter = strings.ToLower(string(tail[i+1]))
 		default:
 			return o, "ERR syntax error"
 		}
+		i++
 	}
 	return o, ""
 }
@@ -63,19 +93,31 @@ func cmdScan(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteError("ERR invalid cursor")
 		return false
 	}
-	o, errMsg := parseScanOpts(args[2:])
+	o, errMsg := parseScanOpts(args[2:], scanFlags{allowType: true})
 	if errMsg != "" {
 		w.WriteError(errMsg)
 		return false
 	}
 
 	keys, next := s.store.Scan(cursor, o.count)
-	if o.hasPattern {
+	if o.hasPattern || o.typeFilter != "" {
 		filtered := keys[:0]
 		for _, k := range keys {
-			if globMatch(o.pattern, k) {
-				filtered = append(filtered, k)
+			if o.hasPattern && !globMatch(o.pattern, k) {
+				continue
 			}
+			// The type is looked up per surviving key rather than returned by the walk, so
+			// MATCH is applied first: a pattern that rejects a key saves the lookup. An
+			// unknown type name is not an error -- it simply matches nothing, which is what
+			// Redis does, since the set of type names is a property of the server and not
+			// of the request.
+			if o.typeFilter != "" {
+				typ, ok := s.store.Type(k)
+				if !ok || typ != o.typeFilter {
+					continue
+				}
+			}
+			filtered = append(filtered, k)
 		}
 		keys = filtered
 	}
@@ -83,10 +125,11 @@ func cmdScan(s *Server, w *resp.Writer, args [][]byte) bool {
 	return false
 }
 
-// cmdHScan implements HSCAN key cursor [MATCH pattern] [COUNT n], whose elements
-// are flattened field/value pairs. MATCH filters on the field name.
+// cmdHScan implements HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES], whose
+// elements are flattened field/value pairs -- or the field names alone under NOVALUES.
+// MATCH filters on the field name either way.
 func cmdHScan(s *Server, w *resp.Writer, args [][]byte) bool {
-	return collectionScan(s, w, args, func(key string) ([]string, error) {
+	return collectionScan(s, w, args, scanFlags{allowNoValues: true}, func(key string) ([]string, error) {
 		flat, err := s.store.HGetAll(key)
 		if err != nil {
 			return nil, err
@@ -101,7 +144,7 @@ func cmdHScan(s *Server, w *resp.Writer, args [][]byte) bool {
 
 // cmdSScan implements SSCAN key cursor [MATCH pattern] [COUNT n].
 func cmdSScan(s *Server, w *resp.Writer, args [][]byte) bool {
-	return collectionScan(s, w, args, func(key string) ([]string, error) {
+	return collectionScan(s, w, args, scanFlags{}, func(key string) ([]string, error) {
 		return s.store.SMembers(key)
 	}, 1)
 }
@@ -109,7 +152,7 @@ func cmdSScan(s *Server, w *resp.Writer, args [][]byte) bool {
 // cmdZScan implements ZSCAN key cursor [MATCH pattern] [COUNT n], whose elements are
 // flattened member/score pairs. MATCH filters on the member.
 func cmdZScan(s *Server, w *resp.Writer, args [][]byte) bool {
-	return collectionScan(s, w, args, func(key string) ([]string, error) {
+	return collectionScan(s, w, args, scanFlags{}, func(key string) ([]string, error) {
 		members, err := s.store.ZRange(key, 0, -1)
 		if err != nil {
 			return nil, err
@@ -134,13 +177,23 @@ func cmdZScan(s *Server, w *resp.Writer, args [][]byte) bool {
 // present for the whole iteration is returned at least once). Returning everything
 // at once satisfies that guarantee trivially. Any non-zero cursor therefore means
 // the iteration is already complete and yields an empty batch.
-func collectionScan(s *Server, w *resp.Writer, args [][]byte, elems func(string) ([]string, error), stride int) bool {
+func collectionScan(s *Server, w *resp.Writer, args [][]byte, f scanFlags,
+	elems func(string) ([]string, error), stride int) bool {
 	cursor, err := strconv.ParseUint(string(args[2]), 10, 64)
 	if err != nil {
 		w.WriteError("ERR invalid cursor")
 		return false
 	}
-	o, errMsg := parseScanOpts(args[3:])
+	// The collection is read -- and so its type checked -- *before* the options are
+	// parsed, which is the order Redis uses and an order that is visible: SSCAN on a list
+	// with a bogus option answers WRONGTYPE, not "syntax error". Checked side by side
+	// against redis:7.2.
+	items, err := elems(string(args[1]))
+	if err != nil {
+		writeStoreErr(w, err)
+		return false
+	}
+	o, errMsg := parseScanOpts(args[3:], f)
 	if errMsg != "" {
 		w.WriteError(errMsg)
 		return false
@@ -149,10 +202,15 @@ func collectionScan(s *Server, w *resp.Writer, args [][]byte, elems func(string)
 		writeScanReply(w, 0, nil)
 		return false
 	}
-	items, err := elems(string(args[1]))
-	if err != nil {
-		writeStoreErr(w, err)
-		return false
+	if o.noValues {
+		// Drop the value of each pair and narrow the stride to one, so MATCH still filters on
+		// the field name and the reply is field names alone.
+		kept := items[:0]
+		for i := 0; i+stride <= len(items); i += stride {
+			kept = append(kept, items[i])
+		}
+		items = kept
+		stride = 1
 	}
 	if o.hasPattern {
 		matched := make([]string, 0, len(items))

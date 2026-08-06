@@ -1,6 +1,24 @@
 package server
 
-import "testing"
+import (
+	"sort"
+	"strings"
+	"testing"
+)
+
+// replyMembers parses an array reply into its elements, sorted, so a reply whose order
+// comes from map iteration can be compared for contents *and* counted. arrayFields joins
+// with commas, which makes it unusable for counting -- splitting its result on spaces
+// yields one field for any non-empty reply.
+func replyMembers(reply string) []string {
+	inner := reply
+	if len(inner) >= 2 && inner[0] == '[' {
+		inner = inner[1 : len(inner)-1]
+	}
+	f := splitSpace(inner)
+	sort.Strings(f)
+	return f
+}
 
 // TestSetRandomCommands covers SPOP and SRANDMEMBER: the same random draw, one
 // destructive and one not, with reply shapes that differ between the bare and the
@@ -48,14 +66,28 @@ func TestSetRandomCommands(t *testing.T) {
 	}
 
 	// SPOP with a count removes exactly that many, and takes the key with the last.
-	if got := arrayFields(c.cmd("SPOP s 2")); len(splitSpace(got)) == 0 {
-		t.Errorf("SPOP s 2 returned nothing")
+	//
+	// The members come back in map order, so the reply is compared as a set -- but it is
+	// compared for its *contents*, which is what the two assertions here used to miss.
+	// The first counted `splitSpace` over an arrayFields result, and arrayFields joins with
+	// commas: the count was 1 for every non-empty reply, so "returned nothing" was the only
+	// reachable failure. The second asked for len(reply) >= 3, which "-WRONGTYPE ..." also
+	// satisfies. Between them the two SPOPs must yield exactly the three members added.
+	first := replyMembers(c.cmd("SPOP s 2"))
+	if len(first) != 2 {
+		t.Errorf("SPOP s 2 returned %d members (%v); want 2", len(first), first)
 	}
 	if got := c.cmd("SCARD s"); got != ":1" {
 		t.Errorf("SCARD after SPOP 2 = %q; want :1", got)
 	}
-	if got := c.cmd("SPOP s 10"); len(got) < 3 {
-		t.Errorf("SPOP s 10 = %q; want the rest of the set", got)
+	rest := replyMembers(c.cmd("SPOP s 10"))
+	if len(rest) != 1 {
+		t.Errorf("SPOP s 10 over a one-member set returned %d members (%v); want 1", len(rest), rest)
+	}
+	drawn := append(append([]string{}, first...), rest...)
+	sort.Strings(drawn)
+	if got := strings.Join(drawn, ","); got != "a,b,c" {
+		t.Errorf("the two SPOPs drew %q; want exactly a, b and c once each", got)
 	}
 	if got := c.cmd("EXISTS s"); got != ":0" {
 		t.Errorf("emptied set still exists: %q", got)

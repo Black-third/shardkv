@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -179,4 +180,121 @@ func TestReplicaRejectsEveryWriteCommand(t *testing.T) {
 			t.Errorf("%s on a replica = %q; want the READONLY error", name, got)
 		}
 	}
+}
+
+// TestNewWritesConvergeOnReplica covers the writes added with the sorted-set algebra,
+// SORT ... STORE and the radius searches' STORE forms.
+//
+// Every one of them is propagated *verbatim*, which is a claim rather than an assumption:
+// each is a pure function of the dataset the replica already has, because the orderings
+// they produce break ties by the element itself rather than by a hash table's iteration
+// (see commands_sort.go and store.sortedMembers). This is the test that the claim holds --
+// a replica that recomputed a different order would show up here as a different key.
+func TestNewWritesConvergeOnReplica(t *testing.T) {
+	_, masterAddr, stopM := startServer(t, store.New(8))
+	defer stopM()
+	master := dialTx(t, masterAddr)
+	defer master.close()
+
+	replicaSrv, replicaAddr, stopR := startServer(t, store.New(8))
+	defer stopR()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replicaSrv.ReplicaOf(ctx, masterAddr)
+
+	replica := dialTx(t, replicaAddr)
+	defer replica.close()
+
+	master.cmd("SET sentinel 1")
+	waitFor(t, "the replica to attach", func() bool { return replica.cmd("GET sentinel") == "1" })
+
+	for _, cmd := range []string{
+		"ZADD z1 1 a 2 b 3 c",
+		"ZADD z2 1 a 5 d",
+		"SADD plain a e",
+		"ZUNIONSTORE u 3 z1 z2 plain WEIGHTS 1 2 3 AGGREGATE MAX",
+		"ZINTERSTORE i 2 z1 z2",
+		"ZDIFFSTORE df 2 z1 z2",
+		"ZRANGESTORE rs z1 1 2",
+		"ZREMRANGEBYLEX z2 [a [a",
+		"RPUSH ml 3 1 2",
+		"MSET weight_1 10 weight_2 5 weight_3 1",
+		"SORT ml BY weight_* STORE sorted",
+		"SADD unordered 3 1 2",
+		"SORT unordered BY nosort STORE forced",
+		"GEOADD Sicily 13.361389 38.115556 Palermo 15.087269 37.502669 Catania",
+		"GEORADIUS Sicily 15 37 200 km STORE geostore",
+		"GEORADIUS Sicily 15 37 200 km STOREDIST geodist",
+		"LPUSHX ml 9",
+		"RPUSHX nolist 9",
+		"HMSET h f v g w",
+		"SETBIT bits 100 1",
+		"BITFIELD counters SET u8 0 250 INCRBY u8 0 10",
+	} {
+		if reply := master.cmd(cmd); strings.HasPrefix(reply, "-") {
+			t.Fatalf("%q on the master -> %s", cmd, reply)
+		}
+	}
+
+	// Every key the sequence produced has to read identically on both sides. The zero-score
+	// and tie cases are the interesting ones: "forced" comes from a *set*, whose iteration
+	// order is random per walk, so it only matches if the alphabetic ordering was applied.
+	checks := []string{
+		"ZRANGE u 0 -1 WITHSCORES",
+		"ZRANGE i 0 -1 WITHSCORES",
+		"ZRANGE df 0 -1 WITHSCORES",
+		"ZRANGE rs 0 -1 WITHSCORES",
+		"ZRANGE z2 0 -1 WITHSCORES",
+		"LRANGE sorted 0 -1",
+		"LRANGE forced 0 -1",
+		"ZRANGE geostore 0 -1 WITHSCORES",
+		"ZRANGE geodist 0 -1 WITHSCORES",
+		"LRANGE ml 0 -1",
+		"EXISTS nolist",
+		"HGETALL h",
+		"GET bits",
+		"BITFIELD_RO counters GET u8 0",
+	}
+	waitFor(t, "the replica to catch up", func() bool {
+		return replica.cmd("BITFIELD_RO counters GET u8 0") == master.cmd("BITFIELD_RO counters GET u8 0")
+	})
+	for _, q := range checks {
+		want := master.cmd(q)
+		got := replica.cmd(q)
+		// A hash and a set have no order, and Go randomises map iteration, so comparing
+		// the two replies as strings is a coin flip that says "diverged" when the copies
+		// agree perfectly. Convergence here means the same *elements*; the commands whose
+		// order is part of the answer (ZRANGE, LRANGE) are compared verbatim above and
+		// below by falling through to the string compare.
+		if unorderedReply(q) {
+			if !sameElements(got, want) {
+				t.Errorf("%q: replica %q, master %q (elements differ)", q, got, want)
+			}
+			continue
+		}
+		if got != want {
+			t.Errorf("%q: replica %q, master %q", q, got, want)
+		}
+	}
+}
+
+// unorderedReply reports whether a command's reply is a collection with no defined
+// order, so two agreeing copies may legitimately spell it differently.
+func unorderedReply(q string) bool {
+	switch strings.Fields(strings.ToUpper(q))[0] {
+	case "HGETALL", "HKEYS", "HVALS", "SMEMBERS", "SINTER", "SUNION", "SDIFF", "CONFIG":
+		return true
+	}
+	return false
+}
+
+// sameElements compares two flattened "[a b c]" array replies as multisets.
+func sameElements(a, b string) bool {
+	fa, fb := splitSpace(strings.Trim(a, "[]")), splitSpace(strings.Trim(b, "[]"))
+	if len(fa) != len(fb) {
+		return false
+	}
+	slices.Sort(fa)
+	slices.Sort(fb)
+	return slices.Equal(fa, fb)
 }

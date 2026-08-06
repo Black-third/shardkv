@@ -46,47 +46,58 @@ const maxBitOffset = int64(maxStringLen)*8 - 1
 //
 // A wrong-type key is refused rather than overwritten, which is what makes SETBIT on a
 // list an error instead of a silent replacement.
-func (s *Store) stringForWrite(sh *shard, key string, now time.Time) (*entry, error) {
-	e := sh.liveEntry(key, now)
+// stringForWrite returns the string entry to write into, creating it if absent. created
+// reports that it was not there before, which is one of the two ways a bit command changes
+// the dataset without changing any bit (the other is growing the value); see SetBit.
+func (s *Store) stringForWrite(sh *shard, key string, now time.Time) (e *entry, created bool, err error) {
+	e = sh.liveEntry(key, now)
 	if e != nil {
 		if e.kind != kindString {
-			return nil, ErrWrongType
+			return nil, false, ErrWrongType
 		}
-		return e, nil
+		return e, false, nil
 	}
 	e = &entry{kind: kindString, rawString: true}
 	sh.data[key] = e
-	return e, nil
+	return e, true, nil
 }
 
-// growTo extends the value to at least n bytes, zero-padding.
-func growString(e *entry, n int) {
+// growString extends the value to at least n bytes, zero-padding, and reports whether it
+// had to.
+func growString(e *entry, n int) (grew bool) {
 	if len(e.str) >= n {
-		return
+		return false
 	}
 	grown := make([]byte, n)
 	copy(grown, e.str)
 	e.str = grown
+	return true
 }
 
 // SetBit sets or clears the bit at offset and returns its previous value. A missing key
 // is treated as an empty string and grown as needed; the TTL of an existing key is kept.
-func (s *Store) SetBit(key string, offset int64, on bool) (old int, err error) {
+//
+// changed reports whether the dataset actually changed, which is not the same question as
+// "did the bit flip": creating the key and growing the value are both changes a replica and
+// an AOF replay have to perform even when the bit already had the value asked for. Redis
+// draws the line in exactly those three places, and its own test suite checks it by reading
+// rdb_changes_since_last_save around a SETBIT that sets a bit to the value it already had.
+func (s *Store) SetBit(key string, offset int64, on bool) (old int, changed bool, err error) {
 	if offset < 0 || offset > maxBitOffset {
-		return 0, ErrBitOffset
+		return 0, false, ErrBitOffset
 	}
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	e, err := s.stringForWrite(sh, key, now)
+	e, created, err := s.stringForWrite(sh, key, now)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	byteIdx := int(offset / 8)
 	mask := byte(0x80 >> (offset % 8))
-	growString(e, byteIdx+1)
+	grew := growString(e, byteIdx+1)
 	if e.str[byteIdx]&mask != 0 {
 		old = 1
 	}
@@ -96,7 +107,15 @@ func (s *Store) SetBit(key string, offset int64, on bool) (old int, err error) {
 		e.str[byteIdx] &^= mask
 	}
 	s.touch(e, now)
-	return old, nil
+	return old, created || grew || old != boolToBit(on), nil
+}
+
+// boolToBit is the 0/1 form of a bit value, for comparing the old bit against the new one.
+func boolToBit(on bool) int {
+	if on {
+		return 1
+	}
+	return 0
 }
 
 // GetBit returns the bit at offset, which is 0 for any offset past the end of the value
@@ -465,9 +484,22 @@ func (s *Store) BitField(key string, ops []BitFieldOp) (results []BitFieldResult
 
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e, err := s.stringForWrite(sh, key, now)
+	e, created, err := s.stringForWrite(sh, key, now)
 	if err != nil {
 		return nil, false, err
+	}
+	// The value is grown once, to fit the furthest field any write in the batch reaches,
+	// rather than per operation. That is not only cheaper: "the string was created or
+	// extended" is a property of the whole command in Redis, and every write in a command
+	// that extended it counts as a change even if it wrote the value already there. Doing
+	// it per operation would make the answer depend on the order the fields appear in.
+	widened := created
+	for _, op := range ops {
+		if op.Kind != BitFieldGet {
+			if growString(e, bitFieldBytes(op)) {
+				widened = true
+			}
+		}
 	}
 	results = make([]BitFieldResult, 0, len(ops))
 	for _, op := range ops {
@@ -475,7 +507,6 @@ func (s *Store) BitField(key string, ops []BitFieldOp) (results []BitFieldResult
 		case BitFieldGet:
 			results = append(results, BitFieldResult{Value: getBitField(e.str, op), Present: true})
 		case BitFieldSet:
-			growString(e, bitFieldBytes(op))
 			old := getBitField(e.str, op)
 			v, ok := clampBitField(op, op.Value)
 			if !ok {
@@ -483,10 +514,11 @@ func (s *Store) BitField(key string, ops []BitFieldOp) (results []BitFieldResult
 				continue
 			}
 			setBitField(e.str, op, v)
-			changed = true
+			if widened || v != old {
+				changed = true
+			}
 			results = append(results, BitFieldResult{Value: old, Present: true})
 		case BitFieldIncrBy:
-			growString(e, bitFieldBytes(op))
 			cur := getBitField(e.str, op)
 			v, ok := incrBitField(op, cur)
 			if !ok {
@@ -494,15 +526,26 @@ func (s *Store) BitField(key string, ops []BitFieldOp) (results []BitFieldResult
 				continue
 			}
 			setBitField(e.str, op, v)
-			changed = true
+			if widened || v != cur {
+				changed = true
+			}
 			results = append(results, BitFieldResult{Value: v, Present: true})
 		}
 	}
 	if changed {
 		s.touch(e, now)
-	} else if len(e.str) == 0 {
-		// Nothing was written and the key was created by this call: leave no empty value
-		// behind, so a BITFIELD that only failed is indistinguishable from one never run.
+	} else if created {
+		// Nothing changed and the key was created by this call, so leave no value behind: a
+		// BITFIELD whose every operation was refused by OVERFLOW FAIL is indistinguishable
+		// from one never run.
+		//
+		// Real Redis leaves the zero-filled key in place here, and it is worth saying why
+		// this deliberately does not. Redis does not count that creation as a change either,
+		// so the key it leaves in memory is never propagated -- a master and its replica
+		// disagree about whether the key exists, permanently and silently, which is exactly
+		// the failure mode invariant 2 exists to prevent. Removing it keeps memory, the AOF
+		// and every replica saying the same thing. The visible difference is one EXISTS
+		// answer after a BITFIELD that did nothing.
 		delete(sh.data, key)
 	}
 	return results, changed, nil

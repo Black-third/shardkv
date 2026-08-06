@@ -37,6 +37,16 @@ linters:
 
   exclusions:
     rules:
+      # ST1005 wants error strings uncapitalized, which is right for Go errors and wrong
+      # for these: the sentinels in internal/store carry the *protocol* text a client
+      # receives, and client libraries match on it exactly. Redis spells several of them
+      # with a capital ("The specified keys must contain string values", "WRONGTYPE ..."),
+      # so obeying the convention here would mean answering differently from Redis in
+      # order to look more idiomatic.
+      - path: internal/store/.*\.go
+        linters:
+          - staticcheck
+        text: 'ST1005'
       # Tests deliberately ignore errors on setup paths and reuse fixture helpers.
       - path: _test\.go
         linters:

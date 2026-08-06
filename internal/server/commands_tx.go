@@ -77,15 +77,34 @@ func (s *Server) executeCommand(sess *session, w *resp.Writer, args [][]byte) *c
 	// allowing ordinary commands would leave the client unable to demultiplex its own
 	// stream. RESP3 delivers messages as push frames, so the restriction does not
 	// apply: a RESP3 client may stay subscribed and keep issuing ordinary commands.
-	if w.Proto() < resp.ProtoRESP3 && sess.inSubscriberMode() && !subscriberCommands[name] {
-		w.WriteError("ERR Can't execute '" + strings.ToLower(name) +
-			"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context")
-		return reject(cmd)
+	if w.Proto() < resp.ProtoRESP3 && sess.inSubscriberMode() {
+		if !subscriberCommands[name] {
+			w.WriteError("ERR Can't execute '" + strings.ToLower(name) +
+				"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context")
+			return reject(cmd)
+		}
+		// A RESP2 subscriber's PING is answered as a two-element ["pong", <payload>] array
+		// rather than +PONG, which is Redis's behaviour and not a quirk: a subscribed RESP2
+		// client is demultiplexing one stream by shape, and a simple string would be the only
+		// reply in it that does not look like a message. RESP3 subscribers get the ordinary
+		// +PONG, because their messages are tagged push frames.
+		//
+		// It is answered here, beside the gate that knows this connection is a RESP2
+		// subscriber, rather than in cmdPing: PING has to stay an ordinary table command so
+		// that MULTI can queue it, and an ordinary handler is deliberately given no session.
+		if name == "PING" {
+			sess.lastActive.Store(time.Now().UnixNano())
+			writeSubscriberPong(w, args)
+			return cmd
+		}
 	}
 	sess.lastActive.Store(time.Now().UnixNano())
 	if cmd != nil {
-		// The interned table name, so recording it for CLIENT LIST costs no allocation.
-		sess.lastCmd.Store(&cmd.lowerName)
+		// The interned table name, so recording it for CLIENT LIST costs no allocation. For a
+		// container command it is the subcommand's qualified name ("client|list"), which is
+		// what Redis puts in that field -- and the field exists to say what a connection is
+		// doing, which "client" does not.
+		sess.lastCmd.Store(&cmd.statsTarget(args).lowerName)
 	}
 	// Every monitor sees the command from here: past the gates (so a refused
 	// authentication is not echoed as though it had run) and before it executes, which is
@@ -220,7 +239,14 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 	}
 	queued := sess.queued
 	queueErr := sess.queueErr
-	aborted := sess.dirty.Load()
+	// A watched key that has *expired* since it was watched aborts the transaction too, and
+	// it has to be checked here rather than reported by a hook: a key whose deadline has
+	// passed is already invisible to every read, but nothing has removed it yet, so there is
+	// no event to invalidate the WATCH with until the janitor gets to it. Redis checks the
+	// same thing at EXEC (isWatchedKeyExpired) for the same reason, and without it a
+	// transaction guarding "this key still has a TTL left" commits on top of a key that is
+	// gone.
+	aborted := sess.dirty.Load() || s.watchedKeyExpired(sess)
 
 	// Reset transaction + watch state before running, so the batch's own writes
 	// don't mark this session dirty.
@@ -251,11 +277,11 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 		}()
 	}
 
-	// One clock reading for the whole batch: the transaction applies as a single
-	// instant, and reading the store's clock (not time.Now) keeps the deadlines it
-	// propagates identical to the ones its handlers wrote to memory.
-	now := s.store.Now()
-
+	// No clock is read here, deliberately. A batch-wide reading was taken before the loop
+	// and used to rebuild the wire form of every queued expiry -- so each queued handler's
+	// own reading, taken later, wrote a *different* instant to memory, and the skew grew
+	// with a command's position in the batch. Each handler now returns the absolute form
+	// built from the one reading it took, and EXEC only collects it (see wireForm).
 	w.WriteArrayHeader(len(queued))
 	var batch [][][]byte
 	var changed [][][]byte
@@ -266,9 +292,11 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 		// own entry in commandstats then reads as the cost of the batch as a unit while the
 		// members still report their individual latencies.
 		cmdStart, cmdErrs := observeStart(w)
+		created := s.watchNewKeys(cmd)
 		dirty, effect := c.apply(s, w, cmd)
-		c.record(time.Since(cmdStart), w.ErrorsWritten() != cmdErrs)
+		c.statsTarget(cmd).record(time.Since(cmdStart), w.ErrorsWritten() != cmdErrs)
 		if c.write && dirty {
+			s.noteDirty(1)
 			// A blocking command inside a transaction reports what it actually did, for the
 			// same reason it does outside one: its own arguments name candidate keys, its
 			// effect names the key that changed. (It cannot have blocked -- see apply.)
@@ -276,13 +304,14 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 			if c.block != nil {
 				observed = effect
 			}
+			s.notifyNewKeys(created)
 			for _, o := range observed {
 				s.touchWatchers(o)
 				s.notifyWrite(o)
 			}
 			changed = append(changed, observed...)
 			if propagating {
-				batch = append(batch, wireForm(cmd, effect, now)...)
+				batch = append(batch, wireForm(cmd, effect)...)
 			}
 		}
 	}
@@ -305,12 +334,16 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 func (s *Server) watchKey(sess *session, key string) {
 	k := dbKey{db: s.db, key: key}
 	if sess.watched == nil {
-		sess.watched = make(map[dbKey]struct{})
+		sess.watched = make(map[dbKey]bool)
 	}
 	if _, ok := sess.watched[k]; ok {
 		return
 	}
-	sess.watched[k] = struct{}{}
+	// Whether the key was live *when it was watched* is what makes the expiry check at EXEC
+	// meaningful: a key that was already gone cannot expire during the transaction, and
+	// treating it as though it had would abort every transaction that watched a key it
+	// expected to be absent.
+	sess.watched[k] = s.store.Exists(key)
 
 	s.watchMu.Lock()
 	if s.watchers[k] == nil {
@@ -338,6 +371,25 @@ func (s *Server) unwatchAll(sess *session) {
 	sess.dirty.Store(false)
 }
 
+// watchedKeyExpired reports whether any key this session watched was live when it was
+// watched and is not live now. It is the EXEC-time half of WATCH invalidation: the other
+// half (a key that was *written*) arrives as an event, while a key that merely reached its
+// deadline produces no event until something reads it or the janitor sweeps it.
+//
+// It costs one map probe per watched key, on EXEC only, and nothing at all for a
+// transaction that watched nothing.
+func (s *Server) watchedKeyExpired(sess *session) bool {
+	for k, wasLive := range sess.watched {
+		if !wasLive || k.db >= len(s.dbs) {
+			continue
+		}
+		if !s.dbs[k.db].Exists(k.key) {
+			return true
+		}
+	}
+	return false
+}
+
 // touchWatchers marks every session watching an affected key as dirty, so a
 // pending EXEC will abort. FLUSHALL invalidates all watchers.
 func (s *Server) touchWatchers(args [][]byte) {
@@ -348,19 +400,19 @@ func (s *Server) touchWatchers(args [][]byte) {
 	if len(s.watchers) == 0 {
 		return
 	}
-	// FLUSHALL empties every database, so every WATCH anywhere is invalidated;
-	// FLUSHDB empties one, so only that database's watchers are.
-	if name == "FLUSHALL" {
-		for _, sessions := range s.watchers {
-			for sess := range sessions {
-				sess.dirty.Store(true)
-			}
-		}
-		return
-	}
-	if name == "FLUSHDB" {
+	// A flush invalidates a WATCH only on a key that was actually *there* to be emptied.
+	// FLUSHALL reaches every database and FLUSHDB only this one, but in both cases a client
+	// watching a key that did not exist has had nothing taken from it -- and aborting its
+	// transaction would make FLUSHALL a way to fail every open transaction on the server
+	// regardless of what it touched. Redis makes the same distinction (touchAllWatchedKeysInDb
+	// tests each watched key for existence), and its own test checks that the unaffected
+	// transaction still commits.
+	if name == "FLUSHALL" || name == "FLUSHDB" {
 		for k, sessions := range s.watchers {
-			if k.db != s.db {
+			if name == "FLUSHDB" && k.db != s.db {
+				continue
+			}
+			if k.db >= len(s.dbs) || !s.dbs[k.db].Exists(k.key) {
 				continue
 			}
 			for sess := range sessions {
@@ -413,6 +465,29 @@ func (s *Server) affectedDBKeys(name string, args [][]byte) []dbKey {
 		out = append(out, dbKey{db: other, key: key})
 	}
 	return out
+}
+
+// georadiusKeys returns the keys GEORADIUS and GEORADIUSBYMEMBER touch: the source they
+// search, plus the destination of a STORE or STOREDIST clause if there is one.
+//
+// The destination is found by scanning for the keyword rather than by position, because
+// the options between it and the source are variable in both number and shape. Scanning
+// can over-report -- a member literally named "STORE" would be searched for, not stored to
+// -- and that is the safe direction: an extra key costs a spurious WATCH invalidation,
+// while a missing one loses a real conflict, and only one of those two failures is silent.
+func georadiusKeys(args [][]byte) []string {
+	if len(args) < 2 {
+		return nil
+	}
+	keys := []string{string(args[1])}
+	for i := 2; i+1 < len(args); i++ {
+		switch strings.ToUpper(string(args[i])) {
+		case "STORE", "STOREDIST":
+			keys = append(keys, string(args[i+1]))
+			i++
+		}
+	}
+	return keys
 }
 
 // crossDBTarget reports the other database a write reaches into, and the key it writes
@@ -485,6 +560,18 @@ func affectedKeys(name string, args [][]byte) []string {
 			return []string{string(args[2])}
 		}
 		return nil
+	case "SORT", "SORT_RO":
+		// The collection, plus a STORE destination that is not at a fixed position. The BY
+		// and GET patterns name keys too, but which keys depends on the data -- see sortKeys.
+		return sortKeys(args)
+	case "GEORADIUS", "GEORADIUSBYMEMBER":
+		// GEORADIUS key lon lat radius unit ... [STORE dst] [STOREDIST dst]: the source is
+		// the first argument, but the destination is not at any fixed position -- it follows
+		// a keyword that may not be there at all. Missing it would leave a WATCH on the
+		// destination unaware it had been overwritten, and would route the command by the
+		// wrong key in cluster mode. The read-only forms have no STORE and so fall through
+		// to the default.
+		return georadiusKeys(args)
 	case "MIGRATE":
 		// MIGRATE host port key|"" db timeout ... [KEYS key ...]: the first three arguments
 		// are an address, so the default of "argument 1 is the key" would name the
@@ -498,10 +585,13 @@ func affectedKeys(name string, args [][]byte) []string {
 		// one of those two failures is silent.
 		return migrateKeys(args)
 	case "RENAME", "RENAMENX", "COPY", "SMOVE", "LMOVE", "RPOPLPUSH",
-		"BLMOVE", "BRPOPLPUSH":
+		"BLMOVE", "BRPOPLPUSH", "ZRANGESTORE":
 		// The first two arguments are source and destination for all of these; the
 		// options that follow (COPY's REPLACE, LMOVE's directions, a blocking form's
-		// timeout) are not keys. The blocking pair reports its keys through its effect,
+		// timeout) are not keys. ZRANGESTORE puts the destination first and the source
+		// second -- the reverse of the others -- which does not matter here, because what
+		// this list is for is naming *every* key the command touches, not saying which is
+		// which. The blocking pair reports its keys through its effect,
 		// which is the non-blocking LMOVE/RPOPLPUSH, so these two entries are belt and
 		// braces -- but invariant 7 is about the list being complete, not about which
 		// path happens to consult it today.

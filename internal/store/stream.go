@@ -286,8 +286,20 @@ func (st *stream) nextID(nowMs int64) (StreamID, error) {
 	if ms > st.last.Ms {
 		return StreamID{Ms: ms}, nil
 	}
+	// The clock has not moved past the last id, so the id is the one after it. A sequence
+	// counter at its maximum carries into the *millisecond*: only an id that is at the
+	// maximum in both halves has nowhere left to go.
+	//
+	// That distinction matters more than it looks. An explicit XADD may name an id whose
+	// millisecond is far in the future -- Redis's own test writes
+	// `2577343934890-18446744073709551615`, a timestamp in the year 2051 -- and treating a
+	// full sequence counter as exhaustion refuses every later XADD on that stream, for
+	// decades, over a counter that had a whole millisecond of room above it.
 	if st.last.Seq == math.MaxUint64 {
-		return StreamID{}, ErrStreamIDExhausted
+		if st.last.Ms == math.MaxUint64 {
+			return StreamID{}, ErrStreamIDExhausted
+		}
+		return StreamID{Ms: st.last.Ms + 1}, nil
 	}
 	return StreamID{Ms: st.last.Ms, Seq: st.last.Seq + 1}, nil
 }
@@ -295,13 +307,19 @@ func (st *stream) nextID(nowMs int64) (StreamID, error) {
 // seqForMs generates the id an XADD with "<ms>-*" gets: the caller fixed the
 // millisecond and the sequence continues from whatever is already there.
 func (st *stream) seqForMs(ms uint64) (StreamID, error) {
+	// Unlike nextID this one cannot carry into the next millisecond: the caller *fixed* the
+	// millisecond, so a full sequence counter inside it really has nowhere to go -- and the
+	// refusal names that, rather than claiming the whole stream is exhausted. It is not: an
+	// XADD naming the next millisecond, or a plain "*", still works. Redis words it the same
+	// way ("equal or smaller than the target stream top item"), because from the caller's
+	// point of view the id it asked for is one the stream already has.
 	switch {
 	case ms > st.last.Ms:
 		return StreamID{Ms: ms}, nil
 	case ms < st.last.Ms:
 		return StreamID{}, ErrStreamIDSmaller
 	case st.last.Seq == math.MaxUint64:
-		return StreamID{}, ErrStreamIDExhausted
+		return StreamID{}, ErrStreamIDSmaller
 	}
 	return StreamID{Ms: ms, Seq: st.last.Seq + 1}, nil
 }

@@ -56,7 +56,9 @@ import (
 
 func init() {
 	register("DUMP", 2, false, cmdDump)
-	register("RESTORE", -4, true, cmdRestore)
+	// RESTORE's ttl operand counts from now, so it propagates the absolute ABSTTL form it
+	// resolved rather than its own text. See restoreForm and propagation.go.
+	registerEffect("RESTORE", -4, cmdRestore)
 	// MIGRATE propagates the effect it had on *this* node's dataset, which is the DEL of
 	// the keys that left. Shipping the command itself would have every replica open its
 	// own connection to the destination and send the same keys again -- and an AOF replay
@@ -262,57 +264,62 @@ func parseRestoreOpts(args [][]byte) (restoreOpts, string) {
 // accepting an option that does nothing is worse than saying so, which is what the
 // README's Cluster section does. IDLETIME, by contrast, is applied -- a key arriving
 // from another node keeps the age it had there.
-func cmdRestore(s *Server, w *resp.Writer, args [][]byte) bool {
+//
+// A relative ttl is resolved once here, and the ABSTTL form built from that same value is
+// what propagates (see restoreForm); a ttl of 0 or an operand already marked ABSTTL takes
+// no clock reading and propagates verbatim.
+func cmdRestore(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	key := string(args[1])
 	ttl, ok := parseInt64(args[2])
 	if !ok {
 		w.WriteError("ERR value is not an integer or out of range")
-		return false
+		return nil
 	}
 	o, errMsg := parseRestoreOpts(args[4:])
 	if errMsg != "" {
 		w.WriteError(errMsg)
-		return false
+		return nil
 	}
 	if ttl < 0 {
 		w.WriteError("ERR Invalid TTL value, must be >= 0")
-		return false
+		return nil
 	}
 	if !o.replace && s.store.Exists(key) {
 		w.WriteError("BUSYKEY Target key name already exists.")
-		return false
+		return nil
 	}
 	cmds, err := decodeDumpPayload(args[3])
 	if err != nil {
 		w.WriteError("ERR " + err.Error())
-		return false
+		return nil
 	}
 
 	var deadline time.Time
+	wire := args
 	if ttl > 0 {
 		if o.absTTL {
 			deadline = time.UnixMilli(ttl)
 		} else {
-			nowMs := s.store.Now().UnixMilli()
-			atMs, valid := deadlineMs(nowMs, ttl, 1, true)
+			atMs, valid := deadlineMs(s.store.Now().UnixMilli(), ttl, 1, true)
 			if !valid {
 				w.WriteError("ERR Invalid TTL value, must be >= 0")
-				return false
+				return nil
 			}
 			deadline = time.UnixMilli(atMs)
+			wire = restoreForm(args, atMs)
 		}
 	}
 
 	switch err := s.restoreKey(key, cmds, deadline, o); {
 	case errors.Is(err, errBusyKey):
 		w.WriteError("BUSYKEY Target key name already exists.")
-		return false
+		return nil
 	case err != nil:
 		w.WriteError("ERR " + err.Error())
-		return false
+		return nil
 	}
 	w.WriteSimple("OK")
-	return true
+	return [][][]byte{wire}
 }
 
 // errBusyKey is the commit losing a race with another connection that created the same
@@ -642,32 +649,21 @@ func migrateErr(err error) string {
 	return "IOERR error or timeout reading from target instance"
 }
 
-// restoreForm rewrites RESTORE's relative TTL into an absolute deadline for the AOF
-// and the replicas, which is invariant 3 applied to the one command that carries a TTL
-// in milliseconds-from-now as a positional operand.
+// restoreForm renders RESTORE with atMs in place of its relative TTL operand, marked
+// ABSTTL so a replayer reads it as the absolute deadline it is. This is invariant 3
+// applied to the one command that carries a TTL in milliseconds-from-now as a positional
+// operand.
 //
-// Without it, a RESTORE replayed from an AOF an hour after it was written would give
-// the key an hour more life than it had, and a replica would disagree with its master
-// about when a migrated key disappears -- silently, since both would look internally
-// consistent. A ttl of 0 (no deadline) and a payload already carrying ABSTTL are
-// passed through untouched: there is nothing relative to rewrite.
-func restoreForm(args [][]byte, nowMs int64) [][]byte {
-	if len(args) < 4 {
-		return args
-	}
-	ttl, ok := parseInt64(args[2])
-	if !ok || ttl == 0 {
-		return args
-	}
-	for _, a := range args[4:] {
-		if strings.EqualFold(string(a), "ABSTTL") {
-			return args
-		}
-	}
-	atMs, ok := deadlineMs(nowMs, ttl, 1, true)
-	if !ok {
-		return args
-	}
+// Without it, a RESTORE replayed from an AOF an hour after it was written would give the
+// key an hour more life than it had, and a replica would disagree with its master about
+// when a migrated key disappears -- silently, since both would look internally
+// consistent.
+//
+// atMs is the deadline cmdRestore already resolved and already gave the store: this is a
+// renderer, not a second derivation, and it takes no clock. It is called only for a
+// relative operand, so a ttl of 0 (no deadline) and one already marked ABSTTL never reach
+// it and propagate verbatim -- there is nothing relative to rewrite.
+func restoreForm(args [][]byte, atMs int64) [][]byte {
 	out := make([][]byte, 0, len(args)+1)
 	out = append(out, args[0], args[1], []byte(strconv.FormatInt(atMs, 10)))
 	out = append(out, args[3:]...)

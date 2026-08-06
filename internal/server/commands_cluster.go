@@ -125,15 +125,23 @@ func (s *Server) clusterSubcommand(w *resp.Writer, sub string, args [][]byte) bo
 		return s.clusterReset(w, args)
 
 	default:
-		w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try CLUSTER HELP.")
+		writeUnknownSubcommand(w, "CLUSTER", args[1])
 	}
 	return false
 }
 
+// writeClusterArity answers a *known* CLUSTER subcommand given the wrong number of
+// arguments, with the text Redis uses:
+//
+//	ERR wrong number of arguments for 'cluster|keyslot' command
+//
+// It used to emit the unknown-subcommand message instead, which told a client its
+// subcommand did not exist when the real problem was the count -- measured against a
+// cluster-enabled redis:7.2 (a standalone one refuses every CLUSTER subcommand before
+// the arity check, so this could only be checked with `--cluster-enabled yes`).
 func writeClusterArity(w *resp.Writer, sub []byte) {
-	w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-		string(sub) + "'. Try CLUSTER HELP.")
+	w.WriteError("ERR wrong number of arguments for 'cluster|" +
+		strings.ToLower(string(sub)) + "' command")
 }
 
 // parseSlotArg parses a slot operand, answering with Redis's message for a value that
@@ -477,6 +485,14 @@ func (s *Server) clusterReset(w *resp.Writer, args [][]byte) bool {
 	case len(args) == 3 && strings.EqualFold(string(args[2]), "HARD"):
 		hard = true
 	case len(args) == 3 && strings.EqualFold(string(args[2]), "SOFT"):
+	case len(args) == 3:
+		// The right number of arguments, but not HARD or SOFT. Redis answers "syntax
+		// error" here rather than an arity message, and it is the only CLUSTER
+		// subcommand that distinguishes the two -- measured on a cluster-enabled
+		// redis:7.2, where `CLUSTER RESET BOGUS` is a syntax error and
+		// `CLUSTER RESET a b` is a wrong-number-of-arguments error.
+		w.WriteError("ERR syntax error")
+		return false
 	default:
 		writeClusterArity(w, args[1])
 		return false

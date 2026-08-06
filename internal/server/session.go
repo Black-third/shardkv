@@ -34,8 +34,11 @@ type session struct {
 	inMulti  bool
 	queued   [][][]byte
 	queueErr bool // a queued command failed to parse -> EXEC aborts with EXECABORT
-	watched  map[dbKey]struct{}
-	dirty    atomic.Bool
+	// watched maps each (database, key) this connection has WATCHed to whether that key was
+	// live at the moment it was watched. The value is what lets EXEC tell a key that expired
+	// during the transaction from one that was never there -- see watchedKeyExpired.
+	watched map[dbKey]bool
+	dirty   atomic.Bool
 
 	// authenticated is true once AUTH (or HELLO ... AUTH) succeeded, or always when
 	// no password is configured. See needsAuth.
@@ -51,6 +54,14 @@ type session struct {
 	// accepts reads served by a replica of the slot's owner instead of being redirected
 	// to the master.
 	readReplica bool
+
+	// The CLIENT REPLY state (see cmdClientReply). replyOff is the durable OFF mode;
+	// replySkipNext is set by CLIENT REPLY SKIP and replySkipping marks the one command
+	// whose reply it suppresses. All three belong to the connection's own goroutine, which
+	// is the only thing that reads or writes them.
+	replyOff      bool
+	replySkipNext bool
+	replySkipping bool
 
 	// quit asks the connection loop to hang up once the pending reply is flushed.
 	// QUIT and SHUTDOWN set it rather than closing the socket themselves, so the

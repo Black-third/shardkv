@@ -65,6 +65,57 @@ func parseInt64(b []byte) (int64, bool) {
 	return n, err == nil
 }
 
+// maxDrawWithReplacement bounds how many draws a negative RANDMEMBER count may ask for.
+// It is the protocol's own multibulk limit: an array longer than this is one no RESP
+// reader will accept, including this server's own.
+const maxDrawWithReplacement = resp.MaxMultiBulk
+
+// parseRandomCount parses the count operand of the RANDMEMBER family -- SRANDMEMBER,
+// HRANDFIELD, ZRANDMEMBER -- whose negative form asks for that many draws *with*
+// replacement. errMsg is the RESP error to reply with, or "".
+//
+// pairs says the reply carries two elements per draw (WITHSCORES/WITHVALUES), which
+// halves the range Redis accepts.
+//
+// Three refusals, each with the message real Redis sends:
+//
+//   - not a number: the usual "not an integer or out of range".
+//   - exactly the smallest int64: Redis's accepted range is [-LONG_MAX, LONG_MAX], so
+//     the single value whose negation does not fit is refused by name. It has to be --
+//     negating it wraps back to itself, and a slice of negative length is a panic in Go,
+//     which is one operand from any client taking the whole process down. That is what it
+//     did before this check existed.
+//   - beyond half the range with pairs, which Redis rejects with its shorter
+//     "value is out of range".
+//
+// And one refusal Redis does not make: a repetition count past the protocol's multibulk
+// limit. Redis materializes it and dies of it; a reply that no reader can parse is not
+// worth the heap it would take to build, and refusing before allocating is the same
+// discipline SETRANGE applies to a string too long to carry. The message is Redis's
+// "value is out of range", so a client (or a test) matching on that text sees what it
+// expects.
+func parseRandomCount(b []byte, pairs bool) (int, string) {
+	n, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0, "ERR value is not an integer or out of range"
+	}
+	if n == math.MinInt64 {
+		return 0, "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807"
+	}
+	if pairs && (n < -math.MaxInt64/2 || n > math.MaxInt64/2) {
+		return 0, "ERR value is out of range"
+	}
+	if n < -maxDrawWithReplacement {
+		return 0, "ERR value is out of range"
+	}
+	// A positive count is bounded by the collection's own size, so it needs no cap of its
+	// own; it is clamped to int width for the 32-bit build.
+	if n > math.MaxInt32 {
+		n = math.MaxInt32
+	}
+	return int(n), ""
+}
+
 func parseFloat(b []byte) (float64, bool) {
 	f, err := strconv.ParseFloat(string(b), 64)
 	return f, err == nil

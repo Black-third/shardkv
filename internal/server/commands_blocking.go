@@ -26,28 +26,28 @@ func init() {
 	// The timeout is the last argument for the historical blocking commands and the
 	// first for the MPOP family, which cannot put it after a variable-length key list.
 	registerBlocking("BLPOP", -3, &blockSpec{
-		fn: blockingListPop(true), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray,
+		fn: blockingListPop(true), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray, wantType: "list",
 	})
 	registerBlocking("BRPOP", -3, &blockSpec{
-		fn: blockingListPop(false), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray,
+		fn: blockingListPop(false), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray, wantType: "list",
 	})
 	registerBlocking("BLMOVE", 6, &blockSpec{
-		fn: blockingLMove, keys: firstKeyOnly, timeout: -1, empty: writeNullArray,
+		fn: blockingLMove, keys: firstKeyOnly, timeout: -1, empty: writeNullArray, wantType: "list",
 	})
 	registerBlocking("BRPOPLPUSH", 4, &blockSpec{
-		fn: blockingRPopLPush, keys: firstKeyOnly, timeout: -1, empty: writeNullArray,
+		fn: blockingRPopLPush, keys: firstKeyOnly, timeout: -1, empty: writeNullArray, wantType: "list",
 	})
 	registerBlocking("BZPOPMIN", -3, &blockSpec{
-		fn: blockingZPop(true), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray,
+		fn: blockingZPop(true), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray, wantType: "zset",
 	})
 	registerBlocking("BZPOPMAX", -3, &blockSpec{
-		fn: blockingZPop(false), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray,
+		fn: blockingZPop(false), keys: keysBeforeTimeout, timeout: -1, empty: writeNullArray, wantType: "zset",
 	})
 	registerBlocking("BLMPOP", -5, &blockSpec{
-		fn: blockingLMPop, keys: mpopKeysAfterTimeout, timeout: 1, empty: writeNullArray,
+		fn: blockingLMPop, keys: mpopKeysAfterTimeout, timeout: 1, empty: writeNullArray, wantType: "list",
 	})
 	registerBlocking("BZMPOP", -5, &blockSpec{
-		fn: blockingZMPop, keys: mpopKeysAfterTimeout, timeout: 1, empty: writeNullArray,
+		fn: blockingZMPop, keys: mpopKeysAfterTimeout, timeout: 1, empty: writeNullArray, wantType: "zset",
 	})
 
 	// The non-blocking halves, which are ordinary write commands. LMPOP propagates

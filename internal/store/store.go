@@ -56,6 +56,11 @@ var (
 	ErrIndexOutOfRange = errors.New("index out of range")
 	// ErrSameObject is returned by Copy when source and destination are one key.
 	ErrSameObject = errors.New("source and destination objects are the same")
+	// ErrNotString is returned by LCS when either key holds something other than a
+	// string. It is separate from ErrWrongType because Redis words this one in terms of
+	// the values rather than the operation: LCS needs two strings and does not report
+	// which of the two was not one.
+	ErrNotString = errors.New("The specified keys must contain string values")
 )
 
 // maxStringLen bounds a value SetRange may grow a string to. It matches Redis's
@@ -152,6 +157,10 @@ type Store struct {
 	// SetActiveExpire for why anything would turn it off.
 	activeExpire atomic.Bool
 
+	// encoding holds the representation thresholds OBJECT ENCODING reports from and
+	// the HyperLogLog's sparse/dense switchover. See encoding.go.
+	encoding encodingLimits
+
 	// keyspaceHits and keyspaceMisses count how many key lookups made by *read* paths
 	// found a live value and how many did not. They back INFO's keyspace_hits and
 	// keyspace_misses, i.e. the cache hit rate an operator sizes the dataset from.
@@ -184,6 +193,7 @@ func New(numShards int) *Store {
 		s.shards[i] = &shard{data: make(map[string]*entry)}
 	}
 	s.activeExpire.Store(true)
+	s.encoding.reset()
 	return s
 }
 

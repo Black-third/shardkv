@@ -54,6 +54,13 @@ func cmdReset(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 	sess.name.Store(nil)
 	sess.authenticated = s.RequirePass() == ""
 	sess.db.Store(0)
+	// And replies are delivered again: RESET clears CLIENT REPLY OFF/SKIP, as it does in
+	// Redis. A pooled socket handed on with its replies silenced would look hung to
+	// whoever got it next.
+	sess.replyOff = false
+	sess.replySkipNext = false
+	sess.replySkipping = false
+	w.Resume()
 	w.SetProto(resp.ProtoRESP2)
 	w.WriteSimple("RESET")
 }
@@ -245,15 +252,108 @@ func cmdClient(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 		}
 		w.WriteVerbatim("txt", []byte(b.String()))
 
+	case "REPLY":
+		if len(args) != 3 {
+			w.WriteError("ERR wrong number of arguments for 'client|reply' command")
+			return
+		}
+		clientReply(sess, w, args)
+
 	case "UNBLOCK":
 		s.clientUnblock(w, args)
 
 	case "KILL":
 		s.clientKill(sess, w, args)
 
+	case "HELP":
+		writeSubcommandHelp(w, "CLIENT", []string{
+			"ID",
+			"    Return the ID of the current connection.",
+			"INFO",
+			"    Return information about the current client connection.",
+			"LIST",
+			"    Return information about all client connections.",
+			"GETNAME",
+			"    Return the name of the current connection.",
+			"SETNAME <name>",
+			"    Assign the name <name> to the current connection.",
+			"SETINFO <option> <value>",
+			"    Set client meta attr. Options are:",
+			"    * LIB-NAME: the client lib name.",
+			"    * LIB-VER: the client lib version.",
+			"REPLY (ON|OFF|SKIP)",
+			"    Control the replies sent to the current connection.",
+			"UNBLOCK <clientid> [TIMEOUT|ERROR]",
+			"    Unblock the specified blocked client.",
+			"KILL <option> <value> [<option> <value> [...]]",
+			"    Kill connections matching every given filter.",
+		})
+
 	default:
-		w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try CLIENT HELP.")
+		writeUnknownSubcommand(w, "CLIENT", args[1])
+	}
+}
+
+// clientReply implements CLIENT REPLY ON|OFF|SKIP: whether this connection wants to be
+// answered at all.
+//
+// It exists for a client that fires a stream of writes it will not read the answers to --
+// a bulk load over one socket. Without it the answers pile up in the socket buffer until
+// the server blocks writing them, so the caller has to read replies it does not want.
+//
+// The three modes and what each replies with are Redis's, and the asymmetry is the whole
+// interface: ON answers +OK (it is the one that re-enables answering, so its own answer is
+// the acknowledgement), while OFF and SKIP answer with nothing at all -- an
+// acknowledgement of "stop answering me" would be self-contradicting.
+//
+// SKIP suppresses exactly the next command's reply, so it is a two-step state machine:
+// this sets replySkipNext, and advanceReplyMode -- which runs after every command --
+// promotes it to replySkipping for one command and then restores delivery. SKIP while OFF
+// is already in force does nothing extra, as in Redis, because there is nothing left to
+// suppress.
+func clientReply(sess *session, w *resp.Writer, args [][]byte) {
+	switch strings.ToUpper(string(args[2])) {
+	case "ON":
+		sess.replyOff = false
+		sess.replySkipNext = false
+		sess.replySkipping = false
+		w.Resume()
+		w.WriteSimple("OK")
+	case "OFF":
+		// Flush first: the replies to the commands that came before this one in the same
+		// pipeline were promised, and Suppress discards whatever the buffer holds.
+		_ = w.Flush()
+		sess.replyOff = true
+		w.Suppress()
+	case "SKIP":
+		if sess.replyOff {
+			return
+		}
+		_ = w.Flush()
+		sess.replySkipNext = true
+		w.Suppress()
+	default:
+		w.WriteError("ERR syntax error")
+	}
+}
+
+// advanceReplyMode moves the CLIENT REPLY SKIP state machine on by one command. It runs
+// after every command on the connection, and while no SKIP is outstanding it is two
+// boolean tests.
+//
+// The order matters: the command that has just run may be the CLIENT REPLY SKIP itself, in
+// which case suppression has to persist through the *next* one; only on the command after
+// that is delivery restored -- and only if OFF is not separately in force.
+func advanceReplyMode(sess *session, w *resp.Writer) {
+	switch {
+	case sess.replySkipNext:
+		sess.replySkipNext = false
+		sess.replySkipping = true
+	case sess.replySkipping:
+		sess.replySkipping = false
+		if !sess.replyOff {
+			w.Resume()
+		}
 	}
 }
 

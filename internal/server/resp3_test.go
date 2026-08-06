@@ -343,8 +343,14 @@ func TestRESP2SubscriberModeStillRestricted(t *testing.T) {
 	if got := c.cmd("GET k"); !strings.HasPrefix(got, "-ERR Can't execute 'get'") {
 		t.Errorf("GET while subscribed on RESP2 = %q; want it refused", got)
 	}
-	if got := c.cmd("PING"); got != "+PONG" {
-		t.Errorf("PING while subscribed = %q", got)
+	// A RESP2 subscriber's PING is a two-element ["pong", <payload>] array, not +PONG: the
+	// connection is demultiplexing one stream by shape, and a simple string would be the only
+	// reply in it that does not look like a message. Captured from redis:7.2.
+	if got := c.cmd("PING"); got != "[pong ]" {
+		t.Errorf("PING while subscribed on RESP2 = %q; want [pong ]", got)
+	}
+	if got := c.cmd("PING hello"); got != "[pong hello]" {
+		t.Errorf("PING hello while subscribed on RESP2 = %q; want [pong hello]", got)
 	}
 }
 
