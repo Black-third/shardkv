@@ -406,11 +406,30 @@ func (s *Server) geoSearch(key string, o geoSearchOpts) ([]geoResult, error) {
 			out = append(out, geoResult{member: cand.Member, score: cand.Score, dist: d / o.unit})
 			continue
 		}
-		// BYBOX measures the two axes separately, each along a great circle through the
-		// centre, which is how Redis defines the box: the north-south extent is measured at
-		// the query's longitude and the east-west extent at its latitude.
+		// BYBOX measures the two axes separately, and *where* the east-west axis is measured
+		// is the part worth stating: along the **candidate's** parallel, not the query's.
+		//
+		// That is not the obvious reading -- it means the box flares outwards with latitude
+		// rather than being a box on the map -- so it was established by measurement rather
+		// than argument. For a candidate at a given longitude offset, the box width at which
+		// redis:7.2 flips from excluding it to including it was binary-searched over eight
+		// query/candidate latitude pairs. Every one matched the distance along the
+		// *candidate's* parallel and none matched the query's; where the two agree (candidate
+		// at the query's own latitude) both predict the same number, which is why a sweep
+		// over random points is nearly blind to the difference and a designed probe is not.
+		//
+		// Measured thresholds, half-width in km, query latitude / candidate latitude /
+		// longitude offset:
+		//
+		//	10 / 70 / 20   ->  757.4   (query's parallel would say 2190.4)
+		//	 0 / 60 / 90   -> 4605.8   (query's parallel would say 10010.4)
+		//	45 / 80 / 60   -> 1108.0   (query's parallel would say 4605.8)
+		//	 0 /  0 / 90   -> 10010.4  (the two agree here)
+		//
+		// The north-south extent has no such subtlety: a degree of latitude is the same
+		// length everywhere on a sphere.
 		latDist := geoDistance(lon, lat, lon, clat)
-		lonDist := geoDistance(lon, lat, clon, lat)
+		lonDist := geoDistance(clon, clat, lon, clat)
 		if latDist > o.height*o.unit/2 || lonDist > o.width*o.unit/2 {
 			continue
 		}

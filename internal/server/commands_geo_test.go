@@ -394,3 +394,109 @@ func TestGeoHashBitsRoundTrip(t *testing.T) {
 		t.Error("the geohash does not survive a round trip through float64")
 	}
 }
+
+// TestGeoSearchCoverEdgeCases pins three defects in the search *area*, each of which made a
+// search answer wrongly while reporting success. All three were found by planting the same
+// points on this server and on a live redis:7.2 and comparing the member sets over ~1,300
+// randomised searches plus the deliberately hostile shapes; each expectation below is the
+// measured Redis answer.
+//
+// They are worth separate cases because they fail in three different directions:
+//
+//  1. **Duplicates.** The nine cells stop being distinct once the step is small enough that
+//     the grid wraps, so a large radius visited the same cell repeatedly and returned the
+//     same member up to four times. A 172-member set answered a 20,000 km radius with 331
+//     entries. Beyond the obvious, that also breaks COUNT: it fills up on repeats and
+//     returns fewer than n distinct members while looking like it succeeded.
+//
+//  2. **The box measured its width in the wrong place.** BYBOX compares the east-west
+//     distance against half the width, and that distance has to be measured along the
+//     *candidate's* parallel, not the query's -- a degree of longitude shortens towards the
+//     poles. Measuring at the query's latitude judged poleward candidates by the wrong
+//     yardstick, which produced false positives on one side and omissions on the other.
+//
+//  3. **A pole-reaching circle spans every longitude.** No ring of three columns covers
+//     that, and the ordinary reach check cannot detect it because moveY wraps the row index:
+//     the "north" neighbour of a top-row cell is the bottom row, half a world away, so the
+//     cover looks sufficient. A 5,000 km search from 53N silently omitted a member 4,514 km
+//     away at 83N.
+func TestGeoSearchCoverEdgeCases(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	// 1. No member may be reported twice, however large the area.
+	//
+	// Four members spread over the world, so a global radius must return exactly four
+	// entries. Before the cover's ranges were merged this answered with repeats.
+	c.cmd("GEOADD w 0 0 origin")
+	c.cmd("GEOADD w 90 45 east")
+	c.cmd("GEOADD w -90 -45 west")
+	c.cmd("GEOADD w 179.9 10 dateline")
+	for _, radius := range []string{"5000", "20000", "40075", "100000"} {
+		got := c.cmd("GEOSEARCH w FROMLONLAT 0 0 BYRADIUS " + radius + " km ASC")
+		members := strings.Fields(strings.Trim(got, "[]"))
+		seen := map[string]int{}
+		for _, m := range members {
+			seen[m]++
+		}
+		for m, n := range seen {
+			if n > 1 {
+				t.Errorf("BYRADIUS %s km returned %q %d times: %s", radius, m, n, got)
+			}
+		}
+	}
+	// The global cases must find all four, so the dedup cannot be hiding an under-cover.
+	if got := c.cmd("GEOSEARCH w FROMLONLAT 0 0 BYRADIUS 40075 km ASC"); len(strings.Fields(strings.Trim(got, "[]"))) != 4 {
+		t.Errorf("a world-spanning radius returned %s; want all four members exactly once", got)
+	}
+
+	// 2. A box's width is measured along the *candidate's* parallel, not the query's.
+	//
+	// `base` is at (0,10) and `high` at (20,70). Twenty degrees of longitude is 2,190 km
+	// along parallel 10 and only 757 km along parallel 70, so the two candidate readings
+	// disagree for any box between them -- which is what makes this the case that pins which
+	// one Redis uses. A sweep over random points is nearly blind to it, because most
+	// candidates sit near the query's own latitude where the two readings agree.
+	//
+	// The threshold was found by binary-searching the width at which redis:7.2 flips, here
+	// and at seven other latitude pairs: it is 757 km every time, never 2,190. So `high` is
+	// out of a 1,000 km-wide box (half-width 500) and in a 3,000 km one (half-width 1,500).
+	c.cmd("GEOADD box 0 10 base")
+	c.cmd("GEOADD box 20 70 high")
+	for _, tc := range []struct {
+		width string
+		want  bool
+	}{
+		{"1000", false}, {"1400", false}, {"1600", true}, {"3000", true}, {"10000", true},
+	} {
+		got := c.cmd("GEOSEARCH box FROMLONLAT 0 10 BYBOX " + tc.width + " 15000 km ASC")
+		if has := contains(got, "high"); has != tc.want {
+			t.Errorf("BYBOX %s 15000 km: high present = %v, want %v (%s)", tc.width, has, tc.want, got)
+		}
+		if !contains(got, "base") {
+			t.Errorf("BYBOX %s 15000 km lost the centre member itself: %s", tc.width, got)
+		}
+	}
+
+	// 3. A search whose circle reaches the latitude limit must cover every longitude.
+	//
+	// Measured on redis:7.2: from (-7.103421, 53.468338) a 5,000 km radius includes a point
+	// at (118.26, 83.50), which is 4,514 km away over the pole. Both servers agree on that
+	// distance; the old cover simply never looked there.
+	c.cmd("GEOADD polar -7.103421 53.468338 observer")
+	c.cmd("GEOADD polar 118.2625088 83.5012621 faraway")
+	if got := c.cmd("GEOSEARCH polar FROMLONLAT -7.103421 53.468338 BYRADIUS 5000 km ASC"); !contains(got, "faraway") {
+		t.Errorf("a pole-reaching search omitted a member 4514 km away: %s", got)
+	}
+	// The distance itself is what makes that a *miss* rather than a judgement call.
+	if got := c.cmd("GEODIST polar observer faraway km"); !strings.HasPrefix(got, "4514.") {
+		t.Errorf("GEODIST observer faraway = %s; want ~4514 km (redis:7.2 agrees to four decimals)", got)
+	}
+	// A search that does *not* reach the pole must still exclude it, so the widened cover is
+	// not simply returning everything.
+	if got := c.cmd("GEOSEARCH polar FROMLONLAT -7.103421 53.468338 BYRADIUS 1000 km ASC"); contains(got, "faraway") {
+		t.Errorf("a 1000 km search included a member 4514 km away: %s", got)
+	}
+}
