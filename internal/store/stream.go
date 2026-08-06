@@ -1453,7 +1453,12 @@ func (s *Store) XInfoConsumers(key, group string) ([]StreamConsumerInfo, error) 
 
 	e := s.readEntry(sh, key, now)
 	if e == nil {
-		return nil, ErrNoGroup
+		// A missing key is distinct from a missing group here, and the caller answers
+		// them differently: XINFO CONSUMERS on an absent key is "ERR no such key" on
+		// real Redis, not NOGROUP. Returning ErrNoGroup for both reported a missing
+		// stream as a missing consumer group, which sends a client looking for the
+		// group it just created rather than for the key that is gone.
+		return nil, ErrNoSuchStreamKey
 	}
 	if e.kind != kindStream {
 		return nil, ErrWrongType

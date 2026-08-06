@@ -303,8 +303,7 @@ func cmdSlowlog(s *Server, w *resp.Writer, args [][]byte) bool {
 		})
 
 	default:
-		w.WriteError("ERR Unknown SLOWLOG subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "SLOWLOG", args[1])
 	}
 	return false
 }
@@ -474,8 +473,7 @@ func cmdLatency(s *Server, w *resp.Writer, args [][]byte) bool {
 		})
 
 	default:
-		w.WriteError("ERR Unknown LATENCY subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "LATENCY", args[1])
 	}
 	return false
 }
@@ -888,8 +886,7 @@ func cmdMemory(s *Server, w *resp.Writer, args [][]byte) bool {
 		})
 
 	default:
-		w.WriteError("ERR Unknown subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'. Try MEMORY HELP.")
+		writeUnknownSubcommand(w, "MEMORY", args[1])
 	}
 	return false
 }

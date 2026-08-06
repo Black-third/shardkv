@@ -58,7 +58,7 @@ func TestHyperLogLogCommands(t *testing.T) {
 		{"PFDEBUG TODENSE hll", ":0"},
 		{"PFCOUNT hll", ":4"}, // the count survives the promotion
 		{"PFDEBUG ENCODING nosuch", "-ERR The specified key does not exist"},
-		{"PFDEBUG BOGUS hll", "-ERR Unknown PFDEBUG subcommand or wrong number of arguments for 'BOGUS'"},
+		{"PFDEBUG BOGUS hll", "-ERR Unknown PFDEBUG subcommand 'BOGUS'"},
 		{"PFSELFTEST", "+OK"},
 	}
 	for _, tc := range cases {

@@ -751,3 +751,87 @@ func TestStreamKeyspaceNotifications(t *testing.T) {
 		t.Errorf("a repeat XCLAIM fired an event; the next message was %q, want the xdel", got)
 	}
 }
+
+// TestNogroupTextsAndXInfoDispatch pins the error texts a client matches on, all of them
+// measured against redis:7.2 (identically on amd64 and arm64) rather than reasoned about.
+//
+// Redis uses *three* different NOGROUP messages, and this server used two: the three
+// commands that report on work in flight -- XPENDING, XCLAIM, XAUTOCLAIM -- said "No such
+// consumer group 'g' for key name 'k'" where Redis names the key first and leaves open
+// which of the two is missing. That distinction is the useful one, because for those three
+// the key may legitimately have been deleted under the group.
+//
+// XINFO's dispatch had three separate faults, each of which told a client the wrong thing
+// was wrong: an unknown subcommand was reported as a syntax error, a missing key argument
+// was reported as a syntax error rather than naming the subcommand, and a *surplus*
+// argument was not checked at all -- so `XINFO GROUPS k extra` answered as though the
+// extra argument had never been sent, which is how a client asking for an option this
+// server does not implement gets told it worked.
+func TestNogroupTextsAndXInfoDispatch(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	if got := c.cmd("XADD st 1-1 f v"); got != "1-1" {
+		t.Fatalf("XADD = %q", got)
+	}
+
+	cases := []struct{ cmd, want string }{
+		// Form 2: the key is named first, because it may be the missing half.
+		{"XPENDING st g", "-NOGROUP No such key 'st' or consumer group 'g'"},
+		{"XPENDING st g - + 10", "-NOGROUP No such key 'st' or consumer group 'g'"},
+		{"XCLAIM st g c 0 1-1", "-NOGROUP No such key 'st' or consumer group 'g'"},
+		{"XAUTOCLAIM st g c 0 0", "-NOGROUP No such key 'st' or consumer group 'g'"},
+		{"XAUTOCLAIM nokey g c 0 0", "-NOGROUP No such key 'nokey' or consumer group 'g'"},
+		// Form 3: XGROUP and XINFO CONSUMERS, where the key is known to exist because a
+		// missing one is refused earlier.
+		{"XGROUP SETID st g 0", "-NOGROUP No such consumer group 'g' for key name 'st'"},
+		{"XGROUP DELCONSUMER st g c", "-NOGROUP No such consumer group 'g' for key name 'st'"},
+		{"XGROUP CREATECONSUMER st g c", "-NOGROUP No such consumer group 'g' for key name 'st'"},
+		{"XINFO CONSUMERS st g", "-NOGROUP No such consumer group 'g' for key name 'st'"},
+		// ...and a missing key there is "no such key", not NOGROUP. Returning NOGROUP sent
+		// a client looking for the group it had just created rather than the absent stream.
+		{"XINFO CONSUMERS nokey g", "-ERR no such key"},
+		{"XINFO STREAM nokey", "-ERR no such key"},
+		// Form 1: XREADGROUP names itself, because "your group is gone" and "your read
+		// found nothing" are different situations for a consumer.
+		{"XREADGROUP GROUP g c STREAMS st >",
+			"-NOGROUP No such key 'st' or consumer group 'g' in XREADGROUP with GROUP option"},
+
+		// XINFO dispatch. An unknown subcommand is not a syntax error.
+		{"XINFO NOPE", "-ERR unknown subcommand 'NOPE'. Try XINFO HELP."},
+		// A missing key names the subcommand.
+		{"XINFO STREAM", "-ERR wrong number of arguments for 'xinfo|stream' command"},
+		{"XINFO GROUPS", "-ERR wrong number of arguments for 'xinfo|groups' command"},
+		{"XINFO CONSUMERS st", "-ERR wrong number of arguments for 'xinfo|consumers' command"},
+		{"XINFO", "-ERR wrong number of arguments for 'xinfo' command"},
+		// A surplus argument is refused -- and by *which* message depends on whether the
+		// subcommand has an optional argument at all. GROUPS takes exactly a key, so this
+		// is an arity error; STREAM accepts an optional FULL, so a fourth argument is an
+		// unrecognised option and gets Redis's other text. Both spellings are real.
+		{"XINFO GROUPS st extra", "-ERR wrong number of arguments for 'xinfo|groups' command"},
+		{"XINFO CONSUMERS st g extra", "-ERR wrong number of arguments for 'xinfo|consumers' command"},
+		{"XINFO STREAM st nope",
+			"-ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP."},
+		// The subcommand is echoed as the client spelled it, as Redis does.
+		{"xinfo stream st bogus",
+			"-ERR unknown subcommand or wrong number of arguments for 'stream'. Try XINFO HELP."},
+	}
+	for _, tc := range cases {
+		if got := c.cmd(tc.cmd); got != tc.want {
+			t.Errorf("%q -> %q; want %q", tc.cmd, got, tc.want)
+		}
+	}
+
+	// With the group present, the same commands succeed -- so the texts above are about a
+	// missing group and not about these commands being broken.
+	if got := c.cmd("XGROUP CREATE st g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+	for _, cmd := range []string{"XPENDING st g", "XINFO CONSUMERS st g", "XAUTOCLAIM st g c 0 0"} {
+		if got := c.cmd(cmd); strings.HasPrefix(got, "-") {
+			t.Errorf("%q with the group present = %q; want a reply", cmd, got)
+		}
+	}
+}

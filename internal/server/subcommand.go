@@ -27,6 +27,25 @@ func writeUnknownSubcommand(w *resp.Writer, container string, sub []byte) {
 		strings.ToUpper(container) + " HELP.")
 }
 
+// writeSubcommandSyntaxError answers a subcommand whose *options* are wrong, with Redis's
+// addReplySubcommandSyntaxError text:
+//
+//	ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.
+//
+// Redis really does use two different messages, and which one applies depends on whether
+// the subcommand has optional arguments. `XINFO GROUPS k extra` is an arity error
+// ("wrong number of arguments for 'xinfo|groups' command") because GROUPS takes exactly a
+// key; `XINFO STREAM k nope` is *this* one, because STREAM accepts an optional FULL and so
+// the fourth argument is an unrecognised option rather than a surplus one. Both were
+// measured against redis:7.2 -- the distinction is not guessable, and picking one for
+// everything is what made the earlier hand-written copies wrong.
+//
+// The subcommand is echoed as the client spelled it, which is what Redis does.
+func writeSubcommandSyntaxError(w *resp.Writer, container string, sub []byte) {
+	w.WriteError("ERR unknown subcommand or wrong number of arguments for '" +
+		string(sub) + "'. Try " + strings.ToUpper(container) + " HELP.")
+}
+
 // writeSubcommandHelp answers <CONTAINER> HELP. Redis replies with an array of lines: a
 // header, then two lines per subcommand (its syntax, then an indented description), then
 // HELP itself. Clients do not parse this -- redis-cli prints it -- so what matters is that

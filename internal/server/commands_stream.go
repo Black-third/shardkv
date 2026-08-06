@@ -107,23 +107,50 @@ const (
 	errBusyGroup = "BUSYGROUP Consumer Group name already exists"
 )
 
-// nogroupError is the NOGROUP reply, whose text differs between XREADGROUP and the
-// other group commands -- a difference clients rely on to tell "your group is gone"
-// from "your read found nothing".
-func nogroupError(key, group string, reading bool) string {
-	if reading {
+// nogroupForm selects which of Redis's three NOGROUP texts a command answers with.
+// There are genuinely three, measured against redis:7.2 (identically on amd64 and
+// arm64), and a client that matches on the message sees the difference:
+//
+//	XREADGROUP                       No such key 'k' or consumer group 'g' in XREADGROUP with GROUP option
+//	XPENDING, XCLAIM, XAUTOCLAIM     No such key 'k' or consumer group 'g'
+//	XGROUP SETID|DELCONSUMER|...     No such consumer group 'g' for key name 'k'
+//	XINFO CONSUMERS                  No such consumer group 'g' for key name 'k'
+//
+// This was a bool, which collapsed the middle form into the last one: the three
+// commands that report on *work in flight* said "no such consumer group" where Redis
+// names the key first and leaves open which of the two is missing. That is the useful
+// distinction, because for those three the key may legitimately be gone.
+type nogroupForm int
+
+const (
+	// nogroupRead is XREADGROUP's, which names the command because a read that finds
+	// nothing and a read whose group vanished are different situations for a consumer.
+	nogroupRead nogroupForm = iota
+	// nogroupPending is XPENDING's, XCLAIM's and XAUTOCLAIM's.
+	nogroupPending
+	// nogroupAdmin is XGROUP's and XINFO CONSUMERS', where the key is known to exist --
+	// a missing key is refused earlier, with "ERR no such key".
+	nogroupAdmin
+)
+
+func nogroupError(key, group string, form nogroupForm) string {
+	switch form {
+	case nogroupRead:
 		return "NOGROUP No such key '" + key + "' or consumer group '" + group +
 			"' in XREADGROUP with GROUP option"
+	case nogroupPending:
+		return "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"
+	default:
+		return "NOGROUP No such consumer group '" + group + "' for key name '" + key + "'"
 	}
-	return "NOGROUP No such consumer group '" + group + "' for key name '" + key + "'"
 }
 
 // writeStreamStoreErr maps the stream sentinels onto their RESP replies. Everything
 // else falls through to the shared translator.
-func writeStreamStoreErr(w *resp.Writer, err error, key, group string, reading bool) {
+func writeStreamStoreErr(w *resp.Writer, err error, key, group string, form nogroupForm) {
 	switch {
 	case errors.Is(err, store.ErrNoGroup), errors.Is(err, store.ErrNoSuchStreamKey):
-		w.WriteError(nogroupError(key, group, reading))
+		w.WriteError(nogroupError(key, group, form))
 	case errors.Is(err, store.ErrBusyGroup):
 		w.WriteError(errBusyGroup)
 	default:
@@ -808,7 +835,7 @@ func blockingXReadGroup(s *Server, w *resp.Writer, args [][]byte) ([][][]byte, b
 		}
 		res, err := s.store.XReadGroup(key, o.group, o.consumer, newOnly, after, o.count, o.noack)
 		if err != nil {
-			writeStreamStoreErr(w, err, key, o.group, true)
+			writeStreamStoreErr(w, err, key, o.group, nogroupRead)
 			return nil, false
 		}
 		s.notifyConsumerCreated(res.ConsumerCreated, key)
@@ -925,8 +952,7 @@ func cmdXGroup(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 		return nil
 	}
 	if len(args) < 4 {
-		w.WriteError("ERR Unknown XGROUP subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "XGROUP", args[1])
 		return nil
 	}
 	key, group := string(args[2]), string(args[3])
@@ -979,8 +1005,7 @@ func cmdXGroup(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 		return [][][]byte{args}
 
 	default:
-		w.WriteError("ERR Unknown XGROUP subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "XGROUP", args[1])
 		return nil
 	}
 }
@@ -991,7 +1016,7 @@ func xgroupErr(w *resp.Writer, err error, key, group string) [][][]byte {
 		w.WriteError(errXGroupNoKey)
 		return nil
 	}
-	writeStreamStoreErr(w, err, key, group, false)
+	writeStreamStoreErr(w, err, key, group, nogroupAdmin)
 	return nil
 }
 
@@ -1143,7 +1168,7 @@ func cmdXPending(s *Server, w *resp.Writer, args [][]byte) bool {
 	if len(args) == 3 {
 		sum, err := s.store.XPendingSummary(key, group)
 		if err != nil {
-			writeStreamStoreErr(w, err, key, group, false)
+			writeStreamStoreErr(w, err, key, group, nogroupPending)
 			return false
 		}
 		writeXPendingSummary(w, sum)
@@ -1187,7 +1212,7 @@ func cmdXPending(s *Server, w *resp.Writer, args [][]byte) bool {
 	rows, err := s.store.XPendingRange(key, group,
 		store.StreamRange{Start: start, End: end}, count, consumer, minIdle)
 	if err != nil {
-		writeStreamStoreErr(w, err, key, group, false)
+		writeStreamStoreErr(w, err, key, group, nogroupPending)
 		return false
 	}
 	w.WriteArrayHeader(len(rows))
@@ -1296,7 +1321,7 @@ func cmdXClaim(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 
 	claimed, deleted, consumerCreated, err := s.store.XClaim(key, group, consumer, ids, o)
 	if err != nil {
-		writeStreamStoreErr(w, err, key, group, false)
+		writeStreamStoreErr(w, err, key, group, nogroupPending)
 		return nil
 	}
 	s.notifyConsumerCreated(consumerCreated, key)
@@ -1386,7 +1411,7 @@ func cmdXAutoClaim(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	claimed, deleted, cursor, consumerCreated, err := s.store.XAutoClaim(
 		key, group, consumer, start, max(minIdle, 0), count, justID)
 	if err != nil {
-		writeStreamStoreErr(w, err, key, group, false)
+		writeStreamStoreErr(w, err, key, group, nogroupPending)
 		return nil
 	}
 	s.notifyConsumerCreated(consumerCreated, key)
@@ -1419,11 +1444,46 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 		})
 		return false
 	}
+	// The subcommand is validated before the argument count, because an unknown one is
+	// not a syntax error: `XINFO NOPE` answered "ERR syntax error" here, where Redis
+	// answers "unknown subcommand 'NOPE'. Try XINFO HELP." -- so a client that had
+	// mistyped a subcommand was told its *arguments* were wrong.
+	switch sub {
+	case "STREAM", "GROUPS", "CONSUMERS":
+	default:
+		writeUnknownSubcommand(w, "XINFO", args[1])
+		return false
+	}
+	// ...and the count is then an arity error naming the subcommand, which is what
+	// CONSUMERS below already answered. STREAM and GROUPS shared a bare "syntax error",
+	// so `XINFO STREAM` with the key forgotten did not say which argument was missing.
 	if len(args) < 3 {
-		w.WriteError("ERR syntax error")
+		w.WriteError("ERR wrong number of arguments for 'xinfo|" +
+			strings.ToLower(sub) + "' command")
 		return false
 	}
 	key := string(args[1+1])
+
+	// Surplus arguments, per subcommand and measured. GROUPS takes exactly a key, so a
+	// fourth argument is an arity error. STREAM accepts an optional FULL, so a fourth
+	// argument is an unrecognised *option* and gets the other message. Both previously
+	// went unchecked, and `XINFO GROUPS k extra` silently answered as if the extra
+	// argument had not been sent -- a client passing an option this server does not
+	// support was told it had worked.
+	switch sub {
+	case "GROUPS":
+		if len(args) != 3 {
+			w.WriteError("ERR wrong number of arguments for 'xinfo|groups' command")
+			return false
+		}
+	case "STREAM":
+		// FULL is not implemented here, so it lands in this arm too: better a refusal
+		// naming the option than a summary report answering a request for a full one.
+		if len(args) != 3 {
+			writeSubcommandSyntaxError(w, "XINFO", args[1])
+			return false
+		}
+	}
 
 	switch sub {
 	case "STREAM":
@@ -1465,7 +1525,7 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 				w.WriteError("ERR no such key")
 				return false
 			}
-			writeStreamStoreErr(w, err, key, group, false)
+			writeStreamStoreErr(w, err, key, group, nogroupAdmin)
 			return false
 		}
 		w.WriteArrayHeader(len(consumers))
@@ -1482,8 +1542,7 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 
 	default:
-		w.WriteError("ERR Unknown XINFO subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		writeUnknownSubcommand(w, "XINFO", args[1])
 	}
 	return false
 }

@@ -137,8 +137,11 @@ func cmdPFDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteInt(int64(boolToInt(changed)))
 
 	default:
-		w.WriteError("ERR Unknown PFDEBUG subcommand or wrong number of arguments for '" +
-			string(args[1]) + "'")
+		// PFDEBUG is the one container that does *not* use the shared wording: Redis spells
+		// it "ERR Unknown PFDEBUG subcommand 'X'" with no arity clause and no "Try ... HELP"
+		// (it has no HELP to try). Measured on redis:7.2; converting it to the shared helper
+		// would have been a regression dressed as a cleanup.
+		w.WriteError("ERR Unknown PFDEBUG subcommand '" + string(args[1]) + "'")
 	}
 	return false
 }
