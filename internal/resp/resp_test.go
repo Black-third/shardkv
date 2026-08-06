@@ -3,6 +3,8 @@ package resp
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -37,8 +39,16 @@ func TestReadCommandRejectsHugeHeaders(t *testing.T) {
 	}
 	for _, in := range cases {
 		_, err := NewReader(strings.NewReader(in)).ReadCommand()
-		if err != ErrProtocol {
-			t.Errorf("ReadCommand(%q) err = %v; want ErrProtocol", in, err)
+		// errors.Is rather than ==: each violation is now a distinct error carrying the
+		// detail the server reports to the client, and each wraps ErrProtocol so this
+		// general test still holds.
+		if !errors.Is(err, ErrProtocol) {
+			t.Errorf("ReadCommand(%q) err = %v; want a protocol error", in, err)
+		}
+		// And each must name what was wrong, because the whole point of reporting it is
+		// that the caller can act on it.
+		if ProtocolErrorText(err) == "" {
+			t.Errorf("ReadCommand(%q) err = %v has no client-facing detail", in, err)
 		}
 	}
 }
@@ -247,5 +257,113 @@ func TestFormatDouble(t *testing.T) {
 		if err != nil || back != f {
 			t.Errorf("FormatDouble(%v) = %q does not round-trip (%v, %v)", f, FormatDouble(f), back, err)
 		}
+	}
+}
+
+// TestReadCommandInlineQuoting covers the inline parser's quoting.
+//
+// This was the worst bug found in the client-facing parser, because it was silent: the
+// splitter divided on whitespace and kept the quote and escape characters as literal
+// bytes, so `set "a\x41b" v` over a telnet or nc session wrote a key named
+// `"a\x41b"` -- eight bytes including the quotes -- and answered +OK. The caller was
+// told its write succeeded and got a different key than it asked for, with nothing
+// anywhere reporting a problem. An unterminated quote was worse still: `set "oops v`
+// created a key called `"oops` instead of being refused.
+//
+// Expectations below match Redis's sdssplitargs, verified against redis:7.2.
+func TestReadCommandInlineQuoting(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{`PING`, []string{"PING"}},
+		{`set foo bar`, []string{"set", "foo", "bar"}},
+		// A quoted argument loses its quotes.
+		{`set "foo bar" v`, []string{"set", "foo bar", "v"}},
+		{`set 'foo bar' v`, []string{"set", "foo bar", "v"}},
+		// \xHH is a byte, not four characters.
+		{`set "a\x41b" v`, []string{"set", "aAb", "v"}},
+		// The C escapes Redis recognises inside double quotes.
+		{`set "a\nb" v`, []string{"set", "a\nb", "v"}},
+		{`set "a\tb" v`, []string{"set", "a\tb", "v"}},
+		{`set "a\"b" v`, []string{"set", `a"b`, "v"}},
+		// Single quotes take only \' -- everything else is literal.
+		{`set 'a\nb' v`, []string{"set", `a\nb`, "v"}},
+		{`set 'a\'b' v`, []string{"set", "a'b", "v"}},
+		// An empty quoted argument is still an argument.
+		{`set k ""`, []string{"set", "k", ""}},
+		// Tabs separate arguments as spaces do.
+		{"set\tfoo\tbar", []string{"set", "foo", "bar"}},
+		// Runs of separators collapse.
+		{`set   foo    bar`, []string{"set", "foo", "bar"}},
+	}
+	for _, tc := range cases {
+		args, err := NewReader(strings.NewReader(tc.in + "\r\n")).ReadCommand()
+		if err != nil {
+			t.Errorf("ReadCommand(%q) unexpected error %v", tc.in, err)
+			continue
+		}
+		if len(args) != len(tc.want) {
+			t.Errorf("ReadCommand(%q) = %q; want %q", tc.in, args, tc.want)
+			continue
+		}
+		for i := range args {
+			if string(args[i]) != tc.want[i] {
+				t.Errorf("ReadCommand(%q) arg %d = %q; want %q", tc.in, i, args[i], tc.want[i])
+			}
+		}
+	}
+
+	// Malformed quoting is a protocol error, never a literal. Writing the quote into the
+	// keyspace is the outcome this rejects.
+	for _, bad := range []string{
+		`set "unterminated v`,
+		`set 'unterminated v`,
+		`set "closed"then v`, // a closing quote must be followed by a separator
+		`set 'closed'then v`,
+		`get "`,
+		`get '`,
+	} {
+		_, err := NewReader(strings.NewReader(bad + "\r\n")).ReadCommand()
+		if !errors.Is(err, ErrUnbalancedQuotes) {
+			t.Errorf("ReadCommand(%q) err = %v; want unbalanced quotes", bad, err)
+		}
+		if ProtocolErrorText(err) != "Protocol error: unbalanced quotes in request" {
+			t.Errorf("ReadCommand(%q) detail = %q", bad, ProtocolErrorText(err))
+		}
+	}
+}
+
+// TestReadCommandTolerantCases covers the malformed input Redis *ignores* rather than
+// treating as fatal. Dropping a connection for one of these disconnects a client that
+// Redis would have kept serving.
+func TestReadCommandTolerantCases(t *testing.T) {
+	// A negative multibulk count is the legacy null multibulk; a zero count is an empty
+	// command. Both are skipped and the next request is read.
+	for _, in := range []string{"*-1\r\nPING\r\n", "*-10\r\nPING\r\n", "*0\r\nPING\r\n", "\r\nPING\r\n", "\n\nPING\r\n"} {
+		args, err := NewReader(strings.NewReader(in)).ReadCommand()
+		if err != nil {
+			t.Errorf("ReadCommand(%q) err = %v; want the following command", in, err)
+			continue
+		}
+		if len(args) != 1 || string(args[0]) != "PING" {
+			t.Errorf("ReadCommand(%q) = %q; want [PING]", in, args)
+		}
+	}
+}
+
+// TestProtocolErrorTextOnlyForProtocolErrors covers the guard that decides whether the
+// server says anything before hanging up: an EOF or a network fault has nobody to tell.
+func TestProtocolErrorTextOnlyForProtocolErrors(t *testing.T) {
+	if got := ProtocolErrorText(nil); got != "" {
+		t.Errorf("ProtocolErrorText(nil) = %q; want empty", got)
+	}
+	if got := ProtocolErrorText(io.EOF); got != "" {
+		t.Errorf("ProtocolErrorText(io.EOF) = %q; want empty (nobody left to tell)", got)
+	}
+	// The expected-'$' case names the byte it found, which is the diagnostic value.
+	_, err := NewReader(strings.NewReader("*1\r\nfoo\r\n")).ReadCommand()
+	if got := ProtocolErrorText(err); got != "Protocol error: expected '$', got 'f'" {
+		t.Errorf("expected-bulk detail = %q", got)
 	}
 }
