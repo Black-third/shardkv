@@ -53,6 +53,61 @@ func (s *Store) MemoryUsage(key string) (int64, bool) {
 	return memEntryOverhead + int64(len(key)) + entrySize(e), true
 }
 
+// Footprint is the whole-keyspace accounting MEMORY STATS reports for one database. The
+// split between Overhead and Dataset is Redis's: the bookkeeping a keyspace needs in
+// order to hold n keys at all, against the keys and values themselves.
+type Footprint struct {
+	// Keys is the number of live keys, and Expires how many of those carry a TTL.
+	Keys    int64
+	Expires int64
+	// Overhead is the keyspace's own bookkeeping: the entry struct and the map slot
+	// holding it, per key. It is the analogue of Redis's overhead.hashtable.main, and
+	// like that number it excludes the key's own bytes and the value's -- those are the
+	// dataset, not the machinery that indexes it.
+	Overhead int64
+	// Dataset is the keys and values themselves: each key string plus the value's
+	// payload, using the same estimate MEMORY USAGE reports for one key. So the identity
+	// a caller can rely on is that Dataset equals the sum of MEMORY USAGE over every live
+	// key, less Overhead -- one estimator, not two that could disagree.
+	Dataset int64
+}
+
+// Footprint walks the whole keyspace and totals what it holds, which is what MEMORY STATS
+// needs and what nothing cheaper can answer: the size of a value is a property of the
+// value, so there is no counter that could be maintained instead.
+//
+// It is therefore O(live keys), like DBSIZE's exact counterpart and like KEYS, and it is
+// on no command's path but its own. It takes one shard's read lock at a time and never
+// two, so it composes with concurrent writes the same way every other whole-keyspace
+// read does: the total describes a keyspace that was true shard by shard rather than one
+// instant, which is the same guarantee Redis's own reply carries once you consider that
+// it is assembled field by field.
+//
+// Like MemoryUsage it reads the shard map directly rather than through readEntry, so it
+// records neither a hit nor a miss: walking the keyspace to size it is introspection, and
+// charging every key on the server as a cache hit would make one MEMORY STATS look like a
+// perfect hit rate (see the keyspace_hits note on Store.readEntry).
+func (s *Store) Footprint() Footprint {
+	var fp Footprint
+	now := s.clock()
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		for k, e := range sh.data {
+			if e.expired(now) {
+				continue
+			}
+			fp.Keys++
+			if !e.expireAt.IsZero() {
+				fp.Expires++
+			}
+			fp.Overhead += memEntryOverhead
+			fp.Dataset += int64(len(k)) + entrySize(e)
+		}
+		sh.mu.RUnlock()
+	}
+	return fp
+}
+
 // entrySize is the estimated size of one value, by type.
 func entrySize(e *entry) int64 {
 	switch e.kind {

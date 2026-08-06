@@ -13,6 +13,12 @@ package server
 // them. Where the setting is this server's own (maxkeys, which bounds keys rather than
 // bytes) the name is its own too, rather than pretending to be maxmemory and reporting
 // a byte count it does not enforce.
+//
+// The maxmemory family is reported all the same, and reading its entries below is the
+// clearest statement of where that line falls: `maxmemory 0` is the true answer to "what
+// byte limit is enforced", every member of the family is read-only because nothing here
+// could act on a value it was given, and the eviction policy is reported from the same
+// accessor INFO reports it from so the two can never disagree.
 
 import (
 	"strconv"
@@ -43,6 +49,19 @@ type configParam struct {
 }
 
 var configParams = []configParam{
+	{
+		// Reported so a client can tell whether DEBUG is available before it tries it, which
+		// is what Redis's own test suite does. Read-only for the same reason Redis makes it
+		// immutable, and the reason is sharper here: a gate a client could open over the wire
+		// is not a gate. Having no setter is what produces the refusal, and that refusal is
+		// byte-for-byte what redis:7.2 answers for this parameter -- measured.
+		//
+		// `enable-module-command` is deliberately not reported alongside it, though Redis
+		// reports both: there is no MODULE command here, and a config for a command that does
+		// not exist is an invented fact.
+		name: "enable-debug-command",
+		get:  func(s *Server) string { return s.EnableDebugCommand() },
+	},
 	{
 		name: "requirepass",
 		get:  func(s *Server) string { return s.RequirePass() },
@@ -130,6 +149,72 @@ var configParams = []configParam{
 			return true
 		},
 	},
+	{
+		// The maxmemory family. It is reported -- and every member of it is read-only --
+		// for one reason: a client library that asks `CONFIG GET maxmemory*` while warming
+		// up needs an answer, and an empty reply is not the same statement as "no byte
+		// limit". Half the drivers in the ecosystem send exactly that pattern, and several
+		// treat the absence of `maxmemory` as "cannot determine" rather than as "unlimited".
+		//
+		// 0 is the truth here, not a placeholder: nothing in this server enforces a byte
+		// budget. What it enforces is `maxkeys`, which is why that parameter keeps its own
+		// name a few entries above rather than masquerading as this one.
+		name: "maxmemory",
+		get:  func(s *Server) string { return "0" },
+		// Read-only, deliberately, and this is the choice worth stating: CONFIG SET
+		// maxmemory could be accepted and remembered, and CONFIG GET would then read back
+		// whatever it was told -- which is precisely the "tune a number that changes no
+		// behaviour" this table exists to refuse. Nothing measures bytes here, so nothing
+		// could act on the value. An operator who wants a bound wants `maxkeys`, and being
+		// refused here is what tells them so. Redis's own message for an unsettable
+		// parameter is what configSet emits.
+	},
+	{
+		// What eviction *does* when the keyspace is over its cap: sample keys and evict the
+		// least recently used of them, over all keys rather than only volatile ones. That is
+		// allkeys-lru, and with no cap configured nothing is evicted at all, which is
+		// noeviction.
+		//
+		// The policy and the trigger are separate facts and only the policy is reported
+		// here. What triggers this eviction is the maxkeys cap (see Store.EvictToLimit),
+		// not a byte budget -- which is exactly why `maxmemory` above reads 0 while this
+		// can read allkeys-lru. A client that reads the pair as "unlimited memory, LRU
+		// eviction" has read it correctly.
+		//
+		// It shares maxmemoryPolicy() with INFO's maxmemory_policy on purpose: two
+		// spellings of one fact drift, and a client that compared them would find the
+		// server disagreeing with itself.
+		name: "maxmemory-policy",
+		get:  func(s *Server) string { return s.maxmemoryPolicy() },
+		// Read-only for the same reason as maxmemory: the policy is derived from whether
+		// maxkeys is set, so accepting `volatile-ttl` here would change nothing and then
+		// report itself back as though it had.
+	},
+	{
+		// How many keys the sampler examines before evicting the least recently used of
+		// them. Reported as the number this server's sampler actually uses, which is 16 --
+		// not Redis's default of 5. Reporting 5 would have been the easy way to look
+		// familiar and would have described nothing that happens here.
+		name: "maxmemory-samples",
+		get:  func(s *Server) string { return strconv.Itoa(store.EvictionSamples) },
+		// Read-only: the sample size is a compile-time constant (store.EvictionSamples),
+		// not a knob.
+	},
+	{
+		// The share of maxmemory that client buffers may occupy before clients are evicted
+		// to reclaim it. 0 is Redis's own default and means "no client eviction", which is
+		// the truth here too: a client that will not read is dropped when its queue fills
+		// (invariant 6), never evicted to free memory, and nothing measures the bytes its
+		// buffers hold.
+		name: "maxmemory-clients",
+		get:  func(s *Server) string { return "0" },
+	},
+	// maxmemory-eviction-tenacity is deliberately absent rather than reported as Redis's
+	// default of 10. It is the effort budget Redis spends inside one event-loop iteration
+	// before returning to serving clients, and this server has no such trade-off to tune:
+	// eviction runs on the janitor goroutine and drains the whole excess in one pass
+	// without competing with the command path for a time slice. There is no number here
+	// that a client could turn into different behaviour, so there is nothing to report.
 	{
 		// Microseconds, as in Redis: a negative value disables the slow log and zero logs
 		// every command.

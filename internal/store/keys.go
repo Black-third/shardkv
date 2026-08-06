@@ -247,17 +247,25 @@ func (s *Store) Encoding(key string) (string, bool) {
 	}
 	switch e.kind {
 	case kindString:
-		// A value that has been appended to or written into stays a plain buffer, whatever
-		// its bytes now look like: the encoding names the representation, not the content.
-		// See entry.rawString -- `SET k 1` then `APPEND k 2` reads "12" and is still raw,
-		// which is what Redis reports.
-		if !e.rawString {
-			if _, err := strconv.ParseInt(string(e.str), 10, 64); err == nil && len(e.str) <= 20 {
-				return "int", true
+		// The name follows how the value was produced, not what its bytes now read as:
+		// see strOrigin. A buffer that was edited in place stays raw whatever its length;
+		// only a value stored *whole by a command that offers the integer encoding* can
+		// read `int`; everything else is embstr or raw by length alone.
+		switch e.strOrigin {
+		case strMutatedBuffer:
+			return "raw", true
+		case strWholeValue:
+			// The length test comes first because it is a comparison rather than a parse,
+			// and because it is also Redis's own precondition (string2ll on a longer
+			// buffer cannot yield a long long).
+			if len(e.str) <= 20 {
+				if _, err := strconv.ParseInt(string(e.str), 10, 64); err == nil {
+					return "int", true
+				}
 			}
-			if len(e.str) <= 44 {
-				return "embstr", true
-			}
+		}
+		if len(e.str) <= 44 {
+			return "embstr", true
 		}
 		return "raw", true
 	case kindList:
@@ -321,8 +329,13 @@ func (s *Store) Encoding(key string) (string, bool) {
 // clone returns a deep copy of the entry, sharing nothing mutable with it, so a
 // copied key and its source can be modified independently. The access time is
 // deliberately not carried over: the copy is a brand new key.
+//
+// strOrigin *is* carried over, because Redis's COPY duplicates the object rather than
+// re-storing its bytes (dupStringObject preserves the encoding). Dropping it made
+// `SET k 1; APPEND k 2; COPY k d` report `int` for d and `raw` for k -- two encodings
+// for one byte sequence, which is the answer that cannot be right.
 func (e *entry) clone() *entry {
-	ne := &entry{kind: e.kind, expireAt: e.expireAt}
+	ne := &entry{kind: e.kind, strOrigin: e.strOrigin, expireAt: e.expireAt}
 	switch e.kind {
 	case kindString:
 		ne.str = copyBytes(e.str)

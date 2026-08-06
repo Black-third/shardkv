@@ -22,6 +22,13 @@ func startTestServer(t *testing.T) (string, func()) {
 	if err := s.SetDatabases(defaultDatabases); err != nil {
 		t.Fatalf("SetDatabases: %v", err)
 	}
+	// DEBUG is refused by default (see commands_debug.go), and several tests here use it
+	// the way Redis's own suite does -- DEBUG PROTOCOL for the RESP3 encodings, DEBUG SLEEP
+	// for a command of a known duration, DEBUG SET-ACTIVE-EXPIRE to observe lazy expiry.
+	// Redis's suite starts its servers with --enable-debug-command local for exactly this
+	// reason; this is the same decision, made once, for every server a test starts. The
+	// gate's own behaviour is covered by TestDebugCommandGate, which sets the modes itself.
+	s.SetEnableDebugCommand("yes")
 	if err := s.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

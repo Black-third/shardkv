@@ -13,8 +13,16 @@ package server
 // which is how a client library's protocol tests check that a server encodes RESP3
 // correctly -- and, here, the one command that exercises the big-number and
 // attribute types no keyspace command has a use for.
+//
+// None of it is reachable by default. DEBUG is a protected command: the whole surface is
+// refused unless -enable-debug-command opens it, which is where Redis 7 draws the same line
+// and for the same reason -- SET-ACTIVE-EXPIRE and CHANGE-REPL-ID change how the *server*
+// behaves for every client and every replica, and a test hook that any client can pull is
+// not a test hook. See SetEnableDebugCommand for the choice of gating the command rather
+// than the two subcommands, and executeCommand for where the decision is taken.
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +32,108 @@ import (
 
 func init() {
 	register("DEBUG", -2, false, cmdDebug)
+}
+
+// protectedCommands are the commands refused unless the configuration opens them, which
+// register reads to set command.protected. It is a set of one here: Redis's other
+// protected command is MODULE, and there are no modules.
+//
+// A package-level var rather than a check inside cmdDebug's init, so it is populated before
+// any init function runs whatever order the files are compiled in -- the same hazard the
+// containerCommands comment describes.
+var protectedCommands = map[string]bool{"DEBUG": true}
+
+// The enable-debug-command settings, in Redis's spelling. The zero value is "no", so the
+// gate is closed on a Server nobody configured.
+const (
+	debugCmdNo int32 = iota
+	debugCmdYes
+	debugCmdLocal
+)
+
+// errDebugNotAllowed is the refusal, byte for byte what redis:7.2 sends (measured on both
+// amd64 and arm64, with enable-debug-command unset and set to "local" from a non-loopback
+// peer). It names the option rather than merely refusing, because the only thing a caller
+// can usefully do about it is set that option.
+const errDebugNotAllowed = "ERR DEBUG command not allowed. If the enable-debug-command " +
+	"option is set to \"local\", you can run it from a local connection, otherwise you " +
+	"need to set this option in the configuration file, and then restart the server."
+
+// SetEnableDebugCommand opens or closes the DEBUG gate. mode is Redis's own enum:
+//
+//	"no"    DEBUG is refused for every connection. The default.
+//	"yes"   DEBUG is allowed for every connection.
+//	"local" DEBUG is allowed only from a loopback peer.
+//
+// It reports whether mode was one of those, so a caller parsing a flag can refuse the
+// value rather than silently picking one.
+//
+// Why the whole command is gated rather than only the subcommands that change server-wide
+// behaviour: two of them do (SET-ACTIVE-EXPIRE stops the expiry sweep, CHANGE-REPL-ID
+// makes every attached replica full-resync), and those are the exposure -- DEBUG SLEEP
+// here parks only the calling connection, so unlike Redis's it is not a denial of service
+// and is not the reason for this. But a partial gate could not answer with Redis's message,
+// which says "DEBUG command not allowed" and names an option whose values are about the
+// command as a whole; a client or a test suite that reads that message and reconfigures
+// would then find the option had not done what it says. Redis gates the command, so the
+// compatible thing and the safe thing are the same thing.
+func (s *Server) SetEnableDebugCommand(mode string) bool {
+	switch strings.ToLower(mode) {
+	case "no":
+		s.enableDebugCmd.Store(debugCmdNo)
+	case "yes":
+		s.enableDebugCmd.Store(debugCmdYes)
+	case "local":
+		s.enableDebugCmd.Store(debugCmdLocal)
+	default:
+		return false
+	}
+	return true
+}
+
+// EnableDebugCommand reports the setting in Redis's spelling, for CONFIG GET.
+func (s *Server) EnableDebugCommand() string {
+	switch s.enableDebugCmd.Load() {
+	case debugCmdYes:
+		return "yes"
+	case debugCmdLocal:
+		return "local"
+	default:
+		return "no"
+	}
+}
+
+// debugCommandAllowed reports whether this connection may run a protected command. It is
+// called from executeCommand for any command whose table entry is protected.
+//
+// A session with no connection is a caller inside this process -- a test driving execute
+// directly, not a client -- and there is no peer address to judge, so "local" admits it.
+func (s *Server) debugCommandAllowed(sess *session) bool {
+	switch s.enableDebugCmd.Load() {
+	case debugCmdYes:
+		return true
+	case debugCmdLocal:
+		return sess == nil || sess.conn == nil || isLoopbackConn(sess.conn)
+	default:
+		return false
+	}
+}
+
+// isLoopbackConn reports whether the peer is on the loopback interface, which is what
+// Redis's islocalClient tests (its own check also admits a Unix-socket client; there is no
+// Unix socket here). An address that does not parse is not treated as local: the safe
+// default for a gate is to refuse what it cannot identify.
+func isLoopbackConn(conn net.Conn) bool {
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // debugProtocolTypes are the type names DEBUG PROTOCOL accepts, in the order the
@@ -108,7 +218,14 @@ func cmdDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 		writeDebugHelp(w)
 
 	default:
-		writeUnknownSubcommand(w, "DEBUG", args[1])
+		// DEBUG is the one container that takes Redis's *longer* form here. Redis 7 has two
+		// messages and which one a container uses is not derivable -- measured against
+		// redis:7.2 with the gate open, OBJECT/CLIENT/CONFIG/XINFO/COMMAND/MEMORY/SLOWLOG/
+		// LATENCY/PUBSUB/XGROUP all answer "unknown subcommand 'X'. Try C HELP." while DEBUG
+		// answers "unknown subcommand or wrong number of arguments for 'X'. Try DEBUG HELP.",
+		// which is writeSubcommandSyntaxError. Found while checking what the gate refuses
+		// against what an open server answers.
+		writeSubcommandSyntaxError(w, "DEBUG", args[1])
 	}
 	return false
 }

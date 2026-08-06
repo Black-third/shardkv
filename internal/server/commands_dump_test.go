@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -261,6 +262,18 @@ func TestDumpRestoreStreamWithGroups(t *testing.T) {
 	// and inactive times in milliseconds, measured at the moment of the call, so two
 	// calls disagree by however long the first took. Its stable half -- which consumers
 	// exist and how much each holds -- is asserted separately below.
+	//
+	// XPENDING's *extended* form has the same property and was in this list anyway, which
+	// made this test fail under load: `XPENDING key group start end count` reports each
+	// entry's idle milliseconds, so the two calls disagree whenever a millisecond boundary
+	// falls between them. It stays, with the idle figure masked -- the fields that a
+	// snapshot has to carry are the id, the owning consumer and the delivery count, and
+	// those are exactly what is left once the clock reading is removed.
+	// Masked by *position*, not by magnitude: the extended reply is
+	// [[<id> <consumer> :<idle> :<delivery-count>]], and idle is the third field. A mask on
+	// "large numbers" would not work -- idle is usually a single digit, and the whole point
+	// is that it can differ by one between two calls.
+	idleField := regexp.MustCompile(`(\[[^\[\]]+ [^\[\] ]+ ):[0-9]+( :[0-9]+\])`)
 	for _, check := range []string{
 		"XRANGE %s - +",
 		"XLEN %s",
@@ -272,6 +285,9 @@ func TestDumpRestoreStreamWithGroups(t *testing.T) {
 	} {
 		want := c.do(strings.Fields(strings.ReplaceAll(check, "%s", "s"))...)
 		got := c.do(strings.Fields(strings.ReplaceAll(check, "%s", "s2"))...)
+		if strings.HasPrefix(check, "XPENDING") && strings.Contains(check, "- +") {
+			want, got = idleField.ReplaceAllString(want, "${1}:<idle>${2}"), idleField.ReplaceAllString(got, "${1}:<idle>${2}")
+		}
 		if want != got {
 			t.Errorf("%s:\n original  %s\n restored  %s", check, want, got)
 		}

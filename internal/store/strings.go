@@ -135,8 +135,10 @@ func (s *Store) SetRange(key string, offset int, val []byte) (int, error) {
 	copy(nv, base)
 	copy(nv[offset:], val)
 	// Written into rather than stored whole, so it stays a plain buffer: see
-	// entry.rawString and OBJECT ENCODING.
-	ne := &entry{kind: kindString, str: nv, rawString: true, expireAt: expireAt}
+	// strOrigin and OBJECT ENCODING. That holds whether the key existed or not --
+	// Redis's setrangeCommand builds the new value with createObject over a raw sds and
+	// never runs tryObjectEncoding, unlike APPEND's create path.
+	ne := &entry{kind: kindString, str: nv, strOrigin: strMutatedBuffer, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return n, nil
@@ -219,7 +221,12 @@ func (s *Store) IncrByFloat(key string, delta LongDouble) (string, error) {
 		return "", ErrNaN
 	}
 	text := sum.Text()
-	ne := &entry{kind: kindString, str: []byte(text), expireAt: expireAt}
+	// Built whole, but *not* through the integer encoding: Redis's incrbyfloatCommand
+	// hands the formatted text to createStringObject and stops there, where SET runs
+	// tryObjectEncoding first. So an integral result reads `embstr` here and `int` after a
+	// SET of the same digits -- see strOrigin, and note that returning strWholeValue
+	// instead is the bug this state was added to fix.
+	ne := &entry{kind: kindString, str: []byte(text), strOrigin: strPlainObject, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return text, nil

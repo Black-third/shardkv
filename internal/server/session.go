@@ -34,6 +34,17 @@ type session struct {
 	inMulti  bool
 	queued   [][][]byte
 	queueErr bool // a queued command failed to parse -> EXEC aborts with EXECABORT
+
+	// multiQueued and multiMem are the same transaction state, published for another
+	// connection's CLIENT LIST: how many commands are queued and how many bytes their
+	// arguments hold. inMulti and queued above belong to this connection's goroutine, and
+	// CLIENT LIST reading them directly was a data race for the sake of a diagnostic.
+	//
+	// multiQueued holds the depth *plus one*, so that the zero value of a session means
+	// "no transaction open" without an initialization step -- see session.multiDepth and
+	// publishMulti, which is called from every place either field above changes.
+	multiQueued atomic.Int64
+	multiMem    atomic.Int64
 	// watched maps each (database, key) this connection has WATCHed to whether that key was
 	// live at the moment it was watched. The value is what lets EXEC tell a key that expired
 	// during the transaction from one that was never there -- see watchedKeyExpired.
@@ -112,6 +123,13 @@ type session struct {
 	nSub          atomic.Int64 // channel subscriptions
 	nPSub         atomic.Int64 // pattern subscriptions
 	listeningPort string       // REPLCONF listening-port, reported by INFO
+
+	// proto is the RESP version this connection negotiated, published for CLIENT LIST's
+	// resp= field. The authority for it is the connection's own resp.Writer, which
+	// belongs to that connection's goroutine and so cannot be read from another; HELLO
+	// and RESET are the only two things that change it, and both store it here as well.
+	// Zero means no HELLO has been sent, which is RESP2.
+	proto atomic.Int64
 
 	// libName and libVer are what CLIENT SETINFO records: the client library behind this
 	// connection, which CLIENT LIST then reports. Modern redis-py and node-redis send them

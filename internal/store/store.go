@@ -98,25 +98,51 @@ func (k kind) String() string {
 	}
 }
 
+// strOrigin says how a string value came to be, which is the only thing that decides
+// the name OBJECT ENCODING gives it beyond its length. It exists so the encoding names
+// the *representation* rather than being re-derived from the content, because Redis's
+// representation depends on which constructor ran and not on what the bytes now read as.
+//
+// The three states are exhaustive: every string entry was either stored whole by a
+// command that offers the integer encoding, built whole by one that does not, or
+// produced by editing a buffer in place. They are named for that distinction rather
+// than for the commands, because the commands are only evidence of it.
+//
+// Getting this wrong is not cosmetic: `assert_encoding` runs throughout Redis's own test
+// suite, and memory-analysis tools read the field to decide how a value is stored.
+type strOrigin uint8
+
+const (
+	// strWholeValue: stored whole by a command that runs Redis's tryObjectEncoding --
+	// SET and its variants, MSET, GETSET, INCR/INCRBY/DECR, RESTORE, and APPEND when it
+	// *creates* the key. The integer encoding is attempted first, so `SET k 1` reads
+	// `int`; otherwise the length decides embstr from raw.
+	strWholeValue strOrigin = iota
+
+	// strPlainObject: built whole as a plain string object by a command that never
+	// attempts the integer encoding. INCRBYFLOAT is the case: Redis's
+	// incrbyfloatCommand calls createStringObject, so a result of "2" reads `embstr`
+	// where `SET k 2` reads `int`. The length still decides embstr from raw.
+	strPlainObject
+
+	// strMutatedBuffer: produced by appending to or writing into an existing buffer --
+	// APPEND onto a key that already existed, SETRANGE, SETBIT, BITFIELD, BITOP's
+	// destination, and the HyperLogLog commands. Redis unshares the value into a plain
+	// sds and never re-encodes it, so `SET k 1` then `APPEND k 2` reads "12" and is
+	// still `raw`. Always raw, whatever the length.
+	strMutatedBuffer
+)
+
 // entry is a single stored value. Exactly one of the type fields is populated
 // according to kind. Entries are always referenced by pointer and never copied
 // (atime is an atomic that must not be copied).
 type entry struct {
 	kind kind
 	str  []byte
-	// rawString marks a string whose bytes were produced by appending to or writing
-	// into an existing value (APPEND, SETRANGE, GETRANGE's siblings) rather than by
-	// storing a whole value.
-	//
-	// It exists so OBJECT ENCODING can report the *representation* rather than
-	// re-deriving an answer from the content. Redis tries an integer encoding when a
-	// value is stored whole and does not re-encode one it has appended to, so
-	// `SET k 1` then `APPEND k 2` leaves a value that reads "12" but is still a plain
-	// buffer: Redis answers `int` then `raw`. Deriving the encoding from the content
-	// instead answers `int` both times, which is wrong in a way that matters --
-	// `assert_encoding` runs throughout Redis's own test suite, and memory-analysis
-	// tools read the field to decide how a value is stored.
-	rawString bool
+	// strOrigin is meaningful only for kindString; see the type. The zero value is
+	// strWholeValue, which is what a plain SET produces, so a construction site that
+	// stores a whole value needs to say nothing.
+	strOrigin strOrigin
 	list      *deque
 	dict      map[string][]byte
 	set       map[string]struct{}
@@ -369,6 +395,13 @@ func copyBytes(b []byte) []byte {
 	return out
 }
 
+// EvictionSamples is how many keys the eviction sampler looks at in the shard it picked
+// before choosing the least recently used of them. It is Redis's maxmemory-samples: the
+// same "approximated LRU" trade-off, where a larger sample is a better choice for more
+// work. CONFIG GET reports it under that name, so the number a client reads is the number
+// the sampler actually uses rather than Redis's default of 5.
+const EvictionSamples = 16
+
 // EvictToLimit removes approximate-LRU keys until the store is within maxKeys.
 // It is invoked by the janitor; it locks one shard at a time (never two at
 // once), so it composes safely with concurrent operations.
@@ -423,7 +456,7 @@ func (s *Store) evictOneLRU() bool {
 				oldest = a
 				victim = k
 			}
-			if sampled++; sampled >= 16 {
+			if sampled++; sampled >= EvictionSamples {
 				break
 			}
 		}

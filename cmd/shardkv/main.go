@@ -12,6 +12,7 @@
 //	        [-requirepass secret] [-masterauth secret]
 //	        [-tls-cert f] [-tls-key f] [-tls-ca f] [-tls-replication]
 //	        [-notify-keyspace-events KEA]
+//	        [-enable-debug-command no|yes|local]
 //	        [-slowlog-log-slower-than us] [-slowlog-max-len n]
 //	        [-latency-monitor-threshold ms]
 //
@@ -81,6 +82,8 @@ func run() error {
 			"subscribers, monitors and blocked clients are exempt)")
 	latencyThreshold := flag.Int64("latency-monitor-threshold", 0,
 		"milliseconds an event must take to be recorded by the latency monitor (0 disables)")
+	enableDebugCmd := flag.String("enable-debug-command", "no",
+		"whether DEBUG may be run: no|yes|local (local = loopback connections only)")
 	clusterEnabled := flag.Bool("cluster-enabled", false,
 		"run as a cluster node: keys are routed by hash slot and foreign slots are redirected")
 	clusterConfig := flag.String("cluster-config-file", "",
@@ -128,6 +131,12 @@ func run() error {
 	srv.SetShutdownHook(shutdown)
 	if !srv.SetNotifyKeyspaceEvents(*notifyEvents) {
 		return fmt.Errorf("invalid -notify-keyspace-events %q: use the flag characters K E g $ l s h z x e A", *notifyEvents)
+	}
+	// DEBUG stays shut unless it is asked for, which is Redis 7's default: two of its
+	// subcommands change server-wide behaviour (the expiry sweep, the replication ID), and
+	// nothing a client library does in normal operation calls DEBUG at all.
+	if !srv.SetEnableDebugCommand(*enableDebugCmd) {
+		return fmt.Errorf("invalid -enable-debug-command %q: use no, yes or local", *enableDebugCmd)
 	}
 
 	// TLS is opt-in: with no certificate the listener and the replication dialer stay
