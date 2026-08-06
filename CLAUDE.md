@@ -172,6 +172,15 @@ special privilege, and because both look like ordinary arithmetic until they are
    it. A waiter that is served hands the queue on before it leaves. When nobody is
    blocked, the whole feature is one atomic load on the write path.
 
+   The other half of FIFO is that an *arriving* command declines its opportunistic first
+   attempt when a waiter it could be served instead of is already queued (`queueAhead`). A
+   pipelining client otherwise takes its own push away from a client that was already
+   waiting: `LPUSH k v` and `BLPOP k 0` arrive in one read, and the wakeup the push sends is
+   a channel send whose recipient has not necessarily been scheduled before the second
+   command runs. The deference is type-aware, and has to be -- an arriving `BLPOP` deferring
+   to a `BZPOPMIN` waiter would queue behind a waiter that can never consume a list and so
+   never leaves, with the element it wanted in plain sight.
+
 10. **A blocking command propagates its effect, never itself.** `BLPOP` ships the
     `LPOP` it performed, `BLMOVE` the `LMOVE`, `BZPOPMIN` the `ZREM`. A replica
     replaying `BLPOP` would wait forever on a connection that has no client behind

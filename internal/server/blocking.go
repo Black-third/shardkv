@@ -93,6 +93,47 @@ type waiter struct {
 	// database 0.
 	keys []dbKey
 	id   int64
+	// wantType is the data type this waiter can be served from, copied off its blockSpec.
+	// It is on the waiter as well as the spec because an *arriving* command has to compare
+	// itself against the waiters already queued -- see queueAhead.
+	wantType string
+}
+
+// queueAhead reports whether a waiter that this command could be served instead of is
+// already queued on one of its keys.
+//
+// It exists to close a fairness hole that only a *pipelining* client can open. Redis serves
+// its blocked clients at the end of every command, before it looks at the next byte in the
+// query buffer, so a client that sends "LPUSH k v" and "BLPOP k 0" in one write cannot take
+// the element it just pushed away from a client that was already waiting. Here the two
+// commands are read from one buffer by one goroutine, and the push's wakeup is a channel
+// send: the waiter's goroutine has not necessarily been scheduled by the time the BLPOP on
+// the same connection makes its opportunistic first attempt, and it took the element. Redis's
+// own suite pins this ("Unblock fairness is kept while pipelining").
+//
+// The fix is to let an arriving command decline the opportunistic attempt when someone is
+// already in the queue for it, and join the back instead. That is what "the earliest blocked
+// client is served first" is supposed to mean, and it is cheaper than it looks: one atomic
+// load rules it out entirely when nobody is blocked anywhere, which is the normal state.
+//
+// The type comparison is not decoration. A BZPOPMIN waiter parked on k cannot be served by a
+// list, so deferring an arriving BLPOP to it would leave both asleep with an element sitting
+// there -- the wakeup filter (see retryBlocking) means that waiter will never consume it and
+// never leave. Only a waiter that could take the same value is worth queueing behind.
+func (s *Server) queueAhead(cmd *command, keys []dbKey) bool {
+	if s.blockedCount.Load() == 0 {
+		return false
+	}
+	s.blockMu.Lock()
+	defer s.blockMu.Unlock()
+	for _, k := range keys {
+		for _, wt := range s.blockQueues[k] {
+			if wt.wantType == cmd.block.wantType {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // blockRegister puts the waiter at the back of every one of its keys' queues.
@@ -330,16 +371,28 @@ func (s *Server) blockUntilServed(sess *session, w *resp.Writer, cmd *command, a
 		return
 	}
 
-	served, wait := s.tryBlocking(cmd, w, args)
-	if served || !wait {
-		return // served, or the arguments were rejected and the error is already written
+	// The queues this command would join, resolved before the first attempt so that the
+	// attempt can be declined. An empty list means the arguments did not parse (keys() is
+	// tolerant by contract), in which case there is nothing to defer to and the attempt
+	// below writes the error.
+	keys := s.dbKeys(cmd.block.keys(args))
+
+	// Skip the opportunistic attempt when a waiter that could be served instead of this one
+	// is already queued: it was here first, and taking the element in front of it is the
+	// unfairness a pipelining client can otherwise create. See queueAhead.
+	if len(keys) == 0 || !s.queueAhead(cmd, keys) {
+		served, wait := s.tryBlocking(cmd, w, args)
+		if served || !wait {
+			return // served, or the arguments were rejected and the error is already written
+		}
 	}
 
 	wt := &waiter{
-		ready:  make(chan struct{}, 1),
-		forced: make(chan string, 1),
-		keys:   s.dbKeys(cmd.block.keys(args)),
-		id:     sess.id,
+		ready:    make(chan struct{}, 1),
+		forced:   make(chan string, 1),
+		keys:     keys,
+		id:       sess.id,
+		wantType: cmd.block.wantType,
 	}
 	// Everything from here on is time the client spends waiting rather than time the
 	// server spends working, which is what the slow log and the per-command latency

@@ -791,13 +791,26 @@ sleep at the head and nobody behind it was disturbed. A waiter that *is* served 
 every queue it was in and signals the new head of each, because one push can carry
 several elements and the next client in line has to be told about the rest.
 
-The guarantee is over *blocked* clients, which is what Redis's rule is about. A
-brand-new `BLPOP` arriving in the same instant as the data makes one opportunistic
-attempt before joining any queue, and can be served ahead of a client that was already
-waiting. Closing that window would mean serializing every arriving command behind one
-lock — which is what a single-threaded server does, and what this one is built not to
-do. A plain `LPOP` racing the same instant could always take the element first, so the
-window is not new.
+**An arriving command declines to jump the queue.** A blocking command normally makes one
+opportunistic attempt before joining any queue — that is the fast path, and it must not pay
+for the wait machinery when the list already has an element. But if a waiter that *could be
+served instead of it* is already queued on one of its keys, it skips that attempt and joins
+the back. Without this, a single pipelining client could take its own push away from a
+client that had been waiting: `LPUSH k v` and `BLPOP k 0` arrive in one read, and the
+wakeup the push sends is a channel send whose recipient has not necessarily been scheduled
+before the second command runs. Redis cannot have that problem — it serves blocked clients
+between commands — and its own suite checks it. The check costs one atomic load when nobody
+is blocked anywhere, which is the normal state.
+
+It is deliberately type-aware: an arriving `BLPOP` does *not* queue behind a `BZPOPMIN`
+waiter, because a list can never serve one and that waiter will never leave the queue. Only
+a waiter that could take the same value is worth queueing behind.
+
+What remains open, and is worth naming: a plain `LPOP` racing the same instant can always
+take the element first, and two *different* connections issuing a write and a blocking read
+at the same moment are ordered by whichever goroutine the scheduler reaches first. Closing
+that would mean serializing every arriving command behind one lock, which is what a
+single-threaded server does and what this one is built not to do.
 
 **What propagates is the pop, never the command.** `BLPOP` ships the `LPOP` it
 performed, `BLMOVE` the `LMOVE`, `BZPOPMIN` the `ZREM` of the member it removed. A
@@ -1992,20 +2005,20 @@ three-node topology from `CLUSTER SLOTS`/`SHARDS`, route by slot, follow `MOVED`
 pipeline per node and stitch the replies back together, and raise `CROSSSLOT` for a
 multi-key command that spans slots — against this server exactly as against Redis.
 
-And on Redis's own suite, against this commit: **about 1180 of its assertions pass**, across
-the 23 unit files that cover the implemented surface, with 17 of those files now running to
+And on Redis's own suite, against this commit: **about 1350 of its assertions pass**, across
+the 23 unit files that cover the implemented surface, with 18 of those files now running to
 completion. Measured per file, one invocation each:
 
 | file | ok | err | stops early on |
 | --- | --- | --- | --- |
 | `type/zset` | 315 | 1 | — |
+| `type/list` | 247 | 4 | — |
 | `type/set` | 112 | 2 | — |
 | `type/string` | 79 | 0 | — |
-| `type/list` | 77 | 0 | — |
 | `type/hash` | 71 | 2 | — |
-| `type/stream` | 57 | 15 | — |
 | `geo` | 58 | 6 | — |
 | `expire` | 58 | 0 | — |
+| `type/stream` | 57 | 15 | — |
 | `bitops` | 49 | 0 | — |
 | `keyspace` | 45 | 1 | — |
 | `type/stream-cgroups` | 41 | 11 | `XINFO STREAM FULL` |
@@ -2027,14 +2040,28 @@ largest single cause used to be the encoding thresholds: Redis's type tests open
 one (`CONFIG SET hash-max-listpack-entries`, `set-max-intset-entries`, …) to exercise both of
 its internal representations, and with the thresholds hard-coded here `unit/type/hash`,
 `list`, `set` and `zset` stopped on their first line and contributed nothing. Those four now
-account for 575 of the assertions above. What remains is mostly scripting — four files end at
+account for 745 of the assertions above. What remains is mostly scripting — four files end at
 an `EVAL` or a `lua-time-limit`, and no amount of work short of an interpreter changes that.
 
-The `err` column is worth reading rather than summing. `type/stream`'s fifteen are almost all
-one thing: approximate trimming (`XADD … MAXLEN ~`, `XTRIM … LIMIT`) is defined in terms of
-Redis's macro-nodes, and a stream stored as a sorted slice has none to trim by, so it trims
-*exactly* — which the tests measure and find different. `type/hash`'s two and `type/set`'s two
-are field ordering (a Go map has none) and the derived-encoding difference described below.
+The `err` column is worth reading rather than summing, because most of it is one structural
+difference repeated:
+
+- `type/stream`'s fifteen are almost all approximate trimming. `XADD … MAXLEN ~` and
+  `XTRIM … LIMIT` are defined in terms of Redis's macro-nodes, and a stream stored as a
+  sorted slice has none to trim by, so it trims *exactly* — which the tests measure and find
+  different.
+- The encoding assertions in `type/list`, `type/set` and `type/hash` are the derived-vs-remembered
+  difference described below: this server computes the name from the value's current contents,
+  so raising a threshold can make a value report `listpack` again where Redis would still say
+  `hashtable`.
+- `type/hash`'s remaining pair is field ordering, which a Go map does not have.
+- One in `type/list` fails on real Redis too, roughly one run in six: it races an `EXEC`
+  against an unblocking `LPUSH` on another connection with no synchronisation between them.
+  Verified by running the same sequence against `redis:7.2` six times.
+- One in `type/list` is a libc difference: Redis parses a timeout with `strtold`, which accepts
+  a C hex literal (`0x7FFFFFFFFFFFFF`), and Go's `ParseFloat` requires a `p` exponent for hex.
+  It is recorded rather than papered over, because the honest fix is a float parser that
+  accepts everything `strtod` does, not a special case in one operand.
 
 Quoting a number without that paragraph would be the same dishonesty as a benchmark table
 with the losses removed.

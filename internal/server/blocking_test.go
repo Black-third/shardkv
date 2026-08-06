@@ -64,6 +64,11 @@ func dialAsync(t *testing.T, addr string) *asyncConn {
 // send issues a command without waiting for its reply.
 func (a *asyncConn) send(cmd string) { a.conn.Write([]byte(cmd + "\r\n")) }
 
+// sendRaw writes exactly these bytes, so a caller can put two commands on the wire in one
+// write and have the server read them from a single buffer -- which is what a pipelining
+// client does and what TestBlockingFairnessAgainstPipelining depends on.
+func (a *asyncConn) sendRaw(raw string) { a.conn.Write([]byte(raw)) }
+
 // reply waits for the next thing the server sends, failing the test if nothing arrives
 // in time.
 func (a *asyncConn) reply(t *testing.T, within time.Duration) string {
@@ -793,5 +798,74 @@ func TestBlockingConcurrentProducersAndConsumers(t *testing.T) {
 		if seen[want] != 1 {
 			t.Errorf("%q was delivered %d times; want exactly once", want, seen[want])
 		}
+	}
+}
+
+// TestBlockingFairnessAgainstPipelining is the fairness case only a pipelining client can
+// create: one connection sends a push and a blocking pop of the same key in a single write.
+//
+// The already-blocked client must be served, not the pipelining one. Both commands arrive in
+// one read on one connection, so the push's wakeup is a channel send whose recipient has not
+// necessarily been scheduled by the time the second command runs its opportunistic attempt --
+// and before queueAhead existed, that attempt took the element from under the client that had
+// been waiting. Redis cannot have the bug (it serves blocked clients between commands) and
+// its own suite pins the behaviour, so this is where the behaviour is pinned here.
+func TestBlockingFairnessAgainstPipelining(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	admin := dialTx(t, addr)
+	defer admin.close()
+
+	waiting := dialAsync(t, addr)
+	defer waiting.close()
+	waiting.send("BLPOP pipe 0")
+	waitBlocked(t, admin, 1)
+
+	// One write carrying both commands, so the server reads them from a single buffer.
+	pipelined := dialAsync(t, addr)
+	defer pipelined.close()
+	pipelined.sendRaw("LPUSH pipe 1\r\nBLPOP pipe 0\r\n")
+
+	if got := waiting.reply(t, 5*time.Second); got != "[pipe 1]" {
+		t.Fatalf("the client that was already blocked got %q; want [pipe 1] -- the pipelining "+
+			"client took the element it pushed", got)
+	}
+	if got := pipelined.reply(t, 5*time.Second); got != ":1" {
+		t.Fatalf("the pipelining client's LPUSH replied %q; want :1", got)
+	}
+	// And it is now the one waiting, so the next push serves it.
+	waitBlocked(t, admin, 1)
+	admin.cmd("LPUSH pipe 2")
+	if got := pipelined.reply(t, 5*time.Second); got != "[pipe 2]" {
+		t.Errorf("the pipelining client's BLPOP got %q; want [pipe 2]", got)
+	}
+}
+
+// TestBlockingDeferenceIsTypeAware checks the other half of queueAhead: an arriving command
+// only queues behind a waiter that could be served *instead of it*.
+//
+// A BZPOPMIN parked on a key cannot be served by a list, and the wakeup filter means it will
+// never consume one and never leave its queue. An arriving BLPOP that deferred to it would
+// therefore wait behind a waiter that can never be served, with the element it wanted sitting
+// in plain sight.
+func TestBlockingDeferenceIsTypeAware(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	admin := dialTx(t, addr)
+	defer admin.close()
+
+	zwaiter := dialAsync(t, addr)
+	defer zwaiter.close()
+	zwaiter.send("BZPOPMIN mixed 0")
+	waitBlocked(t, admin, 1)
+
+	// A list appears under the same key. The sorted-set waiter cannot take it.
+	admin.cmd("RPUSH mixed element")
+	lpop := dialAsync(t, addr)
+	defer lpop.close()
+	lpop.send("BLPOP mixed 0")
+	if got := lpop.reply(t, 5*time.Second); got != "[mixed element]" {
+		t.Errorf("BLPOP arriving behind a BZPOPMIN waiter got %q; want [mixed element] -- it "+
+			"must not queue behind a waiter that cannot be served by a list", got)
 	}
 }
