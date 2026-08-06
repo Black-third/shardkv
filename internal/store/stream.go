@@ -196,17 +196,30 @@ type streamConsumer struct {
 // and who its consumers are.
 type streamGroup struct {
 	lastDelivered StreamID
-	entriesRead   int64
-	pel           map[StreamID]*streamNACK
-	consumers     map[string]*streamConsumer
+	// entriesRead counts entries this group has read over its lifetime, and
+	// hasEntriesRead says whether that count is *known*. The distinction is not
+	// pedantry: a group created at "0" has read nothing, but so has a group created at
+	// "$", and the two are not the same situation -- the first is five entries behind and
+	// the second is caught up. Redis reports a **null** entries-read until the count is
+	// established, and reporting 0 for both (as this did) tells a client the second group
+	// has fallen behind when it is up to date.
+	//
+	// It becomes known when the group actually reads, or when a caller supplies
+	// ENTRIESREAD, and it goes back to unknown on an XGROUP SETID that does not supply one
+	// -- because moving the position invalidates any count derived from the old one.
+	entriesRead    int64
+	hasEntriesRead bool
+	pel            map[StreamID]*streamNACK
+	consumers      map[string]*streamConsumer
 }
 
-func newStreamGroup(start StreamID, entriesRead int64) *streamGroup {
+func newStreamGroup(start StreamID, entriesRead int64, hasEntriesRead bool) *streamGroup {
 	return &streamGroup{
-		lastDelivered: start,
-		entriesRead:   entriesRead,
-		pel:           make(map[StreamID]*streamNACK),
-		consumers:     make(map[string]*streamConsumer),
+		lastDelivered:  start,
+		entriesRead:    entriesRead,
+		hasEntriesRead: hasEntriesRead,
+		pel:            make(map[StreamID]*streamNACK),
+		consumers:      make(map[string]*streamConsumer),
 	}
 }
 
@@ -238,6 +251,60 @@ type stream struct {
 
 func newStream() *stream { return &stream{} }
 
+// groupLag reports how many entries a group has still to read, and whether that number is
+// knowable at all.
+//
+// Every branch below was derived from measuring redis:7.2 across twenty-two scenarios
+// (creation at 0/$/mid, with and without reads, with ENTRIESREAD, after XDEL of the head
+// and of the middle, after MAXLEN and MINID trims, after XSETID, after XGROUP SETID) and
+// then checked against all of them; both the amd64 and arm64 references agreed throughout.
+// It is written as an ordered cascade because the order is load-bearing -- see the third
+// case, which must be tried *before* the arithmetic one.
+//
+// What this replaced was two lines: "added minus read, and null once anything has been
+// deleted". Those were wrong in both directions. A group created at "$" is caught up, and
+// reporting `added - 0` told an operator it was the whole stream behind; meanwhile a
+// trimmed stream reported an unknown lag where the answer is exact.
+func (st *stream) groupLag(g *streamGroup) (int64, bool) {
+	// 1. Nothing left to read, whatever the history. Covers a stream that was trimmed to
+	//    nothing or had every entry deleted, where Redis reports 0 rather than null.
+	if len(st.entries) == 0 {
+		return 0, true
+	}
+	// 2. The group is at or past the last id ever written, so it is caught up. This is the
+	//    case a plain "added - read" got wrong for a group created at "$".
+	if g.lastDelivered.Compare(st.last) >= 0 {
+		return 0, true
+	}
+	first := st.entries[0].ID
+	// 3. The group sits before the first entry that is still here, and the stream has no
+	//    hole *after* that point -- either nothing was deleted, or everything deleted was
+	//    older than what remains (which is what a prefix trim leaves behind). Then the
+	//    group has the whole remaining stream to read, and the count of it is exact even
+	//    though the read counter is not.
+	//
+	//    This is tried before case 4 deliberately: with `ENTRIESREAD 2` on a five-entry
+	//    stream and a group still at 0-0, Redis answers 5, not 3. The position is harder
+	//    evidence than a counter a caller asserted.
+	if (st.maxDeleted == StreamID{} || st.maxDeleted.Compare(first) < 0) &&
+		g.lastDelivered.Compare(first) < 0 {
+		return int64(len(st.entries)), true
+	}
+	// 4. The read counter is known and no deleted id sits at or after the group's
+	//    position, so nothing it has yet to read has gone missing and the arithmetic holds.
+	if g.hasEntriesRead && (st.maxDeleted == StreamID{} || st.maxDeleted.Compare(g.lastDelivered) < 0) {
+		if lag := int64(st.added) - g.entriesRead; lag >= 0 {
+			return lag, true
+		}
+	}
+	// 5. Otherwise the group is somewhere inside a stream with a hole ahead of it, and
+	//    there is no cheap way to count what it has left. Redis will sometimes estimate
+	//    here; this reports null instead, which is the honest answer and is documented as
+	//    a deliberate difference. A wrong lag is worse than an absent one -- it is the
+	//    number an operator pages on.
+	return 0, false
+}
+
 // clone deep-copies the stream, for COPY. The consumer groups come too, including
 // their pending-entries lists: a copied stream that lost its groups would silently
 // hand a consumer a keyspace it had already read as though it were new.
@@ -252,7 +319,7 @@ func (st *stream) clone() *stream {
 	}
 	out.groups = make(map[string]*streamGroup, len(st.groups))
 	for name, g := range st.groups {
-		ng := newStreamGroup(g.lastDelivered, g.entriesRead)
+		ng := newStreamGroup(g.lastDelivered, g.entriesRead, g.hasEntriesRead)
 		for cname, c := range g.consumers {
 			ng.consumers[cname] = &streamConsumer{
 				name: cname, seenMs: c.seenMs, activeMs: c.activeMs,
@@ -405,11 +472,18 @@ func (st *stream) trim(o TrimOptions) int64 {
 	if cut <= 0 {
 		return 0
 	}
-	// The largest id being removed becomes the stream's max-deleted marker, so a
-	// reader can still tell a gap from an id that was never written.
-	if last := st.entries[cut-1].ID; last.Compare(st.maxDeleted) > 0 {
-		st.maxDeleted = last
-	}
+	// A trim deliberately does *not* touch maxDeleted, which is what Redis does and was
+	// measured: after `XTRIM s MAXLEN 2` on a five-entry stream, real Redis still reports
+	// `max-deleted-entry-id 0-0` while this used to report `3-1`.
+	//
+	// The distinction is meaningful rather than cosmetic. `max-deleted-entry-id` records
+	// ids that were *explicitly* removed, which is how a consumer tracking its position by
+	// id tells "never written" from "written and gone" -- and it is also what tells the lag
+	// calculation that the stream has a hole in it. Trimming leaves no hole: it removes a
+	// prefix, so what remains is still contiguous, and `recorded-first-entry-id` already
+	// says where it now starts. Recording a trim here made every trimmed stream look
+	// fragmented, which is why a trimmed group's lag came back as "unknown" on a stream
+	// Redis reports an exact lag for.
 	st.entries = slices.Delete(st.entries, 0, cut)
 	return int64(cut)
 }
@@ -727,9 +801,13 @@ func (s *Store) streamForGroupWrite(sh *shard, key string, now time.Time, mkstre
 	return e, nil
 }
 
-// XGroupCreate creates a consumer group starting from the given id. entriesRead seeds
-// the group's read counter, which a snapshot restores and a client leaves at zero.
-func (s *Store) XGroupCreate(key, group string, start StreamID, mkstream bool, entriesRead int64) error {
+// XGroupCreate creates a consumer group starting from the given id.
+//
+// hasEntriesRead says whether the caller supplied a read counter. A client's plain
+// XGROUP CREATE does not, and the group's count is then *unknown* rather than zero --
+// see streamGroup.entriesRead for why that distinction is what makes lag correct. A
+// snapshot replay does supply one, which is how a restored group keeps the count it had.
+func (s *Store) XGroupCreate(key, group string, start StreamID, mkstream bool, entriesRead int64, hasEntriesRead bool) error {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
@@ -742,7 +820,7 @@ func (s *Store) XGroupCreate(key, group string, start StreamID, mkstream bool, e
 	if _, exists := e.stream.groups[group]; exists {
 		return ErrBusyGroup
 	}
-	e.stream.groups[group] = newStreamGroup(start, entriesRead)
+	e.stream.groups[group] = newStreamGroup(start, entriesRead, hasEntriesRead)
 	s.touch(e, now)
 	return nil
 }
@@ -767,9 +845,12 @@ func (s *Store) XGroupSetID(key, group string, id StreamID, hasEntriesRead bool,
 		return ErrNoGroup
 	}
 	g.lastDelivered = id
-	if hasEntriesRead {
-		g.entriesRead = entriesRead
-	}
+	// Without an explicit ENTRIESREAD the count is *invalidated*, not left alone: it was
+	// derived from the old position, and the position has just moved. Keeping it produced a
+	// concrete lie -- `XGROUP SETID s g 0` after reading a whole stream left the group
+	// reporting "5 read, lag 0" while sitting at the very beginning. Measured against
+	// redis:7.2, which reports a null entries-read here.
+	g.entriesRead, g.hasEntriesRead = entriesRead, hasEntriesRead
 	s.touch(e, now)
 	return nil
 }
@@ -948,7 +1029,25 @@ func (s *Store) XReadGroup(key, group, consumer string, newOnly bool, after Stre
 		}
 		ent := st.entries[i]
 		g.lastDelivered = ent.ID
-		g.entriesRead++
+		// Reading establishes the count as well as advancing it -- and when it was unknown
+		// it is seeded from the *position*, not from zero. Measured on redis:7.2: a group
+		// created at "$" on a three-entry stream, given a fourth entry, reports
+		// entries-read 4 after reading it, and a group created at "2-1" that reads "3-1"
+		// reports 3. Both are "the ordinal of the entry just read", which is the only
+		// answer consistent with the counter meaning "entries of this stream's lifetime
+		// this group has consumed". Incrementing from zero would have said 1 in both cases
+		// and understated every later lag by the group's starting offset.
+		//
+		// The ordinal is derived rather than stored: ids are assigned in increasing order
+		// and `added` counts lifetime additions, so for a contiguous stream the entry at
+		// slice index i is the (added - (len-1-i))'th ever added. With deletions this is an
+		// estimate, as it is in Redis.
+		if g.hasEntriesRead {
+			g.entriesRead++
+		} else {
+			g.entriesRead = int64(st.added) - int64(len(st.entries)-1-i)
+			g.hasEntriesRead = true
+		}
 		res.Entries = append(res.Entries, ent.clone())
 		c.activeMs = nowMs
 		if noack {
@@ -1354,6 +1453,7 @@ type StreamGroupInfo struct {
 	Pending         int64
 	LastDelivered   StreamID
 	EntriesRead     int64
+	HasEntriesRead  bool
 	Lag             int64
 	HasLag          bool
 	ConsumerDetails []StreamConsumerInfo
@@ -1420,20 +1520,14 @@ func (s *Store) XInfoGroups(key string, withConsumers bool) ([]StreamGroupInfo, 
 	out := make([]StreamGroupInfo, 0, len(st.groups))
 	for name, g := range st.groups {
 		info := StreamGroupInfo{
-			Name:          name,
-			Consumers:     int64(len(g.consumers)),
-			Pending:       int64(len(g.pel)),
-			LastDelivered: g.lastDelivered,
-			EntriesRead:   g.entriesRead,
+			Name:           name,
+			Consumers:      int64(len(g.consumers)),
+			Pending:        int64(len(g.pel)),
+			LastDelivered:  g.lastDelivered,
+			EntriesRead:    g.entriesRead,
+			HasEntriesRead: g.hasEntriesRead,
 		}
-		// Lag is how many entries the group has not read. It is only knowable when nothing
-		// has been deleted from underneath the group: once entries have gone, "added minus
-		// read" over-counts and there is no cheap way to recover the truth, so Redis reports
-		// a null lag rather than a wrong number. This does the same.
-		if st.maxDeleted == (StreamID{}) {
-			info.Lag = int64(st.added) - g.entriesRead
-			info.HasLag = info.Lag >= 0
-		}
+		info.Lag, info.HasLag = st.groupLag(g)
 		if withConsumers {
 			info.ConsumerDetails = consumerInfos(g, nowMs)
 		}
@@ -1485,5 +1579,171 @@ func consumerInfos(g *streamGroup, nowMs int64) []StreamConsumerInfo {
 		})
 	}
 	slices.SortFunc(out, func(a, b StreamConsumerInfo) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+// --- XINFO STREAM FULL --------------------------------------------------------
+
+// StreamFullInfo is everything XINFO STREAM ... FULL reports: the stream's counters, a
+// bounded window of its entries, and every group with its consumers and both
+// pending-entries lists in full.
+//
+// It is a separate type from StreamInfo rather than an extension of it, because the two
+// forms report genuinely different field sets: FULL has no first-entry/last-entry (the
+// entries themselves are there), and its "groups" is the groups rather than a count of
+// them. Measured against redis:7.2, which reports nine fields here and ten there.
+type StreamFullInfo struct {
+	Length          int64
+	EntriesAdded    int64
+	LastID          StreamID
+	MaxDeletedID    StreamID
+	RecordedFirstID StreamID
+	Entries         []StreamEntry
+	Groups          []StreamFullGroupInfo
+}
+
+// StreamFullGroupInfo is one group as FULL reports it. Note it carries the pending
+// entries themselves, not a count: a PEL is the record of work in flight, and the whole
+// point of the FULL form is to be able to see it.
+type StreamFullGroupInfo struct {
+	Name           string
+	LastDelivered  StreamID
+	EntriesRead    int64
+	HasEntriesRead bool
+	Lag            int64
+	HasLag         bool
+	PelCount       int64
+	Pending        []StreamFullPending
+	Consumers      []StreamFullConsumerInfo
+}
+
+// StreamFullConsumerInfo is one consumer as FULL reports it.
+//
+// seen-time and active-time are absolute instants here, where XINFO CONSUMERS reports
+// them as the *durations* idle and inactive. That asymmetry is Redis's, and it is the
+// right way round: the summary form answers "is this consumer alive?", which is a
+// duration, while the full form is a dump of state, and a dump that reported durations
+// would say something different every time it ran.
+type StreamFullConsumerInfo struct {
+	Name     string
+	SeenMs   int64
+	ActiveMs int64
+	PelCount int64
+	Pending  []StreamFullPending
+}
+
+// StreamFullPending is one pending entry. Consumer is empty in a *consumer's* own list,
+// where naming the consumer again would be redundant -- Redis omits it there, reporting
+// three fields instead of four, and a client reading the reply positionally depends on
+// that.
+type StreamFullPending struct {
+	ID            StreamID
+	Consumer      string
+	DeliveryMs    int64
+	DeliveryCount int64
+}
+
+// XInfoStreamFull implements XINFO STREAM key FULL [COUNT n].
+//
+// count bounds the entries returned, because a FULL report on a large stream would
+// otherwise serialise the whole thing: Redis defaults to 10 for exactly that reason and
+// treats 0 as "all".
+//
+// It bounds **all three** lists to the same limit -- the entries, the group's
+// pending-entries list, and each consumer's. That was measured rather than assumed: with a
+// consumer holding five pending entries, `COUNT 2` reports two of them and `COUNT 0`
+// reports all five. Bounding only the entries (as the first version of this did) left the
+// PELs unbounded, which defeats the point -- a group with a million unacknowledged entries
+// is exactly the situation an operator runs FULL in, and it is the PEL that is large.
+//
+// ok is false for a missing key.
+func (s *Store) XInfoStreamFull(key string, count int) (StreamFullInfo, bool, error) {
+	var out StreamFullInfo
+	sh := s.getShard(key)
+	now := s.clock()
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	e := s.readEntry(sh, key, now)
+	if e == nil {
+		return out, false, nil
+	}
+	if e.kind != kindStream {
+		return out, false, ErrWrongType
+	}
+	st := e.stream
+	out = StreamFullInfo{
+		Length:       int64(len(st.entries)),
+		EntriesAdded: int64(st.added),
+		LastID:       st.last,
+		MaxDeletedID: st.maxDeleted,
+	}
+	if len(st.entries) > 0 {
+		out.RecordedFirstID = st.entries[0].ID
+	}
+
+	n := len(st.entries)
+	if count > 0 && count < n {
+		n = count
+	}
+	out.Entries = make([]StreamEntry, 0, n)
+	for _, ent := range st.entries[:n] {
+		out.Entries = append(out.Entries, ent.clone())
+	}
+
+	out.Groups = make([]StreamFullGroupInfo, 0, len(st.groups))
+	for name, g := range st.groups {
+		gi := StreamFullGroupInfo{
+			Name:           name,
+			LastDelivered:  g.lastDelivered,
+			EntriesRead:    g.entriesRead,
+			HasEntriesRead: g.hasEntriesRead,
+			PelCount:       int64(len(g.pel)),
+			Pending:        pendingList(g.pel, true, count),
+			Consumers:      make([]StreamFullConsumerInfo, 0, len(g.consumers)),
+		}
+		gi.Lag, gi.HasLag = st.groupLag(g)
+		for cname, c := range g.consumers {
+			gi.Consumers = append(gi.Consumers, StreamFullConsumerInfo{
+				Name:     cname,
+				SeenMs:   c.seenMs,
+				ActiveMs: c.activeMs,
+				PelCount: int64(len(c.pel)),
+				Pending:  pendingList(c.pel, false, count),
+			})
+		}
+		slices.SortFunc(gi.Consumers, func(a, b StreamFullConsumerInfo) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		out.Groups = append(out.Groups, gi)
+	}
+	slices.SortFunc(out.Groups, func(a, b StreamFullGroupInfo) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out, true, nil
+}
+
+// pendingList flattens a PEL in id order, keeping at most limit entries (0 means all).
+// withConsumer distinguishes a group's list, which names the owning consumer, from a
+// consumer's own, which does not.
+//
+// The sort is not cosmetic, and it happens *before* the limit is applied: the PEL is a map,
+// so an unsorted dump would put a Go map's iteration order on the wire -- two servers
+// holding identical state would answer differently, and truncating an unsorted list would
+// make them disagree about *which* entries they showed. That is the same reasoning that
+// makes the non-deterministic commands propagate their effects.
+func pendingList(pel map[StreamID]*streamNACK, withConsumer bool, limit int) []StreamFullPending {
+	out := make([]StreamFullPending, 0, len(pel))
+	for id, nack := range pel {
+		p := StreamFullPending{ID: id, DeliveryMs: nack.deliveryMs, DeliveryCount: nack.deliveryCount}
+		if withConsumer {
+			p.Consumer = nack.consumer
+		}
+		out = append(out, p)
+	}
+	slices.SortFunc(out, func(a, b StreamFullPending) int { return a.ID.Compare(b.ID) })
+	if limit > 0 && limit < len(out) {
+		out = out[:limit]
+	}
 	return out
 }

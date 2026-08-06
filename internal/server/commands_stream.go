@@ -1038,7 +1038,11 @@ func (s *Server) xgroupCreate(w *resp.Writer, args [][]byte, key, group string) 
 		return nil
 	}
 	mkstream := false
-	entriesRead := int64(0)
+	// -1 is Redis's wire spelling of "the read counter is unknown", and it is what a plain
+	// XGROUP CREATE leaves behind: the group has read nothing, but so has a group created
+	// at "$", and reporting 0 for both would tell a client a caught-up group is behind.
+	// See streamGroup.entriesRead.
+	entriesRead := int64(-1)
 	for i := 5; i < len(args); i++ {
 		switch {
 		case strings.EqualFold(string(args[i]), "MKSTREAM"):
@@ -1056,7 +1060,7 @@ func (s *Server) xgroupCreate(w *resp.Writer, args [][]byte, key, group string) 
 			return nil
 		}
 	}
-	if err := s.store.XGroupCreate(key, group, start, mkstream, entriesRead); err != nil {
+	if err := s.store.XGroupCreate(key, group, start, mkstream, entriesRead, entriesRead >= 0); err != nil {
 		return xgroupErr(w, err, key, group)
 	}
 	w.WriteSimple("OK")
@@ -1068,6 +1072,9 @@ func (s *Server) xgroupCreate(w *resp.Writer, args [][]byte, key, group string) 
 		// too, or the replica answers the group command with "no such key".
 		effect = append(effect, []byte("MKSTREAM"))
 	}
+	// Always carried, including the -1: the replica has to end up with the *same*
+	// known-or-unknown state, or the two disagree about a group's lag from here on while
+	// both look internally consistent -- invariant 4's failure shape exactly.
 	effect = append(effect, []byte("ENTRIESREAD"), []byte(strconv.FormatInt(entriesRead, 10)))
 	return [][][]byte{effect}
 }
@@ -1097,7 +1104,10 @@ func (s *Server) xgroupSetID(w *resp.Writer, args [][]byte, key, group string) [
 		}
 		hasRead, entriesRead = true, n
 	}
-	if err := s.store.XGroupSetID(key, group, id, hasRead, entriesRead); err != nil {
+	// hasRead means the count is *known*, not merely that the client typed ENTRIESREAD:
+	// an explicit -1 asks for it to be forgotten, which is the same state a bare SETID
+	// leaves. Either way the effect below reproduces it on the replica.
+	if err := s.store.XGroupSetID(key, group, id, hasRead && entriesRead >= 0, entriesRead); err != nil {
 		return xgroupErr(w, err, key, group)
 	}
 	w.WriteSimple("OK")
@@ -1477,9 +1487,10 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 			return false
 		}
 	case "STREAM":
-		// FULL is not implemented here, so it lands in this arm too: better a refusal
-		// naming the option than a summary report answering a request for a full one.
-		if len(args) != 3 {
+		// STREAM takes an optional FULL, itself taking an optional COUNT, so anything else
+		// is an unrecognised *option* rather than a surplus argument -- which is why it gets
+		// the other of Redis's two messages. Both spellings were measured.
+		if len(args) != 3 && !xinfoFullForm(args) {
 			writeSubcommandSyntaxError(w, "XINFO", args[1])
 			return false
 		}
@@ -1487,6 +1498,24 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 
 	switch sub {
 	case "STREAM":
+		if xinfoFullForm(args) {
+			count, valid := xinfoFullCount(args)
+			if !valid {
+				w.WriteError("ERR value is not an integer or out of range")
+				return false
+			}
+			info, ok, err := s.store.XInfoStreamFull(key, count)
+			if err != nil {
+				writeStoreErr(w, err)
+				return false
+			}
+			if !ok {
+				w.WriteError("ERR no such key")
+				return false
+			}
+			writeXInfoStreamFull(w, info)
+			return false
+		}
 		info, ok, err := s.store.XInfoStream(key)
 		if err != nil {
 			writeStoreErr(w, err)
@@ -1598,11 +1627,21 @@ func writeXInfoGroup(w *resp.Writer, g store.StreamGroupInfo) {
 	w.WriteBulk([]byte("last-delivered-id"))
 	w.WriteBulk([]byte(g.LastDelivered.String()))
 	w.WriteBulk([]byte("entries-read"))
-	w.WriteInt(g.EntriesRead)
+	// A null entries-read means the count is not established, which is different from
+	// zero: a group created at "$" and one created at "0" have both read nothing, but the
+	// first is caught up and the second is the whole stream behind. Reporting 0 for both
+	// told a client the caught-up group had fallen behind.
+	if g.HasEntriesRead {
+		w.WriteInt(g.EntriesRead)
+	} else {
+		w.WriteNull()
+	}
 	w.WriteBulk([]byte("lag"))
-	// A null lag means "not knowable": entries have been deleted from under this group,
-	// so "added minus read" would over-count. Redis reports null here for the same
-	// reason, and a wrong number would be worse than no number.
+	// A null lag means "not knowable": the group sits inside a stream with a hole ahead of
+	// it, so there is no cheap way to count what it has left to read. Redis will sometimes
+	// estimate here and this does not -- a deliberate difference, because the lag is the
+	// number an operator pages on and a wrong one is worse than an absent one. See
+	// stream.groupLag for the cases that *are* answered, all measured against redis:7.2.
 	if g.HasLag {
 		w.WriteInt(g.Lag)
 	} else {
@@ -1639,4 +1678,133 @@ func (s *Server) notifyConsumerCreated(created bool, key string) {
 		return
 	}
 	s.notifyKeyspaceEvent(flags, notifyStream, "xgroup-createconsumer", key)
+}
+
+// xinfoFullForm reports whether this XINFO STREAM asked for the FULL report:
+// `XINFO STREAM key FULL` or `XINFO STREAM key FULL COUNT n`, and nothing else.
+func xinfoFullForm(args [][]byte) bool {
+	if len(args) < 4 || !strings.EqualFold(string(args[3]), "FULL") {
+		return false
+	}
+	switch len(args) {
+	case 4:
+		return true
+	case 6:
+		return strings.EqualFold(string(args[4]), "COUNT")
+	}
+	return false
+}
+
+// xinfoFullCount is FULL's entry limit, and reports whether the operand was valid.
+//
+// It defaults to 10 -- Redis's default, chosen so a FULL report on a large stream does not
+// serialise the whole thing by accident -- and 0 means "all". Both boundaries were
+// measured on redis:7.2, and they are not the same rule: a *negative* count silently falls
+// back to the default, while a non-numeric one is refused with
+// "value is not an integer or out of range". Treating the two alike (as the first version
+// of this did) meant `XINFO STREAM s FULL COUNT x` quietly answered with ten entries
+// instead of telling the caller its argument was nonsense.
+func xinfoFullCount(args [][]byte) (int, bool) {
+	const defaultCount = 10
+	if len(args) != 6 {
+		return defaultCount, true
+	}
+	n, ok := parseInt64(args[5])
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case n < 0:
+		return defaultCount, true
+	case n == 0 || n > math.MaxInt32:
+		return 0, true // all of them
+	}
+	return int(n), true
+}
+
+// writeXInfoStreamFull writes the FULL report. The field order is Redis's, because a
+// client may read the reply positionally, and the nesting is what a RESP3 client
+// dispatches on: the report and each group are maps, while entries, groups, consumers and
+// both pending lists are arrays. All of it was captured from redis:7.2 over both protocols.
+func writeXInfoStreamFull(w *resp.Writer, info store.StreamFullInfo) {
+	w.WriteMapHeader(9)
+	w.WriteBulk([]byte("length"))
+	w.WriteInt(info.Length)
+	// Both radix-tree fields are the entry count rather than an invention: this server
+	// keeps entries in a sorted slice, so there are no internal nodes to count. See
+	// writeXInfoStream, which reports them the same way and explains why.
+	w.WriteBulk([]byte("radix-tree-keys"))
+	w.WriteInt(info.Length)
+	w.WriteBulk([]byte("radix-tree-nodes"))
+	w.WriteInt(info.Length)
+	w.WriteBulk([]byte("last-generated-id"))
+	w.WriteBulk([]byte(info.LastID.String()))
+	w.WriteBulk([]byte("max-deleted-entry-id"))
+	w.WriteBulk([]byte(info.MaxDeletedID.String()))
+	w.WriteBulk([]byte("entries-added"))
+	w.WriteInt(info.EntriesAdded)
+	w.WriteBulk([]byte("recorded-first-entry-id"))
+	w.WriteBulk([]byte(info.RecordedFirstID.String()))
+	w.WriteBulk([]byte("entries"))
+	w.WriteArrayHeader(len(info.Entries))
+	for _, ent := range info.Entries {
+		writeStreamEntry(w, ent)
+	}
+	w.WriteBulk([]byte("groups"))
+	w.WriteArrayHeader(len(info.Groups))
+	for _, g := range info.Groups {
+		w.WriteMapHeader(7)
+		w.WriteBulk([]byte("name"))
+		w.WriteBulk([]byte(g.Name))
+		w.WriteBulk([]byte("last-delivered-id"))
+		w.WriteBulk([]byte(g.LastDelivered.String()))
+		w.WriteBulk([]byte("entries-read"))
+		if g.HasEntriesRead {
+			w.WriteInt(g.EntriesRead)
+		} else {
+			w.WriteNull()
+		}
+		w.WriteBulk([]byte("lag"))
+		if g.HasLag {
+			w.WriteInt(g.Lag)
+		} else {
+			w.WriteNull()
+		}
+		w.WriteBulk([]byte("pel-count"))
+		w.WriteInt(g.PelCount)
+		w.WriteBulk([]byte("pending"))
+		w.WriteArrayHeader(len(g.Pending))
+		for _, p := range g.Pending {
+			// Four fields in a group's list: the entry, who holds it, when it was last
+			// delivered and how many times. The consumer's own list below omits the name.
+			w.WriteArrayHeader(4)
+			w.WriteBulk([]byte(p.ID.String()))
+			w.WriteBulk([]byte(p.Consumer))
+			w.WriteInt(p.DeliveryMs)
+			w.WriteInt(p.DeliveryCount)
+		}
+		w.WriteBulk([]byte("consumers"))
+		w.WriteArrayHeader(len(g.Consumers))
+		for _, c := range g.Consumers {
+			w.WriteMapHeader(5)
+			w.WriteBulk([]byte("name"))
+			w.WriteBulk([]byte(c.Name))
+			// Absolute instants, not durations -- see StreamFullConsumerInfo for why the
+			// full form differs from XINFO CONSUMERS here.
+			w.WriteBulk([]byte("seen-time"))
+			w.WriteInt(c.SeenMs)
+			w.WriteBulk([]byte("active-time"))
+			w.WriteInt(c.ActiveMs)
+			w.WriteBulk([]byte("pel-count"))
+			w.WriteInt(c.PelCount)
+			w.WriteBulk([]byte("pending"))
+			w.WriteArrayHeader(len(c.Pending))
+			for _, p := range c.Pending {
+				w.WriteArrayHeader(3)
+				w.WriteBulk([]byte(p.ID.String()))
+				w.WriteInt(p.DeliveryMs)
+				w.WriteInt(p.DeliveryCount)
+			}
+		}
+	}
 }

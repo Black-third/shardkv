@@ -2,6 +2,7 @@ package server
 
 import (
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -832,6 +833,177 @@ func TestNogroupTextsAndXInfoDispatch(t *testing.T) {
 	for _, cmd := range []string{"XPENDING st g", "XINFO CONSUMERS st g", "XAUTOCLAIM st g c 0 0"} {
 		if got := c.cmd(cmd); strings.HasPrefix(got, "-") {
 			t.Errorf("%q with the group present = %q; want a reply", cmd, got)
+		}
+	}
+}
+
+// TestStreamGroupLagAndEntriesRead pins a consumer group's two reported counters. Every
+// expectation was measured against redis:7.2 -- identically on amd64 and arm64 -- across a
+// matrix of twenty-two situations, and the implementation was written to the measurements
+// rather than to a reading of Redis's source.
+//
+// Two of the old answers were not merely imprecise, they were misleading, and lag is the
+// number an operator alerts on:
+//
+//   - a group created at "$" is caught up, and `added - 0` reported it as the whole stream
+//     behind. On a busy stream that is a permanent false alarm.
+//   - entries-read was 0 for a group that had never read, where Redis reports a **null**.
+//     Zero and unknown are different: a group at "$" and a group at "0" have both read
+//     nothing, and only one of them is behind.
+//
+// And two were needlessly unhelpful: a trimmed stream reported an unknown lag where the
+// answer is exact, and `XGROUP SETID` left a stale read counter in place, so a group reset
+// to the beginning still claimed to have consumed the whole stream.
+func TestStreamGroupLagAndEntriesRead(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	// entriesReadAndLag returns the two fields of the first (only) group.
+	entriesReadAndLag := func(t *testing.T) (string, string) {
+		t.Helper()
+		reply := c.cmd("XINFO GROUPS s")
+		// The reply is [[name g consumers N pending N last-delivered-id ID entries-read X lag Y]].
+		fields := strings.Split(strings.Trim(reply, "[]"), " ")
+		var read, lag string
+		for i := 0; i+1 < len(fields); i++ {
+			switch fields[i] {
+			case "entries-read":
+				read = fields[i+1]
+			case "lag":
+				lag = fields[i+1]
+			}
+		}
+		return read, lag
+	}
+
+	// setup runs a scenario from an empty database. Five entries, ids 1-1..5-1.
+	seed := func(extra ...string) {
+		c.cmd("FLUSHDB")
+		for i := 1; i <= 5; i++ {
+			c.cmd("XADD s " + strconv.Itoa(i) + "-1 f " + strconv.Itoa(i))
+		}
+		for _, cmd := range extra {
+			c.cmd(cmd)
+		}
+	}
+
+	cases := []struct {
+		name       string
+		setup      []string
+		wantRead   string // "(nil)" for the null Redis reports when the count is unknown
+		wantLag    string
+		wantReason string
+	}{
+		{"created at 0, never read", []string{"XGROUP CREATE s g 0"}, "(nil)", ":5",
+			"the whole stream is unread, and the count of it is exact even though entries-read is not"},
+		{"created at $, never read", []string{"XGROUP CREATE s g $"}, "(nil)", ":0",
+			"caught up: this is the case that used to report 5"},
+		{"created mid-stream, never read", []string{"XGROUP CREATE s g 3-1"}, "(nil)", "(nil)",
+			"neither the count nor the position can settle it, so Redis reports null rather than a guess"},
+		{"read one", []string{"XGROUP CREATE s g 0", "XREADGROUP GROUP g c COUNT 1 STREAMS s >"}, ":1", ":4",
+			"reading establishes the counter"},
+		{"read all", []string{"XGROUP CREATE s g 0", "XREADGROUP GROUP g c COUNT 99 STREAMS s >"}, ":5", ":0", ""},
+		{"ENTRIESREAD 2 while still at 0", []string{"XGROUP CREATE s g 0 ENTRIESREAD 2"}, ":2", ":5",
+			"the position is harder evidence than a counter the caller asserted, so 5 and not 3"},
+		{"ENTRIESREAD -1 means unknown", []string{"XGROUP CREATE s g 0 ENTRIESREAD -1"}, "(nil)", ":5",
+			"-1 is Redis's wire spelling of an unestablished counter"},
+		{"head deleted", []string{"XGROUP CREATE s g 0", "XDEL s 1-1"}, "(nil)", ":4",
+			"everything deleted is older than what remains, so the remainder is still countable"},
+		{"middle deleted", []string{"XGROUP CREATE s g 0", "XDEL s 3-1"}, "(nil)", "(nil)",
+			"a hole ahead of the group; a wrong lag would be worse than none"},
+		{"all deleted", []string{"XGROUP CREATE s g 0", "XDEL s 1-1", "XDEL s 2-1", "XDEL s 3-1",
+			"XDEL s 4-1", "XDEL s 5-1"}, "(nil)", ":0", "nothing left to read"},
+		{"trimmed", []string{"XGROUP CREATE s g 0", "XTRIM s MAXLEN 2"}, "(nil)", ":2",
+			"a trim removes a prefix and leaves no hole, so this used to be null and should not be"},
+		{"trimmed to nothing", []string{"XGROUP CREATE s g 0", "XTRIM s MAXLEN 0"}, "(nil)", ":0", ""},
+		{"read then head deleted", []string{"XGROUP CREATE s g 0",
+			"XREADGROUP GROUP g c COUNT 1 STREAMS s >", "XDEL s 1-1"}, ":1", ":4", ""},
+		{"more added after reading all", []string{"XGROUP CREATE s g 0",
+			"XREADGROUP GROUP g c COUNT 99 STREAMS s >", "XADD s 6-1 f 6"}, ":5", ":1", ""},
+		{"SETID forgets the counter", []string{"XGROUP CREATE s g 0",
+			"XREADGROUP GROUP g c COUNT 99 STREAMS s >", "XGROUP SETID s g 0"}, "(nil)", ":5",
+			"the count was derived from a position that has just moved; keeping it claimed the " +
+				"group had consumed a stream it is sitting at the start of"},
+		{"SETID to $", []string{"XGROUP CREATE s g 0", "XGROUP SETID s g $"}, "(nil)", ":0", ""},
+		{"XSETID raises entries-added", []string{"XGROUP CREATE s g 0",
+			"XSETID s 9-9 ENTRIESADDED 9"}, "(nil)", ":5",
+			"lag counts what is *there*, not the lifetime counter"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			seed(tc.setup...)
+			read, lag := entriesReadAndLag(t)
+			if read != tc.wantRead || lag != tc.wantLag {
+				t.Errorf("entries-read=%s lag=%s; want entries-read=%s lag=%s (%s)",
+					read, lag, tc.wantRead, tc.wantLag, tc.wantReason)
+			}
+		})
+	}
+
+	// Reading establishes the counter from the group's *position*, not from zero: a group
+	// created at "$" that reads the fourth entry ever added reports 4. Measured on
+	// redis:7.2; counting from zero would have said 1 and understated every later lag by
+	// the group's starting offset.
+	c.cmd("FLUSHDB")
+	for i := 1; i <= 3; i++ {
+		c.cmd("XADD s " + strconv.Itoa(i) + "-1 f " + strconv.Itoa(i))
+	}
+	c.cmd("XGROUP CREATE s g $")
+	c.cmd("XADD s 4-1 f 4")
+	c.cmd("XREADGROUP GROUP g c COUNT 1 STREAMS s >")
+	if read, lag := entriesReadAndLag(t); read != ":4" || lag != ":0" {
+		t.Errorf("a group created at $ that read the 4th entry reports entries-read=%s lag=%s; want 4 and 0",
+			read, lag)
+	}
+}
+
+// TestStreamTrimDoesNotRecordADeletion pins that a trim leaves max-deleted-entry-id alone.
+//
+// It used to record the largest trimmed id there, which made every trimmed stream look
+// fragmented -- and `max-deleted-entry-id` is an input to the lag calculation, so a routine
+// MAXLEN trim turned an exact lag into "unknown". Measured on redis:7.2: after
+// `XTRIM s MAXLEN 2` on a five-entry stream, max-deleted-entry-id is still 0-0, while
+// `XDEL s 3-1` does set it. The distinction is real: XDEL leaves a hole, a trim removes a
+// prefix and leaves the remainder contiguous, and recorded-first-entry-id already says
+// where that remainder starts.
+func TestStreamTrimDoesNotRecordADeletion(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	c := dialTx(t, addr)
+	defer c.close()
+
+	field := func(reply, name string) string {
+		fields := strings.Split(strings.Trim(reply, "[]"), " ")
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == name {
+				return fields[i+1]
+			}
+		}
+		return "<missing>"
+	}
+	seed := func(then string) string {
+		c.cmd("FLUSHDB")
+		for i := 1; i <= 5; i++ {
+			c.cmd("XADD s " + strconv.Itoa(i) + "-1 f " + strconv.Itoa(i))
+		}
+		c.cmd(then)
+		return c.cmd("XINFO STREAM s")
+	}
+	for _, tc := range []struct{ cmd, wantMaxDel, wantFirst string }{
+		{"XTRIM s MAXLEN 2", "0-0", "4-1"},
+		{"XTRIM s MINID 3", "0-0", "3-1"},
+		{"XTRIM s MAXLEN 0", "0-0", "0-0"},
+		{"XDEL s 3-1", "3-1", "1-1"}, // an explicit delete does record one
+		{"XDEL s 1-1", "1-1", "2-1"}, // ...including of the head
+	} {
+		reply := seed(tc.cmd)
+		if got := field(reply, "max-deleted-entry-id"); got != tc.wantMaxDel {
+			t.Errorf("after %q max-deleted-entry-id = %s; want %s", tc.cmd, got, tc.wantMaxDel)
+		}
+		if got := field(reply, "recorded-first-entry-id"); got != tc.wantFirst {
+			t.Errorf("after %q recorded-first-entry-id = %s; want %s", tc.cmd, got, tc.wantFirst)
 		}
 	}
 }
