@@ -720,6 +720,18 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
+			// A malformed request gets told what was wrong with it before the connection
+			// goes away. Closing silently -- which is what this did -- is what every
+			// client library reports as "connection reset by peer", indistinguishable
+			// from a crash or a network fault, and it withholds the one fact the caller
+			// needs. Redis answers with the detail and then hangs up; so does this.
+			//
+			// Only a protocol violation produces a reply. An EOF or a read error has
+			// nobody left to tell.
+			if detail := resp.ProtocolErrorText(err); detail != "" {
+				w.WriteError("ERR " + detail)
+				w.Flush()
+			}
 			return
 		}
 		if len(args) == 0 {

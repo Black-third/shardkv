@@ -61,6 +61,76 @@ const (
 // ErrProtocol indicates a malformed client request.
 var ErrProtocol = errors.New("resp: protocol error")
 
+// The specific protocol violations, each carrying the detail Redis reports for it.
+//
+// They exist so the server can answer a malformed request with a diagnosable sentence
+// before hanging up. Closing the connection silently -- which is what this did -- is
+// indistinguishable from a crash or a network fault to every client library, and it
+// costs the caller the one piece of information that would tell them what they sent
+// wrong. Redis names the offending byte, so these do too.
+// Each wraps ErrProtocol, so a caller that only cares whether the request was malformed
+// keeps working with errors.Is(err, ErrProtocol) while one that wants to report the
+// detail can ask for it.
+var (
+	// ErrInvalidMultibulk is a "*" header that is not a number, or is beyond MaxMultiBulk.
+	ErrInvalidMultibulk = &protocolError{detail: "invalid multibulk length"}
+	// ErrInvalidBulk is a "$" header that is not a number, is negative, or is beyond
+	// MaxBulkLen.
+	ErrInvalidBulk = &protocolError{detail: "invalid bulk length"}
+	// ErrExpectedBulk is an element header that does not start with "$".
+	ErrExpectedBulk = &protocolError{detail: "expected '$'"}
+	// ErrUnbalancedQuotes is an inline command whose quoting does not close, or whose
+	// closing quote is not followed by a separator.
+	ErrUnbalancedQuotes = &protocolError{detail: "unbalanced quotes in request"}
+)
+
+// protocolError is one specific malformed-request case. It unwraps to ErrProtocol so the
+// specific and the general test both work.
+type protocolError struct{ detail string }
+
+func (e *protocolError) Error() string { return "resp: " + e.detail }
+func (e *protocolError) Unwrap() error { return ErrProtocol }
+
+// ProtocolErrorText renders the "-ERR Protocol error: ..." detail for a read error, or
+// "" when the error is not a protocol violation (an EOF or a network fault, which have
+// nobody to report to). The wording matches Redis, because clients match on it and
+// because the byte named in "expected '$', got 'f'" is the whole diagnostic value.
+func ProtocolErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	// The specific cases come first, and deliberately: every one of them unwraps to
+	// ErrProtocol, so testing the general case earlier would swallow all of them and
+	// report "invalid request" for a violation that could have named itself.
+	var e *expectedBulkError
+	if errors.As(err, &e) {
+		return e.Error() // carries the byte it found
+	}
+	switch {
+	case errors.Is(err, ErrInvalidMultibulk):
+		return "Protocol error: invalid multibulk length"
+	case errors.Is(err, ErrInvalidBulk):
+		return "Protocol error: invalid bulk length"
+	case errors.Is(err, ErrUnbalancedQuotes):
+		return "Protocol error: unbalanced quotes in request"
+	case errors.Is(err, ErrProtocol):
+		return "Protocol error: invalid request"
+	}
+	return ""
+}
+
+// expectedBulkError reports an element header that did not begin with "$", naming the
+// byte found there the way Redis does.
+type expectedBulkError struct{ got byte }
+
+func (e *expectedBulkError) Error() string {
+	return "Protocol error: expected '$', got '" + string(e.got) + "'"
+}
+
+// Unwraps to ErrExpectedBulk, which in turn unwraps to ErrProtocol, so both the
+// specific and the general test match.
+func (e *expectedBulkError) Unwrap() error { return ErrExpectedBulk }
+
 // Protocol limits matching Redis's defaults, enforced before any allocation so a
 // tiny crafted header (e.g. "$9223372036854775806\r\n" or "*2000000000\r\n")
 // cannot drive a huge/overflowing allocation and OOM or panic the server.
@@ -125,12 +195,27 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 	}
 
 	if line[0] != '*' {
-		return splitInline(line), nil // inline command
+		args, err := splitInline(line)
+		if err != nil {
+			return nil, err
+		}
+		if len(args) == 0 {
+			// A line of nothing but separators is not a command; Redis ignores it and
+			// keeps the connection.
+			return r.ReadCommand()
+		}
+		return args, nil
 	}
 
 	n, err := strconv.Atoi(string(line[1:]))
-	if err != nil || n < 0 || n > MaxMultiBulk {
-		return nil, ErrProtocol
+	if err != nil || n > MaxMultiBulk {
+		return nil, ErrInvalidMultibulk
+	}
+	if n <= 0 {
+		// A negative count is the legacy null multibulk and a zero count is an empty
+		// command. Redis skips both and reads the next request rather than treating
+		// either as fatal, so a client that emits one is not dropped.
+		return r.ReadCommand()
 	}
 	// Cap the initial capacity so a large-but-undelivered count can't force a
 	// big up-front allocation; append grows it as real elements arrive.
@@ -140,12 +225,15 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if len(hdr) == 0 || hdr[0] != '$' {
-			return nil, ErrProtocol
+		if len(hdr) == 0 {
+			return nil, &expectedBulkError{got: '\r'}
+		}
+		if hdr[0] != '$' {
+			return nil, &expectedBulkError{got: hdr[0]}
 		}
 		length, err := strconv.Atoi(string(hdr[1:]))
 		if err != nil || length < 0 || length > MaxBulkLen {
-			return nil, ErrProtocol
+			return nil, ErrInvalidBulk
 		}
 		buf := make([]byte, length+2) // payload + trailing CRLF
 		if _, err := io.ReadFull(r.r, buf); err != nil {
@@ -235,23 +323,129 @@ func trimCRLF(b []byte) []byte {
 	return b
 }
 
-func splitInline(line []byte) [][]byte {
+func splitInline(line []byte) ([][]byte, error) {
 	var args [][]byte
 	i := 0
-	for i < len(line) {
-		for i < len(line) && line[i] == ' ' {
+	for {
+		for i < len(line) && isInlineSpace(line[i]) {
 			i++
 		}
 		if i >= len(line) {
-			break
+			return args, nil
 		}
-		start := i
-		for i < len(line) && line[i] != ' ' {
-			i++
+
+		var cur []byte
+		inQuote, inSingle, done := false, false, false
+		for !done {
+			switch {
+			case inQuote:
+				if i >= len(line) {
+					return nil, ErrUnbalancedQuotes
+				}
+				switch {
+				case line[i] == '\\' && i+3 < len(line) && line[i+1] == 'x' &&
+					isHexDigit(line[i+2]) && isHexDigit(line[i+3]):
+					cur = append(cur, hexVal(line[i+2])<<4|hexVal(line[i+3]))
+					i += 4
+				case line[i] == '\\' && i+1 < len(line):
+					cur = append(cur, unescape(line[i+1]))
+					i += 2
+				case line[i] == '"':
+					// A closing quote must end the argument: anything other than a
+					// separator after it is malformed, not the start of more text.
+					if i+1 < len(line) && !isInlineSpace(line[i+1]) {
+						return nil, ErrUnbalancedQuotes
+					}
+					i++
+					done = true
+				default:
+					cur = append(cur, line[i])
+					i++
+				}
+
+			case inSingle:
+				if i >= len(line) {
+					return nil, ErrUnbalancedQuotes
+				}
+				switch {
+				case line[i] == '\\' && i+1 < len(line) && line[i+1] == '\'':
+					cur = append(cur, '\'')
+					i += 2
+				case line[i] == '\'':
+					if i+1 < len(line) && !isInlineSpace(line[i+1]) {
+						return nil, ErrUnbalancedQuotes
+					}
+					i++
+					done = true
+				default:
+					cur = append(cur, line[i])
+					i++
+				}
+
+			default:
+				if i >= len(line) {
+					done = true
+					break
+				}
+				switch line[i] {
+				case ' ', '\t', '\n', '\r', '\v', '\f':
+					done = true
+				case '"':
+					inQuote = true
+					i++
+				case '\'':
+					inSingle = true
+					i++
+				default:
+					cur = append(cur, line[i])
+					i++
+				}
+			}
 		}
-		args = append(args, line[start:i])
+		if cur == nil {
+			// An empty quoted argument ("" ) is still an argument.
+			cur = []byte{}
+		}
+		args = append(args, cur)
 	}
-	return args
+}
+
+func isInlineSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func hexVal(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+// unescape maps the escapes Redis recognises inside a double-quoted inline argument.
+// An unrecognised escape yields the character itself, as Redis does.
+func unescape(c byte) byte {
+	switch c {
+	case 'n':
+		return '\n'
+	case 'r':
+		return '\r'
+	case 't':
+		return '\t'
+	case 'b':
+		return '\b'
+	case 'a':
+		return '\a'
+	default:
+		return c
+	}
 }
 
 // Writer serializes replies to a connection. Callers must Flush after writing a
