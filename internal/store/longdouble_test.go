@@ -219,6 +219,8 @@ func TestLongDoubleParse(t *testing.T) {
 		// parses it and string2ld's isnan check throws it out.
 		{"inf", inf}, {"INF", inf}, {"Inf", inf}, {"+inf", inf}, {"-inf", inf},
 		{"infinity", inf}, {"INFINITY", inf}, {"-Infinity", inf}, {"iNfInItY", inf},
+		// "infinit" is a deliberately truncated "infinity", not a typo: strtold consumes the
+		// whole operand or nothing, so a prefix must be refused rather than completed.
 		{"infinit", bad}, {"nan", bad}, {"NAN", bad}, {"-nan", bad}, {"+nan", bad},
 		{"nan(1)", bad}, {"nan(", bad}, {"nano", bad},
 

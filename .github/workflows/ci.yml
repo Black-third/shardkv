@@ -169,9 +169,14 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v8 of the action, and v2 of the linter, because `.golangci.yml` is a v2 config and
+        # `make lint` installs `golangci-lint/v2` -- the action's v6 line only ever installs
+        # golangci-lint v1, which cannot read that file. CI was therefore running a different
+        # linter from the one the project holds itself to, and failing for a third reason
+        # before it got far enough to notice.
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.12.2
 
   # Cross-compilation only: it costs one compile per target and is what catches a
   # word-size or platform assumption (a 32-bit int truncating a millisecond deadline,

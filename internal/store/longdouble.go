@@ -184,7 +184,8 @@ func (d LongDouble) Text() string {
 //   - A magnitude that underflows to zero ("1e-4951"), which strtold also reports.
 //     A subnormal that survives ("1e-4950") is accepted and formats as "0".
 //   - Anything the parse does not consume whole: leading space, trailing space, "1.2.3",
-//     "1e", "0x", "infinit".
+//     "1e", "0x", a truncated "infinit". (Not a typo: the point of that last one is that a
+//     prefix of "infinity" is refused rather than rounded up to it.)
 //   - An operand of ldMaxTextLen bytes or more, which never reaches strtold at all.
 func ParseLongDouble(s string) (LongDouble, bool) {
 	if len(s) == 0 || len(s) >= ldMaxTextLen {
