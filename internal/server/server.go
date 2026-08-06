@@ -80,6 +80,12 @@ type command struct {
 	// is not a container -- every data command -- pays one branch and nothing else. That is
 	// the whole reason this is a flag rather than "look up the name in a set of containers".
 	container bool
+	// protected marks a command that is refused unless the configuration says otherwise --
+	// DEBUG, and in Redis also MODULE, which this server does not have. It is a flag on the
+	// entry rather than a name the dispatcher compares against for the same reason container
+	// is: the dispatcher already holds the entry, so the gate costs one bool read on the path
+	// of every command instead of a string comparison. See debugCommandAllowed.
+	protected bool
 	// subs holds one statistics-only *command per subcommand seen, created on demand under
 	// subMu. The lock and the map lookup are affordable precisely because they are only ever
 	// reached for the administrative commands: nothing on a data path takes them.
@@ -210,7 +216,7 @@ var commandTable = map[string]*command{}
 func register(name string, arity int, write bool, fn handlerFunc) {
 	commandTable[name] = &command{
 		lowerName: strings.ToLower(name), arity: arity, write: write, fn: fn,
-		container: containerCommands[name],
+		container: containerCommands[name], protected: protectedCommands[name],
 	}
 }
 
@@ -519,6 +525,12 @@ type serverCore struct {
 	clientTimeout atomic.Int64
 	liveConns     atomic.Int64
 	rejectedConns atomic.Int64
+
+	// enableDebugCmd is the enable-debug-command setting: whether DEBUG may be run, and
+	// by whom. Its zero value is "no", so a Server nobody configured refuses DEBUG --
+	// which is the safe direction for a gate, and the direction Redis 7 defaults to. See
+	// commands_debug.go.
+	enableDebugCmd atomic.Int32
 
 	// dirtyChanges counts writes that changed something since the dataset was last
 	// written out in full, which is what INFO's rdb_changes_since_last_save reports.

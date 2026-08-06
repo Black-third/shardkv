@@ -237,20 +237,45 @@ func TestLatencyMonitor(t *testing.T) {
 
 // TestBlockedTimeIsNotSlow pins the rule that keeps every timed-out BLPOP out of the
 // slow log: a client waiting is not the server being slow.
+//
+// The threshold is 250ms against a 500ms wait, which looks generous for something whose
+// point is that a figure is *excluded*. It is deliberate. What session.blockedFor excludes
+// is the park itself; what is left inside the measured window is the parse, the first
+// non-blocking attempt, and -- the part that matters here -- however long this connection's
+// goroutine happens to be off-CPU on either side of the park. That residue was measured on
+// this test's own path: 12-137us on an idle machine, but 2.5ms at p90 and 48.9ms at worst
+// with six concurrent -race runs of this package on eight cores. A 10ms threshold therefore
+// failed on a loaded machine while the exclusion was working perfectly, which is a test
+// reporting the scheduler rather than the server.
+//
+// So the margin is over the scheduler, not over the server, and it is sized from that
+// measurement. It is not a weaker assertion: 500ms is still twice the threshold, so
+// removing the exclusion fails the test just as it did before.
+//
+// The second half is the positive control TestObservabilityCostsNothingWhenUnused uses for
+// the same reason -- a command that really is slow must still be recorded, or "nothing was
+// logged" would pass for a slow log that had simply stopped working.
 func TestBlockedTimeIsNotSlow(t *testing.T) {
 	addr, stop := startTestServer(t)
 	defer stop()
 	c := dialTx(t, addr)
 	defer c.close()
 
-	// 30ms is well over the threshold set here, so only the exclusion can keep it out.
-	c.cmd("CONFIG SET slowlog-log-slower-than 10000")
+	c.cmd("CONFIG SET slowlog-log-slower-than 250000")
 	c.cmd("SLOWLOG RESET")
-	if got := c.cmd("BLPOP nothing-here 0.05"); got != "(nil)" {
+	if got := c.cmd("BLPOP nothing-here 0.5"); got != "(nil)" {
 		t.Fatalf("BLPOP timed out with %q; want (nil)", got)
 	}
 	if got := c.cmd("SLOWLOG LEN"); got != ":0" {
-		t.Errorf("a BLPOP that waited 50ms was recorded as slow (SLOWLOG LEN = %q)", got)
+		t.Errorf("a BLPOP that waited 500ms was recorded as slow (SLOWLOG LEN = %q)", got)
+	}
+
+	if got := c.cmd("DEBUG SLEEP 0.3"); got != "+OK" {
+		t.Fatalf("DEBUG SLEEP = %q", got)
+	}
+	if got := c.cmd("SLOWLOG LEN"); got != ":1" {
+		t.Errorf("a command that spent 300ms working was not recorded (SLOWLOG LEN = %q); "+
+			"the BLPOP assertion above would have passed for a slow log that logs nothing", got)
 	}
 }
 

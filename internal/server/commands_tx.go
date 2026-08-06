@@ -120,6 +120,24 @@ func (s *Server) executeCommand(sess *session, w *resp.Writer, args [][]byte) *c
 		return reject(cmd)
 	}
 
+	// A protected command -- DEBUG, and nothing else here -- is refused unless the
+	// configuration opens it, as Redis 7 refuses it. See debugCommandAllowed.
+	//
+	// The decision is taken here for the same reason the cluster gate above is: a MULTI must
+	// not queue a command this connection has no right to run, and real Redis refuses at
+	// queue time and lets EXEC abort with EXECABORT (measured). The arity is tested first, so
+	// a DEBUG with no subcommand answers the arity error whether the gate is open or not --
+	// also measured, and the reason this is not simply the first line of the handler.
+	// dispatch is deliberately not gated, so an AOF replay and a master's stream are
+	// unaffected, on the same reasoning as invariant 13.
+	if cmd != nil && cmd.protected && arityOK(cmd.arity, len(args)) && !s.debugCommandAllowed(sess) {
+		if sess.inMulti {
+			sess.queueErr = true
+		}
+		w.WriteError(errDebugNotAllowed)
+		return reject(cmd)
+	}
+
 	// A connection-control command acts on this socket, so it runs now even inside a
 	// MULTI: queueing an AUTH or a CLIENT SETNAME would defer a decision the rest of
 	// the queue may depend on. The one exception is the subscribe family, which Redis
@@ -152,6 +170,7 @@ func (s *Server) executeCommand(sess *session, w *resp.Writer, args [][]byte) *c
 			return reject(cmd)
 		}
 		sess.queued = append(sess.queued, args)
+		publishMulti(sess, queuedArgsSize(args))
 		w.WriteSimple("QUEUED")
 		// Not counted as a call: the command has not run, and it will be counted when EXEC
 		// runs it. Counting it here would double every command inside a transaction.
@@ -194,6 +213,7 @@ func cmdMulti(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 	sess.inMulti = true
 	sess.queued = nil
 	sess.queueErr = false
+	publishMulti(sess, 0)
 	w.WriteSimple("OK")
 }
 
@@ -209,6 +229,7 @@ func cmdDiscard(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 	sess.inMulti = false
 	sess.queued = nil
 	sess.queueErr = false
+	publishMulti(sess, 0)
 	s.unwatchAll(sess)
 	w.WriteSimple("OK")
 }
@@ -253,6 +274,7 @@ func (s *Server) execExec(sess *session, w *resp.Writer) {
 	sess.inMulti = false
 	sess.queued = nil
 	sess.queueErr = false
+	publishMulti(sess, 0)
 	s.unwatchAll(sess)
 
 	if queueErr {

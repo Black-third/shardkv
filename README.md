@@ -215,7 +215,12 @@ of goroutines and TCP clients — passes under the Go race detector.
   client library sees exactly what the server can run.
 - **Client and server introspection** — `HELLO [2|3]` negotiating the protocol,
   `CONFIG GET|SET|RESETSTAT` glob-matched over the settings that exist,
-  `CLIENT ID|GETNAME|SETNAME|LIST|INFO|KILL|UNBLOCK`, `COMMAND COUNT|INFO|DOCS`,
+  `CLIENT ID|GETNAME|SETNAME|LIST|INFO|KILL|UNBLOCK` — the `CLIENT INFO`/`CLIENT LIST` line
+  carries Redis 7.4's full field set in Redis's order, including `laddr`, `fd`, `watch`,
+  `resp`, `tot-mem` and a `flags` field that is a *set* of letters (`x` in a transaction,
+  `b` blocked, `d` after a watched key changed, `P` subscribed, `S` a replica feed, `O` a
+  monitor), because tools parse that line and some of them parse it positionally —
+  `COMMAND COUNT|INFO|DOCS`,
   `DEBUG PROTOCOL|SLEEP|OBJECT|CHANGE-REPL-ID`, `RESET`, `SELECT`, `LASTSAVE`,
   `SHUTDOWN [NOSAVE]`, and `INFO <section>` filtering.
 - **Observability** — `INFO` in eight sections: server, clients
@@ -229,7 +234,7 @@ of goroutines and TCP clients — passes under the Go race detector.
   excluded from a bare `INFO`, as in Redis) and keyspace (one line per non-empty
   database). Plus **`SLOWLOG GET|LEN|RESET`** with `-slowlog-log-slower-than` and
   `-slowlog-max-len`, **`MONITOR`**, **`LATENCY HISTORY|LATEST|RESET`** with
-  `-latency-monitor-threshold`, **`MEMORY USAGE`**/**`MEMORY DOCTOR`**, and
+  `-latency-monitor-threshold`, **`MEMORY USAGE`**/**`MEMORY STATS`**/**`MEMORY DOCTOR`**, and
   **`COMMAND GETKEYS`** for the commands whose keys are not at a fixed position.
   The whole surface costs nothing when unused — per-command statistics are three
   atomic adds on the table entry, and the slow log, latency monitor and MONITOR feed
@@ -270,7 +275,7 @@ is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
 | Connection | `AUTH [username] password` · `HELLO [2\|3 [AUTH u p] [SETNAME n]]` · `PING` · `SELECT index` · `RESET` · `QUIT` · `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|LIST\|INFO\|KILL\|UNBLOCK id [TIMEOUT\|ERROR]\|REPLY ON\|OFF\|SKIP` |
 | Databases | `SELECT index` · `SWAPDB index1 index2` · `MOVE key db` · `COPY key dst [DB n] [REPLACE]` · `FLUSHDB` · `FLUSHALL` · `DBSIZE` |
 | Server  | `INFO [section...]` · `DBSIZE` · `FLUSHDB` · `FLUSHALL` · `SWAPDB` · `MOVE` · `CONFIG GET\|SET\|RESETSTAT` · `COMMAND [COUNT\|INFO\|DOCS\|GETKEYS\|HELP]` · `DEBUG PROTOCOL\|SLEEP\|OBJECT\|CHANGE-REPL-ID\|HELP` · `BGREWRITEAOF` · `LASTSAVE` · `SHUTDOWN [NOSAVE]` |
-| Observability | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` · `MONITOR` · `LATENCY HISTORY event\|LATEST\|HISTOGRAM [cmd...]\|RESET [event...]\|HELP` · `MEMORY USAGE key [SAMPLES n]\|DOCTOR\|HELP` · `COMMAND GETKEYS cmd args...` · `INFO commandstats` · `INFO latencystats` |
+| Observability | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` · `MONITOR` · `LATENCY HISTORY event\|LATEST\|HISTOGRAM [cmd...]\|RESET [event...]\|HELP` · `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|HELP` · `COMMAND GETKEYS cmd args...` · `INFO commandstats` · `INFO latencystats` |
 | Replication | `REPLICAOF host port\|NO ONE` · `SLAVEOF` · `ROLE` · `PSYNC replid offset` · `REPLCONF listening-port\|ACK` · `WAIT numreplicas timeout` |
 | Cluster | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` · `CLUSTER ADDSLOTS slot...\|DELSLOTS\|ADDSLOTSRANGE start end...\|DELSLOTSRANGE` · `CLUSTER SETSLOT slot IMPORTING\|MIGRATING\|STABLE\|NODE id` · `CLUSTER COUNTKEYSINSLOT slot\|GETKEYSINSLOT slot count` · `CLUSTER MEET ip port [bus-port]\|FORGET id\|REPLICATE id\|RESET [HARD\|SOFT]` · `ASKING` · `READONLY` · `READWRITE` |
 | Migration | `DUMP key` · `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]` · `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH pw\|AUTH2 user pw] [KEYS key...]` |
@@ -506,6 +511,12 @@ Every flag:
 -timeout 0                      seconds a client may be idle before being closed
                                 (0 = never; replicas, subscribers, monitors and
                                 blocked clients are exempt)
+-enable-debug-command no        whether DEBUG may be run: no|yes|local
+                                (local = loopback connections only). Off by
+                                default, as in Redis 7: DEBUG SET-ACTIVE-EXPIRE
+                                and DEBUG CHANGE-REPL-ID change server-wide
+                                behaviour, and nothing a client library does in
+                                normal operation calls DEBUG at all
 ```
 
 `CONFIG GET`/`SET` reach the same settings at runtime under Redis's names, plus the
@@ -517,6 +528,15 @@ representation thresholds `OBJECT ENCODING` reports from — `hash-max-listpack-
 changes what `OBJECT ENCODING` says about a value, and `hll-sparse-max-bytes` genuinely
 moves the point at which a HyperLogLog stops being sparse. See
 [OBJECT ENCODING](#object-encoding-and-the-representation-thresholds).
+
+The `maxmemory` family is reported too, because client libraries ask for it by pattern
+while warming up and an empty reply is not the same statement as "unlimited":
+`maxmemory 0` (no byte budget is enforced anywhere — the cap here is `maxkeys`),
+`maxmemory-policy` (`noeviction`, or `allkeys-lru` once `maxkeys` is set, read from the same
+accessor `INFO` reports it from so the two cannot disagree), `maxmemory-samples 16` (the
+sampler's real sample size, not Redis's default of 5) and `maxmemory-clients 0` (no client
+eviction). All four are read-only: nothing here would act on a value it was given, and
+`CONFIG SET maxmemory 100mb` is refused rather than accepted and ignored.
 
 Pub/Sub, in two terminals:
 
@@ -1354,6 +1374,28 @@ that grew. `MEMORY DOCTOR` reports what this server can actually diagnose (key c
 the eviction cap, whether eviction is running) and says plainly which of Redis's checks it
 cannot perform, rather than inventing findings from no evidence.
 
+`MEMORY STATS` follows the same rule, and the interesting part of it is what is *missing*.
+It reports the twelve fields this server can state truthfully, under Redis's names and in
+Redis's order: `total.allocated` (the Go heap in use, the same number `INFO`'s `used_memory`
+reports), `replication.backlog` (the bytes the backlog ring retains, as `INFO`'s
+`repl_backlog_histlen`), `clients.normal`/`clients.slaves` (the sums of exactly the `tot-mem`
+`CLIENT LIST` publishes for those connections), `cluster.links`, `lua.caches` and
+`functions.caches` (0 because there is no cluster bus, no Lua and no functions — the
+measurement, not a placeholder), a `db.N` sub-map per non-empty database carrying
+`overhead.hashtable.main`, then `overhead.total`, `keys.count`, `keys.bytes-per-key` and
+`dataset.bytes`, where `dataset.bytes` is the sum of the same per-key estimate
+`MEMORY USAGE` reports so the two commands cannot give different answers.
+
+Redis's other seventeen fields are **omitted rather than filled in**. `peak.allocated` and
+`startup.allocated` would need a high-water mark of live heap bytes and a heap size recorded
+at startup, neither of which Go exposes; `dataset.percentage` and `peak.percentage` are
+ratios over those two denominators; `aof.buffer` would need the AOF's unwritten byte count,
+where 0 is right under `appendfsync always` and false under `everysec`; and the whole
+`allocator.*`, `allocator-fragmentation.*`, `allocator-rss.*`, `rss-overhead.*` and
+`fragmentation` group describes a jemalloc this server does not have. A missing field says
+"this server cannot tell you". A fabricated `fragmentation` ratio would say something false
+about the process, which is the one thing an observability reply must never do.
+
 ## Pub/Sub
 
 ```bash
@@ -1940,13 +1982,21 @@ someone reading `OBJECT`:
   0–9999 because they come from a shared object pool; there is no such pool here, and a
   sentinel refcount would describe an implementation that does not exist. Redis's own
   suite uses `assert_refcount_morethan` in a few places, which this cannot satisfy.
-- `OBJECT ENCODING` names the representation for the cases that matter — a value that has
-  been appended to, written into with `SETRANGE`, used as a bitmap, or built as a
-  HyperLogLog reports `raw`, as in Redis, rather than being re-derived from whether its
-  bytes happen to parse as a number. The one case still derived from content is a value
-  produced by `INCRBYFLOAT`: it reports `int` where Redis reports `embstr`, because Redis
-  does not re-encode an arithmetic result and distinguishing that from `raw` would need a
-  third state carried on every string purely for this reply.
+- `OBJECT ENCODING` names the representation, not the content. Which of the three names a
+  string gets follows *how the value was produced*, which is what Redis's own answer
+  follows: a value stored whole by a command that runs `tryObjectEncoding` (`SET`, `MSET`,
+  `GETSET`, `INCR`, and `APPEND` when it creates the key) can read `int`; one built whole by
+  a command that does not (`INCRBYFLOAT`, whose result reads `embstr` even when it is
+  integral) is embstr or raw by length; and one produced by editing a buffer in place
+  (`APPEND` onto an existing key, `SETRANGE`, `SETBIT`, `BITFIELD`, `BITOP`, the
+  HyperLogLog commands) is always `raw`. `COPY` reports what its source reported, because
+  Redis duplicates the object rather than re-storing its bytes. The whole matrix is checked
+  against a live redis 7.2.15 by `TestObjectEncodingOrigin`.
+
+  What is *not* modelled is Redis's shared-integer pool, which is what `OBJECT REFCOUNT`
+  above is about, and a `RESTORE`d value's original encoding: this `DUMP` payload records
+  the bytes and not the encoding, so an appended value that is dumped and restored reads
+  `int` again where Redis would still say `raw`.
 
 ### How the list above is established
 
@@ -2102,15 +2152,21 @@ mean lying about the implementation:
 - **`OBJECT REFCOUNT` of a small integer returns 1**, where Redis returns 2147483647
   because integers 0-9999 come from a shared object pool. There is no such pool here, and a
   sentinel refcount would describe an optimisation that does not exist.
-- **`OBJECT ENCODING` reports the encoding implied by the value, not its representation
-  history.** After `SET foo 1` then `APPEND foo 2`, Redis reports `raw` (the value now lives
-  in a plain buffer and Redis does not re-encode it) and this server reports `int`. Matching
-  Redis would mean carrying a per-entry "how did this value get here" bit purely for an
-  introspection reply.
+- **`OBJECT ENCODING` of a `RESTORE`d value is derived from its bytes.** The `DUMP` payload
+  here records a value's contents and not the encoding Redis had chosen for it, so an
+  appended value that is dumped and restored reads `int` again where Redis would still say
+  `raw`. Recording an encoding in the payload would change the format `DUMP` promises for
+  the sake of an introspection reply.
 
-Both cost assertions in Redis's suite (`assert_encoding` and `assert_refcount_morethan` run
-throughout its type files), which is the honest price of the choice rather than a reason to
-hide it.
+  The rest of the encoding surface *was* fixed rather than documented away: after
+  `SET foo 1` then `APPEND foo 2` this server reports `raw` as Redis does, and an integral
+  `INCRBYFLOAT` result reports `embstr` rather than `int` — see
+  [OBJECT ENCODING](#object-encoding-and-the-representation-thresholds) for the three states
+  that decide it.
+
+`OBJECT REFCOUNT` costs assertions in Redis's suite (`assert_refcount_morethan` runs in a
+few of its type files), which is the honest price of the choice rather than a reason to hide
+it.
 
 ## Testing
 

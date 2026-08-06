@@ -139,9 +139,13 @@ start_shardkv() {
 	local name="$1"
 	shift
 	docker rm -f "$name" >/dev/null 2>&1 || true
+	# -enable-debug-command matches the --enable-debug-command yes given to the reference
+	# below, and for the same reason: Redis's suite uses DEBUG throughout and shardkv now
+	# refuses it by default, as Redis 7 does. "yes" rather than "local" because the suite
+	# reaches the server across the compat network, so its peer address is not loopback.
 	docker run -d --name "$name" --network "$NET" \
 		-v "$out:/w:ro" \
-		"$SHARDKV_IMAGE" /w/shardkv -addr :6380 "$@" >/dev/null
+		"$SHARDKV_IMAGE" /w/shardkv -addr :6380 -enable-debug-command yes "$@" >/dev/null
 }
 
 start_redis() {

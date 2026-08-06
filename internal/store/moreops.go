@@ -126,9 +126,18 @@ func (s *Store) Append(key string, suffix []byte) (int, error) {
 	nv := make([]byte, 0, len(base)+len(suffix))
 	nv = append(nv, base...)
 	nv = append(nv, suffix...)
-	// An appended value is a plain buffer from here on, whatever its bytes read as: see
-	// entry.rawString and OBJECT ENCODING.
-	ne := &entry{kind: kindString, str: nv, rawString: true, expireAt: expireAt}
+	// APPEND is the one command whose origin depends on whether the key was there.
+	// Appending to an existing value unshares it into a plain buffer that Redis never
+	// re-encodes, so it is raw from here on whatever its bytes read as; appending to a
+	// *missing* key is really a store of the whole argument, and Redis's appendCommand
+	// runs tryObjectEncoding on it before dbAdd -- so `APPEND fresh 123` reads `int`,
+	// measured on redis 7.2.15. Treating both as mutations reported raw for the create
+	// case, which is the second half of the encoding gap strOrigin fixed.
+	origin := strMutatedBuffer
+	if !live {
+		origin = strWholeValue
+	}
+	ne := &entry{kind: kindString, str: nv, strOrigin: origin, expireAt: expireAt}
 	s.touch(ne, now)
 	sh.data[key] = ne
 	return len(nv), nil

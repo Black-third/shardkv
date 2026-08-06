@@ -179,6 +179,7 @@ func (s *Server) clusterGate(sess *session, w *resp.Writer, cmd *command, args [
 		sess.inMulti = false
 		sess.queued = nil
 		sess.queueErr = false
+		publishMulti(sess, 0)
 		s.unwatchAll(sess)
 	} else if sess.inMulti {
 		sess.queueErr = true

@@ -405,3 +405,130 @@ func TestEncodingReportsRepresentationNotContent(t *testing.T) {
 		t.Errorf("a bitmap encodes as %q; want raw", enc)
 	}
 }
+
+// TestStringOriginIsThreeExhaustiveStates pins the distinction Encoding rests on, at the
+// level the states live: which constructor produced the value.
+//
+// It exists because a two-state flag could not express it. The flag before this said
+// "was this appended to?", so INCRBYFLOAT had two options and both were wrong: leaving it
+// clear reported `int` for an integral result, where Redis reports `embstr`, and setting
+// it reported `raw`. The third state is the one that says "built whole, but not through
+// the integer encoding" -- which is exactly what Redis's incrbyfloatCommand does.
+//
+// The wants below were measured against redis 7.2.15 at the wire level; see
+// TestObjectEncodingOrigin in the server package for the same matrix as a client sees it.
+func TestStringOriginIsThreeExhaustiveStates(t *testing.T) {
+	cases := []struct {
+		name       string
+		build      func(*Store)
+		wantOrigin strOrigin
+		wantEnc    string // redis 7.2.15
+	}{
+		{
+			name:       "Set stores whole",
+			build:      func(s *Store) { s.Set("k", []byte("42"), 0) },
+			wantOrigin: strWholeValue, wantEnc: "int",
+		},
+		{
+			name: "SetWithOptions stores whole",
+			build: func(s *Store) {
+				if _, _, _, err := s.SetWithOptions("k", []byte("42"), SetOptions{}); err != nil {
+					t.Fatalf("SetWithOptions: %v", err)
+				}
+			},
+			wantOrigin: strWholeValue, wantEnc: "int",
+		},
+		{
+			name:       "Incr writes a fresh integer",
+			build:      func(s *Store) { mustIncr(t, s, "k", 42) },
+			wantOrigin: strWholeValue, wantEnc: "int",
+		},
+		{
+			name: "Append creating runs the integer encoding",
+			build: func(s *Store) {
+				if _, err := s.Append("k", []byte("42")); err != nil {
+					t.Fatalf("Append: %v", err)
+				}
+			},
+			wantOrigin: strWholeValue, wantEnc: "int",
+		},
+		{
+			name: "Append onto an existing value mutates it",
+			build: func(s *Store) {
+				s.Set("k", []byte("4"), 0)
+				if _, err := s.Append("k", []byte("2")); err != nil {
+					t.Fatalf("Append: %v", err)
+				}
+			},
+			wantOrigin: strMutatedBuffer, wantEnc: "raw",
+		},
+		{
+			name: "SetRange mutates, even when it creates",
+			build: func(s *Store) {
+				if _, err := s.SetRange("k", 0, []byte("42")); err != nil {
+					t.Fatalf("SetRange: %v", err)
+				}
+			},
+			wantOrigin: strMutatedBuffer, wantEnc: "raw",
+		},
+		{
+			name: "SetBit mutates",
+			build: func(s *Store) {
+				if _, _, err := s.SetBit("k", 7, true); err != nil {
+					t.Fatalf("SetBit: %v", err)
+				}
+			},
+			wantOrigin: strMutatedBuffer, wantEnc: "raw",
+		},
+		{
+			name: "IncrByFloat builds a plain object",
+			build: func(s *Store) {
+				s.Set("k", []byte("41"), 0)
+				delta, ok := ParseLongDouble("1")
+				if !ok {
+					t.Fatal("ParseLongDouble(1) failed")
+				}
+				if _, err := s.IncrByFloat("k", delta); err != nil {
+					t.Fatalf("IncrByFloat: %v", err)
+				}
+			},
+			// The whole point: the value reads "42" and is not `int`.
+			wantOrigin: strPlainObject, wantEnc: "embstr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(8)
+			tc.build(s)
+			sh := s.getShard("k")
+			sh.mu.RLock()
+			e := sh.data["k"]
+			sh.mu.RUnlock()
+			if e == nil {
+				t.Fatal("no entry was stored")
+			}
+			if e.strOrigin != tc.wantOrigin {
+				t.Errorf("strOrigin = %d; want %d", e.strOrigin, tc.wantOrigin)
+			}
+			if got, _ := s.Encoding("k"); got != tc.wantEnc {
+				t.Errorf("Encoding = %q; want %q (redis 7.2.15)", got, tc.wantEnc)
+			}
+			// A copy reports what the source reports. Redis's COPY duplicates the object
+			// (dupStringObject preserves the encoding) rather than re-storing its bytes, and
+			// clone dropping the origin gave one byte sequence two encodings.
+			if ok, err := s.Copy("k", "copy", false); err != nil || !ok {
+				t.Fatalf("Copy: ok=%v err=%v", ok, err)
+			}
+			if got, _ := s.Encoding("copy"); got != tc.wantEnc {
+				t.Errorf("Encoding of a COPY = %q; want the source's %q", got, tc.wantEnc)
+			}
+		})
+	}
+}
+
+func mustIncr(t *testing.T, s *Store, key string, by int64) {
+	t.Helper()
+	if _, err := s.Incr(key, by); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+}

@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,6 +52,7 @@ import (
 	"time"
 
 	"github.com/Black-third/shardkv/internal/resp"
+	"github.com/Black-third/shardkv/internal/store"
 )
 
 func init() {
@@ -874,6 +876,13 @@ func cmdMemory(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 		w.WriteInt(n)
 
+	case "STATS":
+		if len(args) != 2 {
+			w.WriteError("ERR wrong number of arguments for 'memory|stats' command")
+			return false
+		}
+		s.memoryStats(w)
+
 	case "DOCTOR":
 		w.WriteVerbatim("txt", []byte(s.memoryDoctor()))
 
@@ -881,6 +890,8 @@ func cmdMemory(s *Server, w *resp.Writer, args [][]byte) bool {
 		writeHelp(w, "MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:", []string{
 			"USAGE <key> [SAMPLES <count>]",
 			"    Estimate the memory usage of <key>.",
+			"STATS",
+			"    Return information about the memory usage of the server.",
 			"DOCTOR",
 			"    Report memory problems and advice.",
 		})
@@ -889,6 +900,162 @@ func cmdMemory(s *Server, w *resp.Writer, args [][]byte) bool {
 		writeUnknownSubcommand(w, "MEMORY", args[1])
 	}
 	return false
+}
+
+// memoryStats answers MEMORY STATS: a RESP3 map (a flat name/value array in RESP2) of
+// what this server can say about where its memory has gone, with a nested sub-map per
+// database, in the field order real Redis emits.
+//
+// # What is reported, and what is deliberately absent
+//
+// Redis's reply is 29 fields, and most of them are derived from two inputs this server
+// does not have: a live figure from an allocator it controls (jemalloc's allocated /
+// active / resident / muzzy), and the heap size recorded at startup. Go's runtime exposes
+// neither an allocator report nor a high-water mark of live heap bytes. So the choice for
+// each field was between deriving it from something true and inventing something
+// plausible, and every field that could only have been invented is *omitted* rather than
+// filled with a zero or a ratio -- a reply that is missing a field says "this server
+// cannot tell you"; a reply carrying a fabricated 1.0 fragmentation ratio says something
+// false about the process, which is what invariant 12 forbids by name.
+//
+// Omitted, with the reason:
+//
+//	peak.allocated        Go exposes no peak of live heap bytes. runtime.MemStats has
+//	                      HeapAlloc (now) and HeapSys (address space obtained), neither of
+//	                      which is the high-water mark of the dataset. A peak sampled at
+//	                      each MEMORY STATS call would be a peak *among readings*, and an
+//	                      operator reads this field as authoritative.
+//	startup.allocated     the Go heap at the moment serving began is not recorded, and
+//	                      would in any case be dominated by runtime structures rather than
+//	                      by the empty-server cost the field names.
+//	dataset.percentage    Redis's is dataset / (total.allocated - startup.allocated).
+//	peak.percentage       Redis's is total.allocated / peak.allocated.
+//	                      Both denominators are omitted above, and computing either from a
+//	                      different denominator under Redis's field name would be a
+//	                      different statistic wearing its label.
+//	aof.buffer            the AOF layer does not expose how many bytes it is holding
+//	                      unwritten. 0 would be exactly right under appendfsync always and
+//	                      false under everysec, which is the default.
+//	allocator.allocated / .active / .resident / .muzzy
+//	allocator-fragmentation.ratio / .bytes
+//	allocator-rss.ratio / .bytes
+//	rss-overhead.ratio / .bytes
+//	fragmentation / fragmentation.bytes
+//	                      all of these describe an allocator's internal behaviour. Go's
+//	                      allocator publishes no equivalent, and fragmentation in
+//	                      particular is the field an operator acts on -- a number derived
+//	                      from Sys/HeapAlloc would look like jemalloc's and mean something
+//	                      else entirely.
+//	overhead.db.hashtable.lut / .rehashing, db.dict.rehashing.count
+//	                      redis 7.4 additions describing its dict's rehashing state. Go's
+//	                      maps rehash too but expose nothing about it.
+//
+// Inside the per-database sub-map, overhead.hashtable.expires and
+// overhead.hashtable.slot-to-keys are omitted for a structural reason rather than a
+// measurement one: there is no separate expires table here (a key's deadline lives in the
+// entry itself, so its cost is already inside overhead.hashtable.main), and there is no
+// slot-to-keys index -- which real Redis 7 also reports as a constant 0, the field having
+// outlived the structure.
+//
+// # The identities the reply does hold
+//
+// dataset.bytes is the sum of the same per-key estimate MEMORY USAGE reports, less the
+// keyspace bookkeeping, so a caller cannot get two different answers from the two
+// commands. clients.normal and clients.slaves are the sums of exactly the tot-mem field
+// CLIENT LIST reports for those connections. keys.bytes-per-key is dataset.bytes over
+// keys.count -- note that Redis's is (total.allocated - startup.allocated) / keys.count
+// instead, which also charges each key a share of the server's fixed cost; this one is
+// the data alone, which is the reading its name supports.
+//
+// It is O(live keys): the size of a value is a property of the value, so no counter could
+// stand in for the walk (see store.Footprint). Nothing but this command pays for it.
+func (s *Server) memoryStats(w *resp.Writer) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// The replication backlog's retained bytes -- the same number INFO reports as
+	// repl_backlog_histlen, and the same one Redis's replication.backlog field carries
+	// (it reports histlen, not the ring's capacity).
+	s.mu.Lock()
+	backlog := s.backlog.histLen()
+	s.mu.Unlock()
+
+	// Client buffers, split the way Redis splits them, and summed from the same
+	// per-connection accounting CLIENT LIST publishes as tot-mem. Two sums of one number
+	// rather than a second estimate, so INFO, CLIENT LIST and MEMORY STATS cannot
+	// disagree about what a connection costs.
+	var clientsNormal, clientsSlaves int64
+	for _, sess := range s.snapshotSessions() {
+		mem := clientReadBufSize + clientWriteBufSize + sess.multiMem.Load()
+		if sess.isReplicaFeed.Load() {
+			clientsSlaves += mem
+		} else {
+			clientsNormal += mem
+		}
+	}
+
+	// Per database, in Redis's order: every database gets an entry, including an empty
+	// one, because Redis emits db.N for every database that exists in its dict array and
+	// a client counting databases would otherwise see them appear and vanish.
+	type dbEntry struct {
+		index int
+		fp    store.Footprint
+	}
+	dbs := make([]dbEntry, 0, len(s.dbs))
+	var overheadDBs, keys, dataset int64
+	for i := range s.dbs {
+		fp := s.dbs[i].Footprint()
+		if fp.Keys == 0 {
+			continue // as in Redis, which skips a database holding nothing
+		}
+		dbs = append(dbs, dbEntry{index: i, fp: fp})
+		overheadDBs += fp.Overhead
+		keys += fp.Keys
+		dataset += fp.Dataset
+	}
+	overheadTotal := backlog + clientsNormal + clientsSlaves + overheadDBs
+	var bytesPerKey int64
+	if keys > 0 {
+		bytesPerKey = dataset / keys
+	}
+
+	// The reply. Field order is redis 7.2.15's and 7.4.10's (they agree on every field
+	// emitted here), measured rather than taken from documentation.
+	fields := []struct {
+		name  string
+		value int64
+	}{
+		{"total.allocated", int64(m.HeapAlloc)},
+		{"replication.backlog", backlog},
+		{"clients.slaves", clientsSlaves},
+		{"clients.normal", clientsNormal},
+		// No cluster bus is implemented, so there are no cluster links to hold memory.
+		// 0 is the measurement, not a placeholder.
+		{"cluster.links", 0},
+		// No Lua and no functions: nothing is cached because nothing can be loaded.
+		{"lua.caches", 0},
+		{"functions.caches", 0},
+	}
+	w.WriteMapHeader(len(fields) + len(dbs) + 4)
+	for _, f := range fields {
+		w.WriteBulk([]byte(f.name))
+		w.WriteInt(f.value)
+	}
+	for _, db := range dbs {
+		w.WriteBulk([]byte("db." + strconv.Itoa(db.index)))
+		// A nested map: RESP3 writes a map, RESP2 the flat array Redis sends there.
+		w.WriteMapHeader(1)
+		w.WriteBulk([]byte("overhead.hashtable.main"))
+		w.WriteInt(db.fp.Overhead)
+	}
+	w.WriteBulk([]byte("overhead.total"))
+	w.WriteInt(overheadTotal)
+	w.WriteBulk([]byte("keys.count"))
+	w.WriteInt(keys)
+	w.WriteBulk([]byte("keys.bytes-per-key"))
+	w.WriteInt(bytesPerKey)
+	w.WriteBulk([]byte("dataset.bytes"))
+	w.WriteInt(dataset)
 }
 
 // memoryDoctor reports what this server can actually diagnose about its own memory.

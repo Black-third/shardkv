@@ -57,7 +57,9 @@ func (s *Store) stringForWrite(sh *shard, key string, now time.Time) (e *entry, 
 		}
 		return e, false, nil
 	}
-	e = &entry{kind: kindString, rawString: true}
+	// A bit command edits a buffer in place, so the value it creates is a plain buffer
+	// too: SETBIT on a missing key reads `raw` on Redis, not `embstr`. See strOrigin.
+	e = &entry{kind: kindString, strOrigin: strMutatedBuffer}
 	sh.data[key] = e
 	return e, true, nil
 }
@@ -385,7 +387,7 @@ func (s *Store) BitOp(op BitOpKind, dst string, srcs []string) (int, error) {
 	// The destination is replaced outright, TTL and all: BITOP computes a new value
 	// rather than editing one, so carrying over the old key's expiry would attach a
 	// deadline that described different data.
-	ne := &entry{kind: kindString, str: out, rawString: true}
+	ne := &entry{kind: kindString, str: out, strOrigin: strMutatedBuffer}
 	s.touch(ne, now)
 	dsh.data[dst] = ne
 	return len(out), nil
