@@ -150,6 +150,15 @@ func TestRESP2WireBytesUnchanged(t *testing.T) {
 		{"DEBUG PROTOCOL verbatim", "$25\r\nThis is a verbatim\nstring\r\n"},
 		{"DEBUG PROTOCOL true", ":1\r\n"},
 		{"DEBUG PROTOCOL false", ":0\r\n"},
+		// The RESP3 double promotion must not reach a RESP2 client: a coordinate stays a
+		// bulk string with the identical digits.
+		{"GEOADD Sicily 13.361389 38.115556 P", ":1\r\n"},
+		{"GEOPOS Sicily P",
+			"*1\r\n*2\r\n$20\r\n13.36138933897018433\r\n$20\r\n38.11555639549629859\r\n"},
+		{"GEOSEARCH Sicily FROMLONLAT 13.361389 38.115556 BYRADIUS 200 km ASC WITHCOORD",
+			"*1\r\n*2\r\n$1\r\nP\r\n*2\r\n$20\r\n13.36138933897018433\r\n$20\r\n38.11555639549629859\r\n"},
+		{"GEOPOS Sicily nope", "*1\r\n*-1\r\n"},
+		{"GEODIST Sicily P P", "$6\r\n0.0000\r\n"},
 		// INFO is a bulk string for a RESP2 client, however it is written internally.
 		{"INFO keyspace", "$"},
 	} {
@@ -237,6 +246,20 @@ func TestRESP3WireBytes(t *testing.T) {
 		{"DEBUG PROTOCOL verbatim", "=29\r\ntxt:This is a verbatim\nstring\r\n"},
 		{"DEBUG PROTOCOL true", "#t\r\n"},
 		{"DEBUG PROTOCOL false", "#f\r\n"},
+		// A geo coordinate is a *double* in RESP3, not a bulk string -- GEOPOS sent bulk
+		// strings, so a client decoding by type got a string where redis:7.2 gives it a
+		// number. The text is still Redis's 17-decimal form rather than the shortest
+		// round-trip spelling, which is why WriteDoubleText exists: the type tag and the
+		// digits are decided separately. Captured from redis:7.2 over HELLO 3.
+		{"GEOADD Sicily 13.361389 38.115556 P", ":1\r\n"},
+		{"GEOPOS Sicily P", "*1\r\n*2\r\n,13.36138933897018433\r\n,38.11555639549629859\r\n"},
+		{"GEOSEARCH Sicily FROMLONLAT 13.361389 38.115556 BYRADIUS 200 km ASC WITHCOORD",
+			"*1\r\n*2\r\n$1\r\nP\r\n*2\r\n,13.36138933897018433\r\n,38.11555639549629859\r\n"},
+		// GEOPOS of an absent member is a null *array* even in RESP3, as in Redis -- the
+		// member has no pair, rather than a pair of nulls.
+		{"GEOPOS Sicily nope", "*1\r\n_\r\n"},
+		// GEODIST stays a bulk string in both protocols; Redis does not promote it.
+		{"GEODIST Sicily P P", "$6\r\n0.0000\r\n"},
 		// INFO becomes a verbatim string, so redis-cli prints the report rather than one
 		// long escaped line.
 		{"INFO keyspace", "="},

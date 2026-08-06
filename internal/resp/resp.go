@@ -721,6 +721,35 @@ func (w *Writer) WriteDouble(f float64) {
 	w.w.WriteString("\r\n")
 }
 
+// WriteDoubleText writes an already-formatted double: ,<text>\r\n in RESP3, and the
+// same text as a bulk string in RESP2.
+//
+// It exists for the values whose *spelling* is fixed by something other than "the
+// shortest form that round-trips", which is what WriteDouble uses. A geo coordinate is
+// the case: Redis prints it with 17 decimal places and then strips trailing zeros, so
+// GEOPOS answers 13.36138933897018433 where the shortest round-trip form would be
+// 13.361389338970184. Both parse to the same float64, but they are not the same bytes,
+// and a client comparing a coordinate it stored against one it read back sees the
+// difference.
+//
+// This is deliberately not "WriteDouble with a precision argument". The caller already
+// holds the exact text -- the point here is only to give it the right *type tag*, which
+// is what a RESP3 client dispatches on. GEOPOS sent its coordinates as bulk strings in
+// RESP3, so a client decoding by type got a string where the reference implementation
+// gives it a number.
+//
+// text must already be a valid RESP double literal; the writer does not validate it, for
+// the same reason WriteBigNumber does not.
+func (w *Writer) WriteDoubleText(text string) {
+	if w.proto < ProtoRESP3 {
+		w.WriteBulk([]byte(text))
+		return
+	}
+	w.w.WriteByte(',')
+	w.w.WriteString(text)
+	w.w.WriteString("\r\n")
+}
+
 // WriteBigNumber writes an integer too large for the int64 an integer reply
 // carries: (<digits>\r\n in RESP3, a bulk string in RESP2. digits must already be a
 // base-10 integer literal, optionally signed; the writer does not validate it,
