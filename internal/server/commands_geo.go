@@ -162,8 +162,11 @@ func cmdGeoPos(s *Server, w *resp.Writer, args [][]byte) bool {
 			continue
 		}
 		w.WriteArrayHeader(2)
-		w.WriteBulk([]byte(formatGeoCoord(lons[i])))
-		w.WriteBulk([]byte(formatGeoCoord(lats[i])))
+		// Doubles, not bulk strings: that is what a RESP3 client dispatches on, and what
+		// real Redis sends. The *text* is still the 17-decimal geo form -- see
+		// WriteDoubleText for why the spelling and the type tag are decided separately.
+		w.WriteDoubleText(formatGeoCoord(lons[i]))
+		w.WriteDoubleText(formatGeoCoord(lats[i]))
 	}
 	return false
 }
@@ -506,8 +509,8 @@ func writeGeoResults(w *resp.Writer, results []geoResult, o geoSearchOpts) {
 		if o.withCoord {
 			lon, lat := geoDecode(uint64(r.score))
 			w.WriteArrayHeader(2)
-			w.WriteBulk([]byte(formatGeoCoord(lon)))
-			w.WriteBulk([]byte(formatGeoCoord(lat)))
+			w.WriteDoubleText(formatGeoCoord(lon))
+			w.WriteDoubleText(formatGeoCoord(lat))
 		}
 	}
 }
