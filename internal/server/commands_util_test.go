@@ -112,7 +112,15 @@ func TestGlobOrdinaryPatternsUnaffected(t *testing.T) {
 		{"*", "user:1234:profile", true},
 		{"", "", true},
 		{"", "a", false},
-		{"*", "", true},
+		// The matcher does not match "*" against the empty string, and that is Redis's
+		// answer, not a regression: its outer loop is `while (patternLen && stringLen)`, so
+		// an empty subject never reaches the trailing-star collapse inside it. Measured with
+		// an empty key name present on redis:7.2: `KEYS **` reports nothing. `KEYS *` does
+		// report it -- because KEYS short-circuits the lone star before the matcher sees it
+		// (Redis's `allkeys`, reproduced in cmdKeys), which is why the two disagree. See
+		// TestGlobEmptySubjectAtEveryCaller for the three call sites and their measurements.
+		{"*", "", false},
+		{"**", "", false},
 		{"user:*", "user:1234:profile", true},
 		{"user:*", "session:1", false},
 		{"user:*:profile", "user:1234:profile", true},
@@ -145,23 +153,37 @@ func BenchmarkGlobMatch(b *testing.B) {
 	long := strings.Repeat("k", 512)
 	cases := []struct {
 		name, pattern, s string
+		want             bool
 	}{
-		{"star", "*", key},
-		{"prefix", "user:*", key},
-		{"middle", "user:*:profile", key},
-		{"suffix", "*profile", key},
-		{"nomatch", "session:*", key},
-		{"questions", "user:????:profile", key},
-		{"multistar", "*a*b*c*", "xaybzc!"},
-		{"longkey", "*:v1", long + ":v1"},
+		{"star", "*", key, true},
+		{"prefix", "user:*", key, true},
+		{"middle", "user:*:profile", key, true},
+		{"suffix", "*profile", key, true},
+		{"nomatch", "session:*", key, false},
+		{"questions", "user:????:profile", key, true},
+		{"multistar", "*a*b*c*", "xaybzc!", true},
+		{"longkey", "*:v1", long + ":v1", true},
+		// The class and escape forms, so a cost added to them is visible too. These are the
+		// shapes a client actually sends -- "user:[0-9]*" is the pattern in the issue that
+		// started this -- not the hostile ones, which have their own tests.
+		{"class", "user:[0-9]*:profile", key, true},
+		{"class-nomatch", "user:[a-f]*:profile", key, false},
+		{"class-range", "user:[0-9][0-9][0-9][0-9]:profile", key, true},
+		{"escape", `user\:1234\:profile`, key, true},
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
 			b.ReportAllocs()
+			// The result is kept and checked after the loop rather than compared inside it.
+			// The previous form was `if globMatch(...) == (i < 0) { b.Fatal }`, which is only
+			// unreachable for a pattern that *matches*: the "nomatch" case failed every run
+			// on that guard, so the one case measuring a rejection had never been measured.
+			var sink bool
 			for i := 0; i < b.N; i++ {
-				if globMatch(c.pattern, c.s) == (i < 0) {
-					b.Fatal("unreachable")
-				}
+				sink = globMatch(c.pattern, c.s)
+			}
+			if sink != c.want {
+				b.Fatalf("globMatch(%q, %q) = %v, want %v", c.pattern, c.s, sink, c.want)
 			}
 		})
 	}

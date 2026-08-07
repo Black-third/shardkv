@@ -394,6 +394,21 @@ func cmdObject(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 		w.WriteInt(1)
 	case "IDLETIME":
+		// The mirror of FREQ below, and measured the same way: under an LFU policy Redis
+		// refuses IDLETIME, because the field that would hold an access time is holding the
+		// access counter instead. Answering 0 would be a number an operator could read as
+		// "just used".
+		switch s.evictionPolicy() {
+		case store.PolicyAllKeysLFU, store.PolicyVolatileLFU:
+			if !s.store.Exists(key) {
+				w.WriteNull()
+				return false
+			}
+			w.WriteError("ERR An LFU maxmemory policy is selected, idle time not tracked. " +
+				"Please note that when switching between policies at runtime LRU and LFU " +
+				"data will take some time to adjust.")
+			return false
+		}
 		idle, ok := s.store.IdleSeconds(key)
 		if !ok {
 			w.WriteNull()
@@ -401,13 +416,25 @@ func cmdObject(s *Server, w *resp.Writer, args [][]byte) bool {
 		}
 		w.WriteInt(idle)
 	case "FREQ":
-		// FREQ exists so that its refusal is the *right* refusal. Redis reports access
-		// frequency only under an LFU maxmemory policy, and answers this otherwise; this
-		// server has no LFU policy at all, so the answer is always this one. Reporting
-		// "unknown subcommand" instead would tell a client the command does not exist,
-		// when the truth is that the policy for it is not selected.
+		// Redis reports access frequency only under an LFU maxmemory policy, and answers the
+		// refusal below otherwise. Both halves are real here: the LFU policies maintain a
+		// decaying access counter per key (see internal/store/evict.go), so under one of them
+		// this reports the counter the sampler would rank by, and under any other policy
+		// nothing is tracked and there is no number to report. Answering "unknown
+		// subcommand" instead would tell a client the command does not exist, when the truth
+		// is that the policy for it is not selected.
 		if !s.store.Exists(key) {
 			w.WriteNull()
+			return false
+		}
+		switch s.evictionPolicy() {
+		case store.PolicyAllKeysLFU, store.PolicyVolatileLFU:
+			freq, ok := s.store.Freq(key)
+			if !ok {
+				w.WriteNull()
+				return false
+			}
+			w.WriteInt(freq)
 			return false
 		}
 		w.WriteError("ERR An LFU maxmemory policy is not selected, access frequency not " +
@@ -475,9 +502,14 @@ func cmdType(s *Server, w *resp.Writer, args [][]byte) bool {
 func cmdKeys(s *Server, w *resp.Writer, args [][]byte) bool {
 	pattern := string(args[1])
 	keys := s.store.Keys()
+	// A lone "*" bypasses the matcher entirely, as Redis's `allkeys` does. It is not only a
+	// shortcut: the matcher refuses an empty subject (see globMatch), so without this an
+	// empty key name -- which SET accepts, here and in Redis -- would be missing from
+	// `KEYS *`. Measured: redis:7.2 lists it for `KEYS *` and not for `KEYS **`.
+	allKeys := pattern == "*"
 	matched := keys[:0]
 	for _, k := range keys {
-		if globMatch(pattern, k) {
+		if allKeys || globMatch(pattern, k) {
 			matched = append(matched, k)
 		}
 	}

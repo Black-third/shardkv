@@ -221,22 +221,88 @@ const (
 	globMaxWork    = 1 << 24 // 16,777,216 byte comparisons
 )
 
-// globMatch reports whether s matches a glob pattern supporting '*' (any run)
-// and '?' (any single byte), as Redis's MATCH does for the common cases. It backs
-// both KEYS and SCAN's MATCH option.
+// globMatch reports whether s matches a glob pattern, using Redis's stringmatchlen
+// semantics: '*' matches any run of bytes, '?' any single byte, '[...]' a character class
+// (with '^' negation and 'a-c' ranges), and a backslash escapes the byte that follows it.
+// It backs KEYS, every SCAN family MATCH, CONFIG GET and pattern subscriptions.
 //
-// It is iterative with a single backtrack point rather than recursive as Redis's is, so
-// the star-count blowup Redis's bound exists to stop is not reachable here at all (1000
-// adjacent stars cost 2.6us) -- the bound is reproduced for the boundary's sake, not for
-// the cost's. What *is* reachable is quadratic backtracking, which the work budget stops.
-// See globMaxStarGroups and globWorkFactor.
+// globMatchFold is the same matcher with ASCII case folding, which is the nocase form
+// Redis uses for the names in CONFIG GET and COMMAND LIST FILTERBY.
+//
+// The class and escape syntax is reproduced from Redis's implementation rather than from
+// the POSIX glob most readers expect, because they disagree in ways a client can see. The
+// disagreements, each measured against redis:7.2 (see the table in TestGlobRedisSemantics):
+//
+//   - '[]' is an empty class and matches nothing, so a ']' as the first member is not the
+//     literal ']' POSIX makes it: `[]abc]` never matches. `[^]` is an empty *negated*
+//     class and therefore matches any single byte, exactly like '?'.
+//   - '!' is not a negation. `[!ae]` is the three-member class {'!','a','e'}.
+//   - a reversed range is silently swapped, so `[c-a]` is `[a-c]`.
+//   - `[a-]` is a *range* from 'a' to ']', because the range branch only asks that three
+//     bytes remain; `[-a]` is the two-member class {'-','a'}, because a leading '-' is not
+//     followed by one.
+//   - an unterminated class swallows the rest of the pattern and keeps the members it read
+//     before running out, so `a[b` matches "ab" and `a[a-b` matches "ab" -- while `a[`
+//     matches nothing at all, its class being empty.
+//   - an escape before an ordinary byte is that byte (`\z` matches "z"), and a *trailing*
+//     backslash is the literal backslash, which is what Redis's fall-through from its
+//     escape case into its literal case does.
+//
+// One deliberate difference from redis on amd64, and it is Redis that is inconsistent
+// with itself rather than this: the range comparison here is on unsigned bytes. Redis
+// compares C `char`s, whose signedness is the platform's, so a range with an endpoint at
+// or above 0x80 gets different answers from the same Redis release on different
+// architectures. Measured on redis:7.2: `[\x00-\xff]` matches "A" on arm64 (unsigned
+// char, 0..255) and does not on amd64 (signed char: 0 and -1, swapped to -1..0, which
+// admits only NUL and 0xff). This server takes the unsigned reading -- the one that is
+// the same everywhere and the one a client writing a byte range means.
 func globMatch(pattern, s string) bool {
+	matched, _ := globMatchCase(pattern, s, false)
+	return matched
+}
+
+// globMatchFold is globMatch with ASCII case folding (Redis's nocase form).
+func globMatchFold(pattern, s string) bool {
+	matched, _ := globMatchCase(pattern, s, true)
+	return matched
+}
+
+// globMatchCase is the matcher itself. It is iterative with a single backtrack point
+// rather than recursive as Redis's is, so the star-count blowup Redis's nesting bound
+// exists to stop is not reachable here at all (1000 adjacent stars cost 2.6us) -- the
+// bound is reproduced for the boundary's sake, not for the cost's. What *is* reachable is
+// quadratic backtracking, which the work budget stops. See globMaxStarGroups and
+// globWorkFactor.
+//
+// The single backtrack point is sound because every token except '*' consumes exactly one
+// subject byte: each segment between two stars is therefore matched at its earliest
+// possible position, and a later failure can only be repaired by sliding the *last* star.
+// That is the same answer Redis's recursion reaches, and for the same reason -- its
+// skipLongerMatches flag exists precisely to stop it from re-trying an earlier star.
+//
+// The second return value is the backtracking work charged against the budget, which is
+// the number the two bounds above are denominated in. It exists so a test can assert what
+// an ordinary pattern costs *in the matcher's own units* rather than in milliseconds on
+// whatever machine happens to be running it -- see TestGlobOrdinaryPatternsStayFree, and
+// commit 64653df for what wall-clock assertions have already cost this tree. Both wrappers
+// discard it, so it is one int64 in a register on every real call and never a load or a
+// store.
+func globMatchCase(pattern, s string, fold bool) (bool, int64) {
 	// A '*' group needs at least one byte, so a pattern no longer than the bound cannot
 	// exceed it. Testing that here rather than inside the helper is what keeps the bound off
 	// the cost of every ordinary pattern: for "user:*" the whole check is one comparison
 	// against a constant, with no call to make and nothing to count.
 	if len(pattern) > globMaxStarGroups && globStarGroupsExceeded(pattern) {
-		return false
+		return false, 0
+	}
+	// Redis's outer loop is `while (patternLen && stringLen)`, so an empty subject never
+	// enters it and never reaches the trailing-star collapse *inside* it: for an empty
+	// subject the answer is "only an empty pattern", and `*` does not match "". Measured:
+	// with an empty key name present, redis:7.2 answers `KEYS **` with nothing. `KEYS *`
+	// does report it -- but because KEYS short-circuits the single-star pattern before the
+	// matcher sees it, which cmdKeys reproduces, not because the matcher matched.
+	if len(s) == 0 {
+		return len(pattern) == 0, 0
 	}
 	// int64, because on a 32-bit build int is 32 bits wide and the product of the factor
 	// with two operands the reader accepts at up to 512 MiB each would wrap -- into a
@@ -245,65 +311,235 @@ func globMatch(pattern, s string) bool {
 	if budget > globMaxWork {
 		budget = globMaxWork
 	}
+	// Kept so the work charged can be reported without counting it a second time in the
+	// loop: the reported figure is the difference, so the backtrack path stays exactly the
+	// one subtraction and one comparison it was.
+	granted := budget
 	pi, si := 0, 0
 	star, starS := -1, 0
 	for si < len(s) {
-		switch {
-		case pi < len(pattern) && (pattern[pi] == '?' || pattern[pi] == s[si]):
-			pi++
-			si++
-		case pi < len(pattern) && pattern[pi] == '*':
-			// A star that ends the pattern absorbs whatever is left of the subject, so the
-			// answer is already known and there is nothing to backtrack over. This is Redis's
-			// own `if (patternLen == 1) return 1` after it collapses a run of stars, and it is
-			// what makes the two commonest patterns cheap: without it "*" backtracks once per
-			// byte of the subject, and "user:*" once per byte after the prefix.
-			if pi == len(pattern)-1 {
-				return true
+		// charge is how much pattern the attempt that is about to be abandoned scanned. It
+		// is set by the branches below and spent in the backtrack, so an ordinary pattern --
+		// one that never backtracks -- never pays anything at all.
+		var charge int
+		if pi < len(pattern) {
+			p := pattern[pi]
+			// The hot path, written out rather than routed through globToken, and ordered for
+			// the commonest outcome: a literal byte of pattern that matches the subject byte.
+			// That costs two loads, one comparison, and the three tests that say this byte is
+			// not a metacharacter.
+			//
+			// The duplication is deliberate. This loop runs once per charged byte of
+			// backtracking -- up to globMaxWork of them -- and globToken cannot be inlined,
+			// because it switches into a class parser that loops. Measured on the hostile shape
+			// the work budget exists for (one '*' then 256 KiB of near-matching literal against
+			// a 512 KiB subject), routing literals through that call cost 7x for an identical
+			// answer: 17ms became 125ms. A class and an escape still go through globToken,
+			// because they have to, and they are not what the hostile shapes are made of.
+			if p == s[si] && !globMeta[p] {
+				pi++
+				si++
+				continue
 			}
-			star, starS = pi, si
-			pi++
-		case star != -1:
-			// Charge the attempt that just failed: pi-star bytes of pattern were compared
-			// after the star and led nowhere. Charging here, rather than counting every
-			// iteration, is what makes the budget free for an ordinary pattern -- one that
-			// never has to backtrack never reaches this branch. It also guarantees
-			// termination on its own, since every visit costs at least 1.
-			budget -= int64(pi - star)
-			if budget < 0 {
-				return false
+			switch {
+			case p == '?':
+				pi++
+				si++
+				continue
+
+			case p == '*':
+				// A star that ends the pattern absorbs whatever is left of the subject, so the
+				// answer is already known and there is nothing to backtrack over. This is Redis's
+				// own `if (patternLen == 1) return 1` after it collapses a run of stars, and it is
+				// what makes the two commonest patterns cheap: without it "*" backtracks once per
+				// byte of the subject, and "user:*" once per byte after the prefix.
+				if pi == len(pattern)-1 {
+					return true, granted - budget
+				}
+				star, starS = pi, si
+				pi++
+				continue
+
+			case p == '[' || p == '\\':
+				end, ok := globToken(pattern, pi, s[si], fold)
+				if ok {
+					pi, si = end, si+1
+					continue
+				}
+				// The failed token counts too, not just the pattern before it. A character class
+				// leaves pi where it was however long the class is, so charging pi-star alone
+				// would let `*[<a long class>]` against a long subject backtrack once per subject
+				// byte at a cost of the whole class each time -- a second unbounded backtracking
+				// source, in a matcher whose first one is what these bounds exist for.
+				charge = end - star
+
+			case fold && lowerByte(p) == lowerByte(s[si]):
+				// A literal that matches only case-insensitively. Off the hot path on purpose:
+				// only CONFIG GET and COMMAND LIST FILTERBY fold, and neither is on a data path.
+				pi++
+				si++
+				continue
+
+			default:
+				charge = pi + 1 - star // a literal that did not match: one byte of pattern
 			}
-			pi = star + 1
-			starS++
-			si = starS
-		default:
-			return false
+		} else {
+			charge = pi - star
 		}
+		if star < 0 {
+			return false, granted - budget
+		}
+		// Charging only here, rather than counting every iteration, is what makes the budget
+		// free for an ordinary pattern. It also guarantees termination on its own, since a
+		// visit always costs at least 1: end is past the token that failed, and pi is past
+		// the star.
+		budget -= int64(charge)
+		if budget < 0 {
+			return false, granted - budget
+		}
+		pi = star + 1
+		starS++
+		si = starS
 	}
+	// The subject ran out. Redis collapses a trailing run of stars here and then requires
+	// the pattern to be exhausted too, which is why `ab*c` does not match "ab".
 	for pi < len(pattern) && pattern[pi] == '*' {
 		pi++
 	}
-	return pi == len(pattern)
+	return pi == len(pattern), granted - budget
+}
+
+// globMeta marks the four pattern bytes that are not literals: '*' and '?' consume subject
+// without naming it, '[' opens a class, and '\\' escapes what follows. The hot path in
+// globMatchCase tests membership with one indexed load instead of four comparisons, which is
+// worth it because that test runs once per byte of pattern per backtracking attempt -- up to
+// globMaxWork times. The table is 256 bytes and stays resident.
+var globMeta = [256]bool{'*': true, '?': true, '[': true, '\\': true}
+
+// globToken matches the single subject byte c against the one pattern token that begins at
+// pattern[pi] -- a literal, an escape, '?', or a character class -- and reports where that
+// token ends.
+//
+// end is returned whether or not the token matched, because the caller charges its
+// backtracking budget by how much pattern the failed attempt scanned, and for a class that
+// is the length of the class rather than one byte.
+//
+// '*' is not a token: it consumes an unbounded run and belongs to the caller.
+func globToken(pattern string, pi int, c byte, fold bool) (end int, matched bool) {
+	switch pattern[pi] {
+	case '?':
+		return pi + 1, true
+	case '[':
+		return globClass(pattern, pi, c, fold)
+	case '\\':
+		// An escape passes the next byte through as a literal, whatever it is. A *trailing*
+		// backslash has no next byte and stands for itself, which is what Redis's
+		// fall-through from its escape case into its literal case does.
+		if pi+1 < len(pattern) {
+			return pi + 2, eqByteFold(pattern[pi+1], c, fold)
+		}
+	}
+	return pi + 1, eqByteFold(pattern[pi], c, fold)
+}
+
+// globClass matches c against the character class beginning at pattern[pi] (which is a
+// '['), and reports the index just past the class.
+//
+// The walk is a transcription of Redis's, including the two things about it that are
+// surprising: the class ends at the first ']' whatever its position, so an empty class
+// (`[]`, or `[^]` before negation) is a real thing that matches nothing; and an
+// unterminated class ends at the end of the *pattern*, keeping whichever members it
+// managed to read. See globMatch for the measured consequences.
+func globClass(pattern string, pi int, c byte, fold bool) (end int, matched bool) {
+	j := pi + 1
+	neg := j < len(pattern) && pattern[j] == '^'
+	if neg {
+		j++
+	}
+	match := false
+	for {
+		switch {
+		case j+1 < len(pattern) && pattern[j] == '\\':
+			// An escaped member is a literal, so ']' and '-' can be class members.
+			j++
+			if eqByteFold(pattern[j], c, fold) {
+				match = true
+			}
+			j++
+
+		case j < len(pattern) && pattern[j] == ']':
+			return j + 1, match != neg
+
+		case j >= len(pattern):
+			// Unterminated. Redis backs its pattern pointer up by one byte here, which its own
+			// post-switch increment then undoes, so the class consumes the rest of the pattern.
+			return j, match != neg
+
+		case j+2 < len(pattern) && pattern[j+1] == '-':
+			// A range needs three bytes left, counted from here rather than to the ']' -- which
+			// is why `[a-]` is the range 'a'..']' and not the two members 'a' and '-'.
+			lo, hi := pattern[j], pattern[j+2]
+			if lo > hi {
+				lo, hi = hi, lo // Redis swaps a reversed range rather than refusing it
+			}
+			b := c
+			if fold {
+				lo, hi, b = lowerByte(lo), lowerByte(hi), lowerByte(b)
+			}
+			if b >= lo && b <= hi {
+				match = true
+			}
+			j += 3
+
+		default:
+			if eqByteFold(pattern[j], c, fold) {
+				match = true
+			}
+			j++
+		}
+	}
+}
+
+// lowerByte folds one ASCII byte to lower case, and only ASCII: that is what C's tolower
+// does in the "C" locale Redis runs in, and folding anything else would make a byte range
+// depend on a locale the wire protocol does not carry.
+func lowerByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func eqByteFold(a, b byte, fold bool) bool {
+	return a == b || (fold && lowerByte(a) == lowerByte(b))
 }
 
 // globStarGroupsExceeded reports whether pattern holds more '*' groups than a pattern may
 // hold and still match anything -- a run of adjacent stars counting as one group. See
 // globMaxStarGroups. Its caller has already established that the pattern is long enough for
 // the answer to be able to be yes.
+//
+// It walks the pattern with globToken rather than counting '*' bytes, so an escaped star
+// and a star inside a character class are the literals they are and count towards nothing.
+// Redis's bound is on how many star groups the *matcher* recurses through, and it never
+// recurses for either of those.
 func globStarGroupsExceeded(pattern string) bool {
 	groups, prevStar := 0, false
-	for i := 0; i < len(pattern); i++ {
-		if pattern[i] != '*' {
-			prevStar = false
+	for i := 0; i < len(pattern); {
+		if pattern[i] == '*' {
+			if !prevStar {
+				groups++
+				if groups > globMaxStarGroups {
+					return true
+				}
+			}
+			prevStar = true
+			i++
 			continue
 		}
-		if !prevStar {
-			groups++
-			if groups > globMaxStarGroups {
-				return true
-			}
-		}
-		prevStar = true
+		prevStar = false
+		// The subject byte is immaterial here; only the token's extent is being asked for.
+		i, _ = globToken(pattern, i, 0, false)
 	}
 	return false
 }

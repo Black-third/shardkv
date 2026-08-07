@@ -16,8 +16,9 @@ func init() {
 }
 
 // scanOpts is the parsed [MATCH pattern] [COUNT n] tail shared by every cursor
-// command. count is a hint at how much work one call should do; hasPattern
-// distinguishes "no MATCH" from "MATCH " with an empty pattern.
+// command. count is a hint at how much work one call should do; hasPattern says whether
+// anything has to be filtered at all, so it distinguishes "no MATCH" -- and the lone "*"
+// that means the same thing -- from `MATCH ""`, which keeps only an empty name.
 type scanOpts struct {
 	pattern    string
 	hasPattern bool
@@ -62,7 +63,13 @@ func parseScanOpts(tail [][]byte, f scanFlags) (scanOpts, string) {
 		switch name {
 		case "MATCH":
 			o.pattern = string(tail[i+1])
-			o.hasPattern = true
+			// A lone "*" is recorded as no pattern at all, which is Redis's own `use_pattern`
+			// test. It is not only a shortcut: the matcher refuses an empty subject (see
+			// globMatch), so a hash field or a key whose name is the empty string -- which
+			// HSET and SET both accept -- would otherwise be filtered out by the one pattern
+			// that is supposed to keep everything. Measured against redis:7.2 with an empty
+			// field name: `HSCAN h 0 MATCH *` reports it, `MATCH **` does not.
+			o.hasPattern = o.pattern != "*"
 		case "COUNT":
 			n, ok := parseInt64(tail[i+1])
 			if !ok {
