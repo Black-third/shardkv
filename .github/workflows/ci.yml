@@ -181,6 +181,13 @@ jobs:
   # Cross-compilation only: it costs one compile per target and is what catches a
   # word-size or platform assumption (a 32-bit int truncating a millisecond deadline,
   # say) without needing hardware to run the tests on.
+  #
+  # linux/386 and linux/arm are the point of this job, not padding: they are the only
+  # targets here where `int` is 32 bits wide, so they are the only ones that can catch
+  # the assumption the comment above describes. Without them the job could not: the
+  # matrix was amd64/arm64/darwin-arm64, all 64-bit, and `internal/store` had a
+  # `const lim = 1 << 40` compared against an `int` that did not fit it -- the package
+  # had not compiled for either 32-bit target for some time, and nothing reported it.
   cross-build:
     runs-on: ubuntu-latest
     strategy:
@@ -193,6 +200,10 @@ jobs:
             goarch: arm64
           - goos: darwin
             goarch: arm64
+          - goos: linux
+            goarch: '386'
+          - goos: linux
+            goarch: arm
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v4

@@ -417,7 +417,12 @@ func scanExponent(body string, i *int, lower, upper byte) (int, bool) {
 	start := j
 	exp := 0
 	for j < len(body) && isDigit(body[j]) {
-		if exp < 1<<30 {
+		// The ceiling is expSaturated and not something near the width of an int, because the
+		// guard is tested *before* the multiply: with a bound of 1<<30 the product overflows a
+		// 32-bit int and wraps -- to a negative exponent, silently, turning a refusal into a
+		// wrong answer on any 32-bit build. Saturating this low costs nothing, since every
+		// caller refuses an exponent outside 10**±4933 (LDBL_MAX/LDBL_MIN) long before this.
+		if exp < expSaturated {
 			exp = exp*10 + int(body[j]-'0')
 		}
 		j++
@@ -432,17 +437,28 @@ func scanExponent(body string, i *int, lower, upper byte) (int, bool) {
 	return exp, true
 }
 
+// expSaturated is the magnitude an exponent saturates at: any value at or past it is "too big
+// to matter", since every caller refuses an exponent outside 10**±4933 (LDBL_MAX) and 10**-4951
+// (the smallest subnormal). It is nine orders of magnitude beyond that and still small enough
+// that doubling it fits an int32, which is what makes the arithmetic below safe on a 32-bit
+// build -- `int` is 32 bits wide there, and the 1<<40 this used to be did not even compile.
+const expSaturated = 1 << 20
+
 // satAdd adds without wrapping, so a saturated exponent stays saturated.
+//
+// The sum is formed in int64 rather than int, because on a 32-bit build two operands that are
+// individually in range can still overflow when added -- and an exponent that wraps negative
+// turns a value this package should refuse into one it accepts, which is the same silent-wrong
+// -answer shape as the overflow guards in commands_util.go.
 func satAdd(a, b int) int {
-	const lim = 1 << 40
-	sum := a + b
+	sum := int64(a) + int64(b)
 	switch {
-	case sum > lim:
-		return lim
-	case sum < -lim:
-		return -lim
+	case sum > expSaturated:
+		return expSaturated
+	case sum < -expSaturated:
+		return -expSaturated
 	}
-	return sum
+	return int(sum)
 }
 
 // digitsToInt reads the digit run as an integer, reporting zero=true when every digit is
