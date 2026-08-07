@@ -822,6 +822,29 @@ func (s *Server) Listen(addr string) error {
 	return nil
 }
 
+// UseListener serves on a listener the caller already bound, in place of Listen.
+//
+// It exists for the embedded API, where a program may want to hand over a socket it
+// obtained some other way -- a port the test framework picked, a Unix socket, an
+// inherited descriptor, a listener it has already wrapped in its own TLS -- and for the
+// case of not listening at all. Anything this server would have done to the listener
+// itself is therefore the caller's to do: EnableTLS wraps what Listen binds, and a
+// listener supplied here is taken as it is.
+func (s *Server) UseListener(ln net.Listener) { s.ln = ln }
+
+// CloseListener closes the listener without waiting for Serve, for a startup path that
+// bound a socket and then failed before the accept loop took ownership of it.
+//
+// On the ordinary path nothing calls this: Serve watches its context and closes the
+// listener when it is canceled, which is what makes canceling the context sufficient to
+// stop a running server. This is only for the window before Serve exists.
+func (s *Server) CloseListener() error {
+	if s.ln == nil {
+		return nil
+	}
+	return s.ln.Close()
+}
+
 // Addr reports the bound address, or nil if Listen has not been called.
 func (s *Server) Addr() net.Addr {
 	if s.ln == nil {
@@ -832,10 +855,25 @@ func (s *Server) Addr() net.Addr {
 
 // Serve accepts connections until ctx is canceled, then waits for in-flight
 // connections to finish.
+//
+// With no listener it still owns the server's lifetime and blocks until ctx is
+// canceled. That is not a degenerate case but the embedded one: a program using only
+// the in-process client has no socket, and it must still be able to run the same call
+// -- because this is where baseCtx is set, and baseCtx is what ties replication started
+// at runtime (REPLICAOF from a client) to the server's lifetime rather than to
+// context.Background. Without it, an embedded server whose caller ran REPLICAOF would
+// leave the replication loop running after it was closed.
 func (s *Server) Serve(ctx context.Context) error {
 	s.mu.Lock()
 	s.baseCtx = ctx // so runtime REPLICAOF ties replication to the serve lifetime
 	s.mu.Unlock()
+
+	if s.ln == nil {
+		go s.reapIdleClients(ctx)
+		<-ctx.Done()
+		s.wg.Wait()
+		return nil
+	}
 
 	go func() {
 		<-ctx.Done()

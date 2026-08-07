@@ -272,11 +272,13 @@ func (r *Reader) ReadStatus() (string, error) {
 //
 // It is the companion ReadStatus needed once this server started acting as a client for
 // something other than the replication handshake: a node introducing itself to another
-// (CLUSTER MEET) reads that node's CLUSTER NODES table, which is a bulk string. A
-// general reply decoder is deliberately not offered -- the node-to-node conversations
-// this server has are a handful of statuses and one bulk string, and a decoder for
-// every RESP type would be a second protocol implementation to keep correct with no
-// caller that needs it.
+// (CLUSTER MEET) reads that node's CLUSTER NODES table, which is a bulk string.
+//
+// This and ReadStatus stay in use even though ReadReply (reply.go) now decodes every
+// type, and deliberately: the node-to-node conversations expect one specific shape, and
+// a reader that demands the shape it expects reports a peer answering something else as
+// a protocol error at the point of the mistake. Decoding into any and type-asserting
+// afterwards would turn the same mistake into a nil that surfaces somewhere later.
 func (r *Reader) ReadBulk() ([]byte, error) {
 	line, err := r.readLine()
 	if err != nil {
