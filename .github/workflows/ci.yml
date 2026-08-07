@@ -148,14 +148,61 @@ jobs:
           path: /tmp/compat-images
           key: compat-images-${{ hashFiles('test/compat/*/*') }}
 
+      # A load that fails is reported, not swallowed. `|| true` is still there -- a missing
+      # or corrupt tar must fall back to building the image, not fail the job -- but it used
+      # to hide the fallback happening, and a silent fallback is indistinguishable from a
+      # cache hit when you are trying to work out why a run behaved differently.
       - name: Load cached client images
         run: |
+          shopt -s nullglob
+          loaded=0 failed=0
           for tar in /tmp/compat-images/*.tar; do
-            [ -f "$tar" ] && docker load -i "$tar" || true
+            if docker load -i "$tar"; then
+              loaded=$((loaded+1))
+            else
+              failed=$((failed+1))
+              echo "::warning::could not load $tar; its image will be rebuilt"
+            fi
           done
+          echo "cached images loaded=$loaded failed=$failed"
 
+      # Output kept so the step below can put it in the run summary. This job has failed
+      # intermittently -- 4 of 10 recent runs, straddling a cache-key fix that was briefly
+      # mistaken for a cure -- and each time it produced no artifact at all, because it dies
+      # before writing test/compat/.results/. So the artifact upload cannot carry the
+      # diagnosis, and a job log needs admin rights on the repository to download. Three
+      # separate attempts to diagnose this from the outside failed for that reason.
       - name: Run the client-library suites
-        run: ./test/compat/run.sh
+        run: |
+          set -o pipefail
+          ./test/compat/run.sh 2>&1 | tee /tmp/compat.log
+
+      # The setup phase is what dies, so the tail is where the reason is. Docker state is
+      # dumped beside it because the plausible causes are all there: an image that did not
+      # load, a container that did not start, a registry pull that failed.
+      - name: Report why the suites failed
+        if: failure()
+        run: |
+          {
+            echo "## client-library compatibility failed"
+            echo
+            echo "### last 120 lines"
+            echo '```'
+            tail -n 120 /tmp/compat.log 2>/dev/null || echo "(no output captured)"
+            echo '```'
+            echo "### docker state"
+            echo '```'
+            docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>&1 | head -40
+            echo "--- images ---"
+            docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' 2>&1 | head -30
+            echo "--- networks ---"
+            docker network ls --format '{{.Name}}' 2>&1 | head -20
+            echo '```'
+            echo "### results directory"
+            echo '```'
+            ls -la test/compat/.results/ 2>&1 | head -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save the client images
         if: always()
