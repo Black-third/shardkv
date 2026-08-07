@@ -49,7 +49,7 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 - **Six data types** — strings, lists, hashes, sets, **sorted sets backed by a
   hand-written skip list** with O(log n) insertion, deletion and rank queries, and
-  **streams** with consumer groups. 222 commands, including both set algebras
+  **streams** with consumer groups. 224 commands, including both set algebras
   (`SINTER`/`SUNION`/`SDIFF` and `ZUNION`/`ZINTER`/`ZDIFF` with their `*STORE` forms,
   `WEIGHTS` and `AGGREGATE`), score, rank *and* lexicographic range queries
   (`ZRANGEBYLEX`, `ZRANGE ... BYSCORE|BYLEX|REV|LIMIT`, `ZRANGESTORE`), `SORT` with its
@@ -124,6 +124,12 @@ of goroutines and TCP clients — passes under the Go race detector.
   (`-aof-rewrite-percentage` against the size after the last rewrite, floored by
   `-aof-rewrite-min-size`) replace the history with a snapshot of the present, so
   a key written a million times stops costing a million records to replay.
+- **Point-in-time snapshots** — `SAVE`, `BGSAVE`, `LASTSAVE`, the `save <seconds>
+  <changes>` schedule and `DEBUG RELOAD` write one framed, length-prefixed,
+  CRC-64-checksummed file that is complete as of a single instant across every database.
+  Written to a temporary file and renamed, so a crash cannot replace a good snapshot with
+  a truncated one. **Not an RDB file, and the header says so** — see
+  [Persistence (snapshots)](#persistence-snapshots).
 - **Primary–replica replication with partial resync** — a replica issues
   `PSYNC <replid> <offset>`; a master that still holds that offset in its bounded
   backlog answers `+CONTINUE` and streams only the bytes the replica missed,
@@ -176,6 +182,12 @@ of goroutines and TCP clients — passes under the Go race detector.
   (with `MATCH`/`COUNT`) instead of the O(n) `KEYS`, and `HSCAN`/`SSCAN`/`ZSCAN`
   offer the same contract over one collection; all filter with the same glob
   matcher (`*`, `?`); pipelined requests are served with a single coalesced flush.
+- **Byte-bounded eviction** — `maxmemory` with all eight of Redis's policies
+  (`noeviction`, `allkeys-lru`/`-lfu`/`-random`, `volatile-lru`/`-lfu`/`-random`/`-ttl`).
+  `used_memory` is a running total maintained as values are written, so the budget is
+  compared against the dataset rather than against the Go heap, and a policy that cannot
+  evict refuses the writes that would grow the keyspace with Redis's own `OOM` error while
+  reads and deletions keep working. See [Memory and eviction](#memory-and-eviction).
 - **Approximate-LRU eviction** — an optional `maxkeys` cap; a background pass
   samples keys and evicts the least-recently-used, Redis-style.
 - **TTL expiration** — lazy on read plus a background janitor that reclaims
@@ -221,12 +233,14 @@ of goroutines and TCP clients — passes under the Go race detector.
   `b` blocked, `d` after a watched key changed, `P` subscribed, `S` a replica feed, `O` a
   monitor), because tools parse that line and some of them parse it positionally —
   `COMMAND COUNT|INFO|DOCS`,
-  `DEBUG PROTOCOL|SLEEP|OBJECT|CHANGE-REPL-ID`, `RESET`, `SELECT`, `LASTSAVE`,
+  `DEBUG PROTOCOL|SLEEP|OBJECT|RELOAD|CHANGE-REPL-ID`, `RESET`, `SELECT`,
+  `SAVE`, `BGSAVE [SCHEDULE]`, `LASTSAVE`,
   `SHUTDOWN [NOSAVE]`, and `INFO <section>` filtering.
 - **Observability** — `INFO` in eight sections: server, clients
   (`blocked_clients`, `total_blocking_keys`), persistence
   (`aof_rewrite_in_progress`, `aof_base_size`, `aof_current_size`,
-  `aof_last_bgrewrite_status`), stats (commands, `keyspace_hits`/`keyspace_misses`,
+  `aof_last_bgrewrite_status`, `rdb_last_save_time`,
+  `rdb_changes_since_last_save`), stats (commands, `keyspace_hits`/`keyspace_misses`,
   evictions, `sync_full`, `sync_partial_ok`, `sync_partial_err`, `replica_drops`,
   Pub/Sub and MONITOR drop counters), replication (`master_replid`,
   `master_repl_offset`, `slave_repl_offset`, per-replica acknowledged offsets,
@@ -250,7 +264,7 @@ of goroutines and TCP clients — passes under the Go race detector.
 
 ## Commands
 
-222 commands, with Redis's replies, error strings, and edge-case behaviour
+224 commands, with Redis's replies, error strings, and edge-case behaviour
 (missing keys, empty collections, negative indexes, wrong-type errors). Every
 reply is available in both RESP2 and RESP3; where the two differ, the RESP3 shape
 is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
@@ -274,7 +288,7 @@ is the one real Redis 7 sends (see [Protocol](#protocol-resp2-and-resp3)).
 | Pub/Sub | `SUBSCRIBE` · `UNSUBSCRIBE` · `PSUBSCRIBE` · `PUNSUBSCRIBE` · `PUBLISH` · `PUBSUB CHANNELS [pattern]\|NUMSUB [ch...]\|NUMPAT` |
 | Connection | `AUTH [username] password` · `HELLO [2\|3 [AUTH u p] [SETNAME n]]` · `PING` · `SELECT index` · `RESET` · `QUIT` · `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|LIST\|INFO\|KILL\|UNBLOCK id [TIMEOUT\|ERROR]\|REPLY ON\|OFF\|SKIP` |
 | Databases | `SELECT index` · `SWAPDB index1 index2` · `MOVE key db` · `COPY key dst [DB n] [REPLACE]` · `FLUSHDB` · `FLUSHALL` · `DBSIZE` |
-| Server  | `INFO [section...]` · `DBSIZE` · `FLUSHDB` · `FLUSHALL` · `SWAPDB` · `MOVE` · `CONFIG GET\|SET\|RESETSTAT` · `COMMAND [COUNT\|INFO\|DOCS\|GETKEYS\|HELP]` · `DEBUG PROTOCOL\|SLEEP\|OBJECT\|CHANGE-REPL-ID\|HELP` · `BGREWRITEAOF` · `LASTSAVE` · `SHUTDOWN [NOSAVE]` |
+| Server  | `INFO [section...]` · `DBSIZE` · `FLUSHDB` · `FLUSHALL` · `SWAPDB` · `MOVE` · `CONFIG GET\|SET\|RESETSTAT` · `COMMAND [COUNT\|INFO\|DOCS\|GETKEYS\|HELP]` · `DEBUG PROTOCOL\|SLEEP\|OBJECT\|RELOAD\|CHANGE-REPL-ID\|HELP` · `BGREWRITEAOF` · `SAVE` · `BGSAVE [SCHEDULE]` · `LASTSAVE` · `SHUTDOWN [NOSAVE]` |
 | Observability | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` · `MONITOR` · `LATENCY HISTORY event\|LATEST\|HISTOGRAM [cmd...]\|RESET [event...]\|HELP` · `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|HELP` · `COMMAND GETKEYS cmd args...` · `INFO commandstats` · `INFO latencystats` |
 | Replication | `REPLICAOF host port\|NO ONE` · `SLAVEOF` · `ROLE` · `PSYNC replid offset` · `REPLCONF listening-port\|ACK` · `WAIT numreplicas timeout` |
 | Cluster | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` · `CLUSTER ADDSLOTS slot...\|DELSLOTS\|ADDSLOTSRANGE start end...\|DELSLOTSRANGE` · `CLUSTER SETSLOT slot IMPORTING\|MIGRATING\|STABLE\|NODE id` · `CLUSTER COUNTKEYSINSLOT slot\|GETKEYSINSLOT slot count` · `CLUSTER MEET ip port [bus-port]\|FORGET id\|REPLICATE id\|RESET [HARD\|SOFT]` · `ASKING` · `READONLY` · `READWRITE` |
@@ -490,6 +504,9 @@ Every flag:
 -databases 16                   how many databases SELECT can switch between
 -sweep 1s                       interval between active expiration sweeps
 -maxkeys 0                      approximate-LRU cap on live keys, per database
+-maxmemory 0                    byte budget for the dataset (100mb, 1gb, …); 0 = unbounded
+-maxmemory-policy               what happens at the budget; default derived from -maxkeys
+-maxmemory-samples 16           keys the sampler examines before choosing a victim
 -aof path                       append-only file (empty disables persistence)
 -aofsync everysec               always | everysec | no
 -aof-rewrite-min-size 67108864  smallest log that may trigger an automatic rewrite
@@ -529,14 +546,23 @@ changes what `OBJECT ENCODING` says about a value, and `hll-sparse-max-bytes` ge
 moves the point at which a HyperLogLog stops being sparse. See
 [OBJECT ENCODING](#object-encoding-and-the-representation-thresholds).
 
-The `maxmemory` family is reported too, because client libraries ask for it by pattern
-while warming up and an empty reply is not the same statement as "unlimited":
-`maxmemory 0` (no byte budget is enforced anywhere — the cap here is `maxkeys`),
-`maxmemory-policy` (`noeviction`, or `allkeys-lru` once `maxkeys` is set, read from the same
-accessor `INFO` reports it from so the two cannot disagree), `maxmemory-samples 16` (the
-sampler's real sample size, not Redis's default of 5) and `maxmemory-clients 0` (no client
-eviction). All four are read-only: nothing here would act on a value it was given, and
-`CONFIG SET maxmemory 100mb` is refused rather than accepted and ignored.
+The `maxmemory` family is real and settable: `maxmemory` is a byte budget enforced on the
+write path, `maxmemory-policy` selects between Redis's eight policies, `maxmemory-samples`
+changes how many keys the sampler examines, and `lfu-log-factor`/`lfu-decay-time` tune the
+LFU counter. Operands take Redis's suffixes and read back as Redis reports them — `CONFIG SET
+maxmemory 100mb` answers `104857600`, not `100mb`. The policy is read from the same accessor
+`INFO` reports it from, so the two cannot disagree. `maxmemory-samples` defaults to 16 rather
+than Redis's 5 (a sample here is drawn from one shard, so it sees 1/256th of the keyspace),
+and the number reported is the number the sampler uses. `maxmemory-clients 0` stays read-only,
+because there is no client eviction to configure — a settable number that changed nothing
+would be worse than an honest constant.
+
+All three are also startup flags (`-maxmemory 100mb`, `-maxmemory-policy allkeys-lfu`,
+`-maxmemory-samples 32`), applied through the same table `CONFIG SET` uses, so a flag and a
+runtime change cannot come to mean different things and a mistyped flag is refused with the
+sentence `CONFIG SET` would have sent. A flag left off is not applied at all rather than
+applied as its default, which is what keeps `-maxmemory-policy`'s default *derived*: a server
+with `-maxkeys` and no explicit policy evicts by `allkeys-lru`.
 
 Pub/Sub, in two terminals:
 
@@ -598,6 +624,182 @@ the rewrite runs on its own goroutine and the caller is acknowledged immediately
 A failed rewrite (a temp file that cannot be created, a rename that fails) leaves
 the existing log open and appendable, and is reported as
 `aof_last_bgrewrite_status:err`.
+
+## Persistence (snapshots)
+
+```bash
+go run ./cmd/shardkv -snapshot dump.skv -save "3600 1 300 100 60 10000"
+```
+
+An AOF is a *history*; a snapshot is a *state*. The difference matters twice: a cold
+start on an AOF replays every write the server ever accepted, so start-up time grows
+with the workload rather than with the dataset, and there is no single file an operator
+can copy for a backup, because the log is being appended to while they copy it. A
+snapshot is one file, complete as of one instant, and holds one command per key rather
+than one per write.
+
+```bash
+redis-cli -p 6380 save              # OK          -- synchronous, blocks this client
+redis-cli -p 6380 bgsave            # Background saving started
+redis-cli -p 6380 lastsave          # (integer) 1786027613
+redis-cli -p 6380 info persistence  # rdb_* fields
+redis-cli -p 6380 debug reload      # save, then load it back in place
+```
+
+`-save` takes Redis's `<seconds> <changes>` pairs and defaults to Redis's own default, so
+`CONFIG GET save` reports the string a client expects; it only ever fires on a server that
+was given a `-snapshot` path. An empty string disables scheduled saving. Each rule means
+"save if at least *changes* writes have changed the dataset and at least *seconds* have
+passed since the dataset was last written out in full" — where "in full" counts a
+successful AOF rewrite as well as a successful save, because both put a complete copy on
+disk.
+
+### This is not an RDB file
+
+The format is shardkv's own. **Redis cannot read a shardkv snapshot and shardkv cannot
+read a `dump.rdb`.** The first line of every file says so in ASCII, so an operator who
+finds one on disk learns it from the file:
+
+```
+SHARDKV-SNAPSHOT v1 -- shardkv native format. NOT an RDB file: Redis cannot read this.
+```
+
+The alternative was attempted-RDB, and it was rejected for the same reason `DUMP`/`RESTORE`
+uses its own payload format (see [No RDB, in either direction](#compatibility-what-is-missing)):
+RDB is versioned and has a per-type opcode table with several size-threshold-selected
+encodings per type — listpack, quicklist, intset, ziplist, stream listpacks with their own
+framing. A half-implemented writer produces a file that either fails to load, which is
+merely useless, or loads *wrongly*, which is silent corruption of the one artefact whose
+entire purpose is to be trustworthy after everything else has already gone wrong.
+
+What that costs, stated because it is real:
+
+- **`redis-check-rdb`, `rdb-tools` and every other RDB inspector cannot read a snapshot.**
+  The mitigation is that the body is a plain RESP command stream, so `redis-cli --pipe`
+  can replay a snapshot's body into any Redis server, and any RESP reader can dump it.
+- **A real Redis's `dump.rdb` cannot be loaded here.** Migrating from Redis goes over the
+  wire — a replica sync, or `DUMP`/`RESTORE` per key — not through the file.
+- **No cross-version binary promise beyond the version in the magic line.** A future v2
+  will be a different magic line, and this reader refuses it by name rather than misreading
+  it. A `dump.rdb` handed to it is named as such: `not a shardkv snapshot file: this looks
+  like a Redis RDB file, which shardkv cannot read`.
+
+### The format
+
+```
+<magic line>        ASCII, ends with '\n'; names the format, the version, and that it is not an RDB
+uint64 big-endian   the instant the snapshot was taken, Unix milliseconds
+uint64 big-endian   how many commands the body holds
+uint64 big-endian   how many bytes the body holds
+<body>              exactly that many bytes: RESP arrays of bulk strings — the same encoding
+                    the AOF and the replica stream use
+uint64 big-endian   CRC-64 (ECMA) of the body
+```
+
+The body is `Store.Dump()`'s command stream, which is what the AOF rewrite and a replica
+seed already use, so the snapshot inherits the parts of this that are hard and already
+tested: collections chunked at 256 elements so no command exceeds `resp.MaxMultiBulk`, a
+chunk boundary that never splits an `HSET` field/value or `ZADD` score/member pair, a key's
+`PEXPIREAT` after its last chunk, and a stream's id counters, consumer groups, consumers
+and pending-entries list. Each database is preceded by the `SELECT` that puts a replayer
+into it, and a dataset that only uses database 0 emits no `SELECT` at all.
+
+The three counters exist for one reason: **a snapshot has to be able to say it is
+incomplete.** A bare command stream cannot — a file truncated after 900 of 1000 commands
+parses cleanly as a smaller dataset, and nothing can tell that the other 100 keys ever
+existed. The byte length catches truncation, the command count catches a body that parses
+to fewer commands than were written, and the checksum catches the rest. Any of the three
+failing is an error and the server refuses to start; it is never a partial load. That is
+the opposite of the AOF's behaviour, and deliberately: a torn AOF tail is the expected
+shape of a crash, whereas a snapshot is written to a temporary file and renamed, so it is
+whole or absent and anything else has been damaged after the fact.
+
+**The write is atomic.** The bytes go to `<path>.tmp`, are fsynced, and are then renamed
+over the destination; the directory is fsynced afterwards so the rename itself survives a
+power loss. Rename is atomic within a directory, so a reader sees either the previous
+snapshot or the new one and never a mixture — the crash that made the backup necessary
+cannot be the crash that destroys it. The directory fsync is best effort, as in the AOF
+rewrite: some platforms refuse it, and failing a save whose data has already reached the
+disk would be the worse answer. A failed save leaves the previous snapshot untouched and
+no `.tmp` debris behind, and reports `rdb_last_bgsave_status:err`.
+
+### What consistency a save provides
+
+**The cut is a single instant for the whole keyspace.** Not per-shard-consistent, and not
+Redis's copy-on-write: `propMu`, `crossDBMu` and every shard's read lock in every database
+are all held together for the whole walk, so no write can be applied anywhere while it is
+being read. There is no window in which one shard is captured before a write and another
+after it — which is exactly what a shard-at-a-time walk would produce, since a key and
+another key it is written with hash to different shards.
+
+Three things follow, and the third is a limit rather than a guarantee:
+
+- Every individual write is wholly in the snapshot or wholly out of it, in every
+  propagation mode.
+- A command that is atomic across shards on its own — the ones built on `Store.lockKeys`:
+  `RENAME`, `COPY`, `SMOVE`, `LMOVE`/`RPOPLPUSH`, `MSETNX` — is likewise wholly in or
+  wholly out. This is pinned by a test that shuttles an element between two lists in
+  different shards from four connections while snapshots are taken, and requires the total
+  across the pair to be invariant in every file.
+- A write that is **not** internally atomic across shards is not made atomic by the cut.
+  `MSET` is the case that exists today: it is a loop of independent single-key writes with
+  no cross-shard lock, so a cut can land between its keys — exactly as a concurrent `MGET`
+  can. The snapshot neither creates that nor can fix it. Likewise a `MULTI`/`EXEC` batch is
+  atomic against the cut **only when propagation is active**, because that is when `EXEC`
+  holds `propMu`; on a pure cache (no AOF, no replica) `EXEC` deliberately does not, and
+  its commands are applied one at a time to any observer, this one included.
+
+**What "background" means here is narrower than in Redis**, and the difference is stated
+rather than papered over. `BGSAVE` does not block the *client* — it returns as soon as the
+save starts — and does not block anything for the *file write*: encoding, fsync and rename
+all happen on the background goroutine with no lock held. It *does* block **writers** for
+the length of the in-memory walk, which is O(dataset) with no I/O in it; readers are
+unaffected, because the walk holds read locks. Real Redis forks and pays copy-on-write page
+faults instead. There is no fork here, so the choice is between blocking writers briefly
+and producing a file that never existed as a state, and the first is the one whose
+correctness fits in a sentence. The peak memory cost is the command stream itself — roughly
+the serialized size of the dataset — held while the file is written, which is the price of
+not forking and the same order as the copy-on-write cost a fork can reach.
+
+`SAVE` takes the same cut and holds nothing longer, but writes the file on the calling
+connection's goroutine, so the client waits for the disk.
+
+### Snapshot and AOF together
+
+**The AOF wins when both exist.** That is Redis's rule (its `loadDataFromDisk` loads the
+AOF when `appendonly` is on and the RDB only otherwise) and it is the right one: the AOF
+recorded every write up to the crash while the snapshot stopped at the last save, so the
+AOF is by construction at least as recent. Applying both would double-apply everything the
+snapshot already describes — harmless for `SET`, wrong for `RPUSH`, `SADD`, `XADD` and
+every other command whose replay is not idempotent.
+
+One case is handled differently from Redis, on purpose. With an AOF configured but *empty*
+next to a snapshot that is not, Redis starts empty and the operator loses the dataset by
+enabling a durability feature. Here the snapshot is loaded and the AOF is then rewritten
+from it immediately, before any client can connect, so the log describes the whole dataset
+from its first byte. A failure of that rewrite is fatal rather than logged: continuing
+would leave an AOF that is authoritative on the next restart and describes only part of
+what is in memory.
+
+`LASTSAVE` after a restart reports the instant recorded *in the file*, not the moment this
+process started. Redis reports its start time there; a backup taken three days ago is not
+a save that happened at boot, and the whole use of the field is to answer "how stale is the
+copy on disk".
+
+### `INFO persistence`
+
+`rdb_last_save_time` and `rdb_changes_since_last_save` are the two an operator polls: the
+first is the last full write of the dataset (a save, an AOF rewrite, or the instant in a
+loaded snapshot), and the second is how many writes have changed it since. The counter is
+*decremented* by what it read at the cut rather than zeroed, so writes that landed while
+the file was being written are still correctly reported as unsaved.
+
+`DEBUG RELOAD` saves and loads back in place — Redis's own test hook, and what its suite
+uses after almost every interesting mutation to check that every type survives the round
+trip. The load is completed and verified *before* anything is discarded, so a snapshot
+that does not parse leaves the dataset alone. With snapshots disabled it does the same
+round trip through memory, using the same encoder and decoder, so the check is available
+on the default configuration too.
 
 ## Replication
 
@@ -996,9 +1198,12 @@ Two further properties:
   fourth command leaves no three-command remnant, invalidates no `WATCH`, and emits no
   keyspace notification for a value that never existed.
 
-`FREQ` is parsed and validated but has no effect — it carries an LFU access counter and
-this server's eviction sampler is LRU. `IDLETIME` *is* applied, so a key arriving from
-another node keeps the age it had there.
+`FREQ` carries an LFU access counter and is applied: under an `allkeys-lfu` or
+`volatile-lfu` policy the counter really is what the sampler ranks by, and `OBJECT FREQ`
+reads it back. `IDLETIME` is applied too, so a key arriving from another node keeps the age
+it had there. Which of the two a policy consults is the same either-or Redis has, since both
+describe the same field: `OBJECT FREQ` is refused under a non-LFU policy and `OBJECT IDLETIME`
+under an LFU one, with Redis's wording for each.
 
 ### Quick start: a three-node cluster
 
@@ -1370,14 +1575,17 @@ Four things are worth knowing about this surface:
 `MEMORY USAGE` is an estimate and is documented as one — Go offers no portable way to ask
 the allocator how large a live object graph is — but it is exact about the payload, which
 is the part that dominates and the part an operator is looking for when hunting the key
-that grew. `MEMORY DOCTOR` reports what this server can actually diagnose (key counts,
-the eviction cap, whether eviction is running) and says plainly which of Redis's checks it
-cannot perform, rather than inventing findings from no evidence.
+that grew. `MEMORY DOCTOR` reports what this server can actually diagnose (key counts, the dataset's
+size, the budget and policy in force, and — when writes are being refused — *why*, which
+under a `volatile-*` policy with no TTLs anywhere is the difference between a diagnosis and a
+mystery) and says plainly which of Redis's checks it cannot perform, rather than inventing
+findings from no evidence.
 
 `MEMORY STATS` follows the same rule, and the interesting part of it is what is *missing*.
 It reports the twelve fields this server can state truthfully, under Redis's names and in
-Redis's order: `total.allocated` (the Go heap in use, the same number `INFO`'s `used_memory`
-reports), `replication.backlog` (the bytes the backlog ring retains, as `INFO`'s
+Redis's order: `total.allocated` (the dataset, the same number `INFO`'s `used_memory`
+reports — Redis's own `total.allocated` is its `used_memory`, so putting anything else under
+the name would be two numbers wearing one label), `replication.backlog` (the bytes the backlog ring retains, as `INFO`'s
 `repl_backlog_histlen`), `clients.normal`/`clients.slaves` (the sums of exactly the `tot-mem`
 `CLIENT LIST` publishes for those connections), `cluster.links`, `lua.caches` and
 `functions.caches` (0 because there is no cluster bus, no Lua and no functions — the
@@ -1395,6 +1603,180 @@ where 0 is right under `appendfsync always` and false under `everysec`; and the 
 `fragmentation` group describes a jemalloc this server does not have. A missing field says
 "this server cannot tell you". A fabricated `fragmentation` ratio would say something false
 about the process, which is the one thing an observability reply must never do.
+
+## Memory and eviction
+
+Every operator sizes a cache in bytes — container limits, alerts and capacity plans are all
+expressed that way — so `maxmemory` is a real budget here and `used_memory` is a real number.
+
+```bash
+redis-cli -p 6380 CONFIG SET maxmemory 2gb
+redis-cli -p 6380 CONFIG SET maxmemory-policy allkeys-lru
+redis-cli -p 6380 INFO memory | grep -E 'used_memory:|maxmemory'
+redis-cli -p 6380 INFO stats  | grep evicted_keys
+```
+
+### What `used_memory` counts
+
+It is a running total, maintained as values are written, of what the dataset occupies: for
+every key the keyspace holds, the entry struct and the keyspace map's slot for it, the key's
+own bytes, and the value's payload measured exactly as `MEMORY USAGE` measures it. The two
+are the same estimator, so `used_memory` equals the sum of `MEMORY USAGE` over every key —
+not a second opinion about it.
+
+It does **not** count the Go runtime's own footprint, the allocator's slack, the per-shard
+map's spare capacity, the replication backlog, client input/output buffers, the AOF's buffer,
+or goroutine stacks. Redis excludes replica output buffers from its own `maxmemory`
+arithmetic for the same reason — a budget you cannot meet by evicting a key is not a budget
+eviction can meet — and includes the rest because it measures at the allocator, which Go
+offers no portable way to do. The Go heap is still reported, under its own name
+(`used_memory_go_heap`), because it is a real and useful number; it is just not the dataset,
+and a budget compared against it would have eviction chasing the garbage collector.
+
+A key whose deadline has passed but which nothing has reclaimed yet is still counted: the
+bytes are still resident. It stops being counted the moment a read, the sweep, or eviction
+removes it.
+
+### Why a maintained counter, and how it is kept honest
+
+The size of a value is a property of the value, so learning it means looking at it — which
+is what `MEMORY USAGE` and `MEMORY STATS` do, and why both are O(the thing they measure).
+A byte budget cannot be enforced that way: "are we over the limit?" is asked before every
+write, and answering it with a walk of the keyspace would make every write O(keyspace).
+
+So the total is maintained. The difficulty of a maintained total is that it must be right
+across *every* path that changes a value's size — including the ones that change it in place
+(`APPEND`, `SETRANGE`, `SETBIT`, `BITFIELD`, the HyperLogLog commands), every collection
+insert and removal, and expiry and eviction. A counter updated by hand at each of ninety-odd
+mutation sites is a counter that will be wrong the first time a site is added and nobody
+notices.
+
+The shape is chosen so "did you remember?" is not a question a reviewer has to ask. A
+mutating method does not compute a delta; it declares that it is about to change a key, and
+the accounting measures the difference itself:
+
+```go
+sh.mu.Lock()
+charged := s.charge(sh, key)
+defer sh.mu.Unlock()
+defer s.settle(sh, key, charged)
+```
+
+Insert, overwrite, in-place growth, shrink and delete are therefore one case rather than
+five, and a method cannot be half-instrumented: either it declared the key it changes or it
+did not. Each container carries its own byte count (`deque.bytes`, `zset.bytes`,
+`entry.elemBytes`) so that asking a million-field hash how large it is costs nothing —
+otherwise `HSET` would become O(n).
+
+What proves it is `TestMemoryAccountingDoesNotDrift`: twenty thousand randomised mutations
+drawn from every mutating store method, interleaved with expiry sweeps and eviction passes,
+after which every entry's maintained size is compared against a walk of that entry and the
+total against a full recomputation. Per entry, not only in total — a total that agrees by
+luck, one key over and another under, is not an accounting anyone can reason about. Measured
+drift: **zero bytes**.
+
+**The accounting is off until something asks for it.** A server with no byte budget that
+nobody has asked about pays one atomic load per mutation and nothing else: no map lookup, no
+arithmetic, no counter. Setting `maxmemory`, or the first read of `used_memory`, switches it
+on and derives the totals from the dataset, so the counter never starts from a partial
+history. That is invariant 12's rule rather than a shortcut — an observer that is not
+watching costs nothing, and whoever asks to watch pays for it.
+
+**One documented gap.** A stream's payload is refreshed by the maintenance pass rather than
+at the moment it changes, because the stream mutation paths live in a file this accounting
+does not instrument. So `used_memory` lags a stream-only write burst by at most one sweep
+interval (`-sweep`, one second by default) and converges exactly; every other type is exact
+at every instant. `TestMemoryAccountingConvergesForStreams` pins both halves of that
+statement, so closing the gap would fail loudly rather than pass silently.
+
+### The policies
+
+All eight of Redis's, and the difference between the two families is not which comparison
+they make but which keys are *candidates*: an `allkeys-*` policy may evict anything, a
+`volatile-*` policy may only evict a key carrying a TTL.
+
+| policy | victim |
+| --- | --- |
+| `noeviction` | nothing; writes that could grow the dataset are refused |
+| `allkeys-lru` / `volatile-lru` | the oldest access time among the sample |
+| `allkeys-lfu` / `volatile-lfu` | the lowest access frequency among the sample |
+| `allkeys-random` / `volatile-random` | any candidate |
+| `volatile-ttl` | the nearest deadline among the sample |
+
+Eviction is approximate, as Redis's is: `maxmemory-samples` keys are examined and the best
+candidate among them is taken, because keeping a global access order would mean touching
+shared state on every read — the exact cost the sharded keyspace exists to avoid. What is
+*not* approximate is which keys are eligible. A `volatile-*` policy never takes a key with no
+TTL, and "there is nothing to evict" is a fact rather than a failed guess: every shard is
+visited, and a per-shard count of volatile keys rules out a hopeless shard in O(1) so the
+only shards walked in full are ones that really do hold a candidate. An earlier version drew
+random shards instead, which missed a lone volatile key's shard often enough to refuse writes
+while a key it was allowed to take was sitting there.
+
+The LFU counter is Redis's: an 8-bit logarithmic counter with a decay, so a key that was hot
+an hour ago does not outrank one that is hot now, and a new key starts at 5 rather than 0 —
+starting at zero would make every freshly written key the most attractive victim in the
+keyspace, so an LFU policy would evict exactly what the workload had just started using.
+`OBJECT FREQ` reads the counter back. The growth is deliberately slow: measured on redis 7.2,
+100 reads of a key move `OBJECT FREQ` from 5 to 6 and 10 000 reads take it to 19.
+
+### When nothing can be evicted
+
+`noeviction`, and a `volatile-*` policy over a keyspace with no volatile keys, both end in a
+refusal rather than a search — the second especially, because "keep looking for a candidate"
+is an infinite loop with a client waiting on it. The refusal is Redis's, byte for byte:
+
+```
+OOM command not allowed when used memory > 'maxmemory'.
+```
+
+Only the commands that could grow the dataset get it. Reads keep working, so the problem
+stays visible to whatever is monitoring; and `DEL`, `UNLINK`, `GETDEL`, `EXPIRE`, the pops
+and the removals keep working, because deleting something is the operator's only way out of a
+full keyspace. Which commands those are is not reconstructed from a rule — the rule has edges
+that are not guessable (`LSET` is refused because it can store a longer element, `SMOVE` is
+not; `SETEX` is, `GETEX` is not; `SORT` is, `SORT_RO` is not) — so the classification is read
+out of `COMMAND INFO` on redis 7.2 per command, and `COMMAND INFO` here reports the same
+`denyoom` flag the gate acts on. A write with no classification fails a test rather than
+silently escaping the budget.
+
+Inside `MULTI` the gate is stricter, and that is measured too: queuing is itself unbounded
+memory growth, so every queued command is refused — a `GET` included — and `EXEC` answers
+`EXECABORT`. `DISCARD` always works, so the batch can be abandoned.
+
+Redis evicts what it can and *then* refuses if that was not enough, and so does this: with
+300 keys, a 1 kB budget and one key given a TTL under `volatile-lru`, redis 7.2 evicts that
+one key, reports `evicted_keys:1`, and still answers the `SET` with `OOM`. Freeing one key
+does not bring 300 of them under a kilobyte.
+
+### Eviction is a write
+
+It is ordered, persisted and replicated like any other, and it propagates as the `DEL` of the
+key that went rather than as anything about the policy. That is invariant 4: the choice of
+victim is not reproducible, so a replica running the same policy over the same keyspace would
+sample different keys and the two datasets would diverge while both looked internally
+consistent.
+
+A replica therefore does **not** evict on its own account, even with a budget of its own —
+its master drives what it holds, and the master's eviction arrives as a `DEL`. Redis draws
+the same line (`replica-ignore-maxmemory`, on by default). The enforcement is on the client
+path only: an AOF replay and a master's stream apply every write they are given whatever this
+server's limit says, the same reasoning invariant 13 applies to cluster redirects.
+
+Because the removal hook takes `propMu` to propagate that `DEL`, eviction runs *before* the
+command that made room for it rather than inside `runWrite` — `propMu` is not reentrant, and
+a write holds it across both its mutation and its propagation. That ordering is also the one
+the stream needs: every `DEL` for an evicted key precedes the command whose arrival caused it.
+
+### `maxkeys` is still here
+
+A byte budget did not retire it. `maxkeys` bounds the *number* of keys, is enforced by the
+janitor rather than on the write path, and only ever evicts — it never refuses a command,
+because a cap is an instruction to bound the keyspace and answering it with `OOM` errors
+would silently retire a documented feature. So a cap evicts by the configured policy when
+that policy evicts at all, and by approximate LRU when the policy is `noeviction`. It applies
+per database; `maxmemory` is server-wide, summed across every database, because a limit each
+of sixteen keyspaces enforced separately would be sixteen times the limit the operator set.
 
 ## Pub/Sub
 
@@ -1949,19 +2331,20 @@ cannot release, because release is a registered script — the lock expires by T
 Verified against redis-py 6.4. The same applies to Redisson, BullMQ, Sidekiq and most
 Lua-based rate limiters. If you need those, you need Redis.
 
-**Commands a client may expect and not find**, verified absent: `SAVE`/`BGSAVE`
-(there is no RDB — see below); `WAITAOF`; `ACL`; `OBJECT FREQ` (there is no LFU); the
-sharded Pub/Sub family `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`; `CLIENT NO-EVICT`/
-`NO-TOUCH`/`PAUSE`/`UNPAUSE`; the hash-field expiry family `HEXPIRE`/`HPEXPIRE`/
-`HTTL`/`HPERSIST` added in 7.4.
+**Commands a client may expect and not find**, verified absent:
+`WAITAOF`; `ACL`; the sharded Pub/Sub family `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`;
+`CLIENT NO-EVICT`/`NO-TOUCH`/`PAUSE`/`UNPAUSE`; the hash-field expiry family
+`HEXPIRE`/`HPEXPIRE`/`HTTL`/`HPERSIST` added in 7.4.
 
 **No RDB, in either direction.** A full resync ships a stream of RESP commands rather
-than an RDB payload, and `DUMP`/`RESTORE` use a self-describing `SHARDKV1` format that
-real Redis rejects cleanly (and vice versa) rather than misreading. That choice is
-deliberate — a subtly wrong listpack encoding would produce a payload real Redis
+than an RDB payload; `DUMP`/`RESTORE` use a self-describing `SHARDKV1` format; and
+`SAVE`/`BGSAVE` write a native snapshot whose header says, in ASCII, that it is not an RDB
+(see [Persistence (snapshots)](#persistence-snapshots)). All three reject a real Redis
+payload cleanly, and are cleanly rejected by real Redis, rather than being misread. That
+choice is deliberate — a subtly wrong listpack encoding would produce a payload real Redis
 *accepts and misparses*, which is silent corruption — but it has a real cost: **you
 cannot load an existing Redis dataset into this server**, and `redis-cli --rdb`,
-`redis-shake` and live cutover from Redis do not work.
+`redis-shake`, `redis-check-rdb` and live cutover from Redis do not work.
 
 **`OBJECT ENCODING` is derived, not remembered.** <a id="object-encoding-and-the-representation-thresholds"></a>
 The thresholds are real configuration — `CONFIG SET hash-max-listpack-entries 3` genuinely
@@ -2386,8 +2769,10 @@ internal/server    TCP server, command table + handlers, transactions, replicati
   commands_cluster.go  the CLUSTER subcommands and the NODES/SLOTS/SHARDS formats
   commands_dump.go     DUMP/RESTORE's payload format, and MIGRATE
   aof_rewrite.go     BGREWRITEAOF and the automatic growth policy
+  snapshot.go        SAVE/BGSAVE, the save schedule, the startup load, DEBUG RELOAD
   commands_*.go      the command groups, incl. blocking, debug, client/config/admin
 internal/aof       append-only-file persistence: append, fsync policy, size, rewrite, replay   (+ tests)
+internal/snapshot  the point-in-time snapshot file: header, framing, CRC-64, atomic write   (+ tests)
 ```
 
 ## Roadmap
