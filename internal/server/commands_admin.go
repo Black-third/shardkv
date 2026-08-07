@@ -281,36 +281,45 @@ func (s *Server) redisMode() string {
 
 // infoMemory reports the memory fields monitoring agents chart.
 //
-// Go does not expose a process RSS, and this server has no allocator it controls the
-// way Redis controls jemalloc, so used_memory is the Go heap in use -- an honest
-// approximation of "how much of the dataset is resident", which is what the field is
-// read for. maxmemory is reported as 0 (no limit) because eviction here is bounded by
-// -maxkeys rather than by a byte budget; reporting a byte limit this server does not
-// enforce would be a lie a client could act on.
+// used_memory is the dataset: the running byte total the store maintains as values are
+// written, which is also what maxmemory is compared against. That is the field's whole
+// purpose -- an operator sizes a container from it and alerts on it -- so it has to be the
+// number eviction acts on rather than a second estimate that could disagree. What it counts
+// and what it does not is documented once, on internal/store/memtrack.go, and the short
+// version is: every key, its value's payload, and the keyspace's per-key overhead; not the
+// Go runtime, not the allocator's slack, not the replication backlog, and not client
+// buffers.
+//
+// used_memory_rss is the Go runtime's total reservation from the OS, which is the closest
+// honest analogue of an RSS available here -- Go exposes no process resident size, and this
+// server does not control its allocator the way Redis controls jemalloc. The fragmentation
+// ratio is therefore that reservation over the dataset, and it reads high for the same
+// reason it would on any garbage-collected runtime: the heap holds the collector's headroom
+// as well as the data.
 func infoMemory(s *Server, b *strings.Builder) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	fmt.Fprintf(b, "used_memory:%d\r\n", m.HeapAlloc)
-	fmt.Fprintf(b, "used_memory_human:%.2fM\r\n", float64(m.HeapAlloc)/(1024*1024))
+	used := s.UsedMemory()
+	maxmem := s.MaxMemory()
+	fmt.Fprintf(b, "used_memory:%d\r\n", used)
+	fmt.Fprintf(b, "used_memory_human:%s\r\n", formatMemoryHuman(used))
 	fmt.Fprintf(b, "used_memory_rss:%d\r\n", m.Sys)
 	fmt.Fprintf(b, "used_memory_peak:%d\r\n", m.HeapSys)
+	fmt.Fprintf(b, "used_memory_dataset:%d\r\n", used)
+	// The Go heap, kept under its own name rather than reported as used_memory. It is a
+	// real and useful number -- it is what the process is actually holding -- but it is not
+	// the dataset, and a maxmemory an operator sets in bytes has to be compared against the
+	// dataset or eviction would be chasing the collector.
+	fmt.Fprintf(b, "used_memory_go_heap:%d\r\n", m.HeapAlloc)
 	fmt.Fprintf(b, "used_memory_lua:%d\r\n", 0)
 	fmt.Fprintf(b, "number_of_cached_scripts:%d\r\n", 0)
-	fmt.Fprintf(b, "maxmemory:%d\r\n", 0)
-	fmt.Fprintf(b, "maxmemory_human:0B\r\n")
+	fmt.Fprintf(b, "maxmemory:%d\r\n", maxmem)
+	fmt.Fprintf(b, "maxmemory_human:%s\r\n", formatMemoryHuman(maxmem))
+	// From the same accessor CONFIG GET maxmemory-policy reads, so the two can never
+	// disagree -- see Server.maxmemoryPolicy.
 	fmt.Fprintf(b, "maxmemory_policy:%s\r\n", s.maxmemoryPolicy())
 	fmt.Fprintf(b, "mem_allocator:go-%s\r\n", runtime.Version())
-	fmt.Fprintf(b, "mem_fragmentation_ratio:%.2f\r\n", float64(m.Sys)/math.Max(float64(m.HeapAlloc), 1))
-}
-
-// maxmemoryPolicy describes what this server does when it is full. With -maxkeys set it
-// samples and evicts by approximate LRU, which is allkeys-lru; without it nothing is
-// evicted, which is noeviction.
-func (s *Server) maxmemoryPolicy() string {
-	if s.store.MaxKeys() > 0 {
-		return "allkeys-lru"
-	}
-	return "noeviction"
+	fmt.Fprintf(b, "mem_fragmentation_ratio:%.2f\r\n", float64(m.Sys)/math.Max(float64(used), 1))
 }
 
 func infoClients(s *Server, b *strings.Builder) {
@@ -347,8 +356,19 @@ func infoPersistence(s *Server, b *strings.Builder) {
 	// successful AOF rewrite, which is also what rdb_last_save_time above reports. See
 	// noteDirty for what one "change" counts as.
 	fmt.Fprintf(b, "rdb_changes_since_last_save:%d\r\n", s.DirtyChanges())
-	fmt.Fprintf(b, "rdb_bgsave_in_progress:%d\r\n", 0)
-	fmt.Fprintf(b, "rdb_last_bgsave_status:%s\r\n", "ok")
+	// The snapshot fields, in redis 7.2's own order (measured), reading real state rather
+	// than the constants they used to be: there was no snapshot mechanism when they were
+	// added, so `0` and `ok` were the honest answers. There is one now, and a monitoring
+	// agent that charts rdb_last_bgsave_status is watching for the value these can now take.
+	fmt.Fprintf(b, "rdb_bgsave_in_progress:%d\r\n", boolToInt(s.SnapshotInProgress()))
+	fmt.Fprintf(b, "rdb_last_bgsave_status:%s\r\n", s.SnapshotStatus())
+	// Both durations report -1 for "not applicable", which is Redis's spelling for a save
+	// that has not happened (or is not happening) rather than a zero that would read as
+	// "instantaneous".
+	fmt.Fprintf(b, "rdb_last_bgsave_time_sec:%d\r\n", s.SnapshotLastDurationSec())
+	fmt.Fprintf(b, "rdb_current_bgsave_time_sec:%d\r\n", s.SnapshotCurrentDurationSec())
+	fmt.Fprintf(b, "rdb_saves:%d\r\n", s.SnapshotSaves())
+	fmt.Fprintf(b, "rdb_last_load_keys_loaded:%d\r\n", s.SnapshotLoadedKeys())
 }
 
 func infoStats(s *Server, b *strings.Builder) {
@@ -363,7 +383,11 @@ func infoStats(s *Server, b *strings.Builder) {
 	}
 	fmt.Fprintf(b, "keyspace_hits:%d\r\n", hits)
 	fmt.Fprintf(b, "keyspace_misses:%d\r\n", misses)
-	fmt.Fprintf(b, "evicted_keys:%d\r\n", s.store.Evicted())
+	// Summed over every database, like keyspace_hits above and for the same reason: an
+	// eviction total for one keyspace out of sixteen is not the number an operator is
+	// watching. It is a lifetime figure and CONFIG RESETSTAT deliberately leaves it alone --
+	// it describes the dataset's history, not a measurement window.
+	fmt.Fprintf(b, "evicted_keys:%d\r\n", s.EvictedKeys())
 	fmt.Fprintf(b, "sync_full:%d\r\n", s.fullSyncs.Load())
 	fmt.Fprintf(b, "sync_partial_ok:%d\r\n", s.partialOK.Load())
 	fmt.Fprintf(b, "sync_partial_err:%d\r\n", s.partialErr.Load())
@@ -824,8 +848,20 @@ func commandSummary(cmd *command) string {
 // commandFlags reports the flags a client cares about: whether the command writes (so
 // it must not be sent to a replica) and whether it is a connection-control command
 // (which a client must not pipeline behind a transaction).
+//
+// denyoom is reported for the writes that are actually refused when the server is over its
+// byte budget and cannot evict, and withheld from the ones that are not. It used to be
+// claimed for every write, which was wrong in the direction that matters: a client reading
+// the flags would have believed DEL and EXPIRE could be refused under memory pressure --
+// the two commands an operator recovers with -- and a well-behaved client library that
+// pre-emptively avoids denyoom commands would have removed its own way out. The set is
+// oomSafeWrite's complement, so the flag a client reads and the decision the server takes
+// come from one place.
 func commandFlags(cmd *command) []string {
 	if cmd.write {
+		if !oomDenied(cmd.lowerName) {
+			return []string{"write"}
+		}
 		return []string{"write", "denyoom"}
 	}
 	if cmd.sess != nil {

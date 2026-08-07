@@ -179,10 +179,13 @@ func cmdBGRewriteAOF(s *Server, w *resp.Writer, args [][]byte) bool {
 	return false
 }
 
-// cmdLastSave reports when the dataset was last written out in full, as a Unix
-// timestamp. There is no RDB here, so the answer is the last successful AOF rewrite --
-// the moment a complete copy of the dataset was last put on disk -- or the server's
-// start time if none has happened.
+// cmdLastSave reports when the dataset was last written out in full, as a Unix timestamp.
+//
+// Three events mean that here, and all three set it: a successful snapshot save
+// (SAVE/BGSAVE, see snapshot.go), a successful AOF rewrite, and a snapshot loaded at
+// startup -- which reports the instant recorded in the *file*, not this process's start
+// time, because a backup taken three days ago is not a save that happened at boot. Failing
+// all three, the server's start time, as in Redis.
 func cmdLastSave(s *Server, w *resp.Writer, args [][]byte) bool {
 	w.WriteInt(s.lastSave.Load())
 	return false
