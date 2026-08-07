@@ -196,6 +196,24 @@ func cmdDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 		s.store.SetActiveExpire(on == 1)
 		w.WriteSimple("OK")
 
+	case "RELOAD":
+		// Honest here, and cheap, because the snapshot machinery already exists: save the
+		// dataset and put it back from what was saved. Redis's own test suite calls this
+		// after almost every interesting mutation, and what it checks is that every type
+		// survives the round trip through the serialized form -- the property invariant 5
+		// is about. It is not a write: the dataset afterwards is the dataset before, so
+		// nothing is persisted or replicated on its account.
+		//
+		// It is safe in the one way that matters: the saved commands are loaded and verified
+		// in full *before* the databases are emptied, so a snapshot that does not parse
+		// leaves the data alone. See reloadFromSnapshot for the ordering and for what it
+		// does not exclude on a server with no propagation.
+		if err := s.reloadFromSnapshot(); err != nil {
+			w.WriteError("ERR " + err.Error())
+			return false
+		}
+		w.WriteSimple("OK")
+
 	case "JMAP", "STRINGMATCH-LEN", "QUICKLIST-PACKED-THRESHOLD", "LISTPACK", "LISTPACK-ENTRIES":
 		// Accepted and ignored. These ask the server to dump internal representations or
 		// to tune thresholds of encodings this store does not have -- there is one
@@ -321,6 +339,8 @@ func writeDebugHelp(w *resp.Writer) {
 		"    Show the encoding and idle time of <key>.",
 		"PROTOCOL <type>",
 		"    Reply with a test value of the specified type. <type> can be: " + debugProtocolTypes + ".",
+		"RELOAD",
+		"    Save the dataset and load it back, checking the round trip through the snapshot form.",
 		"SLEEP <seconds>",
 		"    Stop this connection for <seconds>. Decimals allowed.",
 		"HELP",

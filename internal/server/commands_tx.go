@@ -157,6 +157,15 @@ func (s *Server) executeCommand(sess *session, w *resp.Writer, args [][]byte) *c
 		return cmd
 	}
 
+	// The byte budget. Like the cluster gate above, the decision is taken before anything
+	// runs and before anything is queued -- a MULTI must not accumulate writes the server
+	// has already decided it cannot afford -- and it is deliberately not on dispatch, so an
+	// AOF replay and a master's stream apply every write they are given. It is one atomic
+	// load when no budget is configured, which is the default. See maxmemory.go.
+	if !s.oomGate(w, cmd, sess) {
+		return reject(cmd)
+	}
+
 	if sess.inMulti {
 		// Validate now so EXEC can abort cleanly; queue for later execution.
 		if cmd == nil {

@@ -379,7 +379,20 @@ func TestCommandIntrospection(t *testing.T) {
 		{"COMMAND INFO set", "[[set :-3 [+write +denyoom] :1 :1 :1]]"},
 		{"COMMAND INFO ping", "[[ping :-1 [+readonly] :0 :0 :0]]"},
 		{"COMMAND INFO mset", "[[mset :-3 [+write +denyoom] :1 :-1 :2]]"},
-		{"COMMAND INFO del", "[[del :-2 [+write +denyoom] :1 :-1 :1]]"},
+		// This expectation was wrong and was pinning a bug rather than catching one:
+		// commandFlags used to claim denyoom for every write, and DEL is the case that
+		// shows why that matters. Measured on redis 7.2, `COMMAND INFO del` reports
+		// `[+write]` with no denyoom -- deleting is how an operator recovers from a full
+		// keyspace, so Redis never refuses it under memory pressure, and a client library
+		// that avoids denyoom commands while OOM would have been told to avoid its own way
+		// out. The flag now comes from the same measured table the OOM gate reads (see
+		// oomDenyOOM in maxmemory.go).
+		{"COMMAND INFO del", "[[del :-2 [+write] :1 :-1 :1]]"},
+		// Measured on redis 7.2 as controls for the pair above: EXPIRE only moves a
+		// deadline and so is not denyoom either, while LSET can store a longer element and
+		// so is. "Every write is denyoom" is wrong in both directions.
+		{"COMMAND INFO expire", "[[expire :-3 [+write] :1 :1 :1]]"},
+		{"COMMAND INFO lset", "[[lset :4 [+write +denyoom] :1 :1 :1]]"},
 		{"COMMAND INFO multi", "[[multi :1 [+fast +loading +no-auth-none] :0 :0 :0]]"},
 		// An unknown command is a null entry, so a client can line the reply up with
 		// what it asked about.

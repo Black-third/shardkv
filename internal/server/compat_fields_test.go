@@ -94,6 +94,15 @@ func TestClientInfoFieldSet(t *testing.T) {
 	defer c.close()
 	other := dialTx(t, addr)
 	defer other.close()
+	// A command on the second connection, and not only a dial. A dial returns when the TCP
+	// handshake completes, which is before the server's connection goroutine has run
+	// newSession and put the session in the registry CLIENT LIST reads -- so asserting "at
+	// least 2 connections" straight after dialling is asserting that the accept side has been
+	// scheduled. It usually has; under -race with the rest of the package running it
+	// intermittently has not, which is what made this test fail for a reason that had nothing
+	// to do with the field set it exists to pin. A reply proves the registration happened,
+	// because newSession precedes the command loop that produced it.
+	other.cmd("PING")
 
 	info := c.cmd("CLIENT INFO")
 	if got := lineFieldNames(info); !equalStrings(got, clientInfoFields) {
@@ -480,6 +489,15 @@ func TestMemoryStatsIsAMapInRESP3(t *testing.T) {
 //
 // (7.4.10 answers the same five; the order differs between servers because Redis walks a
 // dict, so order is not part of this contract -- unlike the CLIENT INFO line.)
+//
+// The read-only half of this test was correct when nothing here measured bytes and is
+// obsolete now that something does. It used to assert that every member of the family is
+// refused by CONFIG SET, on the reasoning that accepting a value nothing could act on is
+// how a client comes to believe it configured a limit. Bytes are measured now
+// (internal/store/memtrack.go), so the values *are* acted on and refusing them would be the
+// misleading answer. What replaces those assertions is the round trip -- set it, read it
+// back as Redis reports it -- plus TestMaxmemoryConfigMatchesRedis for the operand forms
+// and the exact refusals.
 func TestConfigGetMaxmemoryFamily(t *testing.T) {
 	addr, stop := startTestServer(t)
 	defer stop()
@@ -532,8 +550,9 @@ func TestConfigGetMaxmemoryFamily(t *testing.T) {
 		t.Errorf("INFO maxmemory = %q; want 0 to match CONFIG GET", infoMax)
 	}
 
-	// With a cap configured the policy follows what eviction actually does, in both
-	// places at once.
+	// With a maxkeys cap and no policy explicitly chosen, the policy still follows what
+	// eviction actually does, in both places at once -- the default is derived rather than
+	// flatly noeviction. See Server.evictionPolicy.
 	c.cmd("CONFIG SET maxkeys 10")
 	if _, v := parseFlatMap(t, c.cmd("CONFIG GET maxmemory-policy")); v["maxmemory-policy"] != "allkeys-lru" {
 		t.Errorf("with maxkeys set, maxmemory-policy = %q; want allkeys-lru", v["maxmemory-policy"])
@@ -543,18 +562,49 @@ func TestConfigGetMaxmemoryFamily(t *testing.T) {
 	}
 	c.cmd("CONFIG SET maxkeys 0")
 
-	// Every member is read-only: nothing here would enforce a value it was given, and
-	// accepting one is how a client comes to believe it configured a limit.
-	for _, set := range []string{
-		"CONFIG SET maxmemory 100mb",
-		"CONFIG SET maxmemory 0",
-		"CONFIG SET maxmemory-policy allkeys-lru",
-		"CONFIG SET maxmemory-samples 5",
-		"CONFIG SET maxmemory-clients 0",
-	} {
-		if got := c.cmd(set); !contains(got, "can't set immutable config") {
-			t.Errorf("%s = %q; want the immutable-config refusal", set, got)
+	// An explicit policy wins over that derived default, or the parameter would read back as
+	// something other than what it was set to -- the one property that makes a settable
+	// config worth having.
+	c.cmd("CONFIG SET maxkeys 10")
+	if got := c.cmd("CONFIG SET maxmemory-policy noeviction"); got != "+OK" {
+		t.Errorf("CONFIG SET maxmemory-policy noeviction = %q; want +OK", got)
+	}
+	if _, v := parseFlatMap(t, c.cmd("CONFIG GET maxmemory-policy")); v["maxmemory-policy"] != "noeviction" {
+		t.Errorf("after setting it explicitly, maxmemory-policy = %q; want noeviction",
+			v["maxmemory-policy"])
+	}
+	c.cmd("CONFIG SET maxkeys 0")
+
+	// The three members this server can act on round-trip: set, then read back the value
+	// Redis would report. maxmemory reports a byte count and not the operand it was given --
+	// measured: redis 7.2 answers 104857600 for `CONFIG SET maxmemory 100mb`.
+	roundTrip := []struct{ param, set, want string }{
+		{"maxmemory", "100mb", "104857600"}, // measured on redis 7.2
+		{"maxmemory", "1gb", "1073741824"},  // measured on redis 7.2
+		{"maxmemory", "0", "0"},             // measured on redis 7.2
+		{"maxmemory-policy", "volatile-ttl", "volatile-ttl"},
+		{"maxmemory-samples", "5", "5"},
+		{"lfu-log-factor", "10", "10"}, // Redis's default, measured
+		{"lfu-decay-time", "1", "1"},   // Redis's default, measured
+	}
+	for _, tc := range roundTrip {
+		if got := c.cmd("CONFIG SET " + tc.param + " " + tc.set); got != "+OK" {
+			t.Errorf("CONFIG SET %s %s = %q; want +OK", tc.param, tc.set, got)
+			continue
 		}
+		if _, v := parseFlatMap(t, c.cmd("CONFIG GET "+tc.param)); v[tc.param] != tc.want {
+			t.Errorf("CONFIG SET %s %s then GET = %q; want %q",
+				tc.param, tc.set, v[tc.param], tc.want)
+		}
+	}
+	c.cmd("CONFIG SET maxmemory 0")
+	c.cmd("CONFIG SET maxmemory-policy noeviction")
+
+	// maxmemory-clients stays read-only, and for the reason it always had: nothing here
+	// measures the bytes a client's buffers hold, so there is no budget to act on. A client
+	// that will not read is dropped when its queue fills (invariant 6), never evicted.
+	if got := c.cmd("CONFIG SET maxmemory-clients 1mb"); !contains(got, "can't set immutable config") {
+		t.Errorf("CONFIG SET maxmemory-clients = %q; want the immutable-config refusal", got)
 	}
 }
 

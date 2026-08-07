@@ -433,6 +433,12 @@ type serverCore struct {
 	aofRewritePerc    atomic.Int64
 	lastSave          atomic.Int64 // Unix time of the last full dataset write
 
+	// snapshot is the point-in-time snapshot state: the file path, the save schedule and
+	// the counters INFO persistence reports (see snapshot.go). It is one lazily allocated
+	// pointer rather than nine fields here so a server that never saves costs one atomic
+	// load, and so the whole feature can be read in one file.
+	snapshot atomic.Pointer[snapshotState]
+
 	// tlsConfig wraps the listener when set; masterTLS is used when dialing a master.
 	// Both nil means plain TCP in both directions, which is the default. tlsOpts keeps
 	// the files they were built from so CONFIG GET can report what was loaded. All are

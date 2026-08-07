@@ -1025,7 +1025,13 @@ func (s *Server) memoryStats(w *resp.Writer) {
 		name  string
 		value int64
 	}{
-		{"total.allocated", int64(m.HeapAlloc)},
+		// The dataset, which is what INFO reports as used_memory and what maxmemory is
+		// compared against. Redis's total.allocated is zmalloc_used_memory(), i.e. exactly
+		// its used_memory, so reporting anything else here would put two numbers under one
+		// name. This used to be the Go heap, which was the honest answer while nothing
+		// measured the dataset; now that something does, the heap is reported separately
+		// as INFO's used_memory_go_heap and this field agrees with used_memory.
+		{"total.allocated", s.UsedMemory()},
 		{"replication.backlog", backlog},
 		{"clients.slaves", clientsSlaves},
 		{"clients.normal", clientsNormal},
@@ -1075,24 +1081,60 @@ func (s *Server) memoryDoctor() string {
 		volatile += expires
 	}
 	cap0 := s.dbs[0].MaxKeys()
+	used, maxmem := s.UsedMemory(), s.MaxMemory()
+	policy := s.maxmemoryPolicy()
 	b.WriteString("Memory doctor report for shardkv " + Version + ".\n")
 	fmt.Fprintf(&b, "Live keys across %d databases: %d (%d with a TTL).\n", len(s.dbs), total, volatile)
+	fmt.Fprintf(&b, "Dataset: %s (%d bytes) by the MEMORY USAGE estimate.\n",
+		formatMemoryHuman(used), used)
+	switch {
+	case maxmem == 0:
+		b.WriteString("No byte budget is set (maxmemory 0): the keyspace grows until the " +
+			"process runs out of memory. Set maxmemory with a policy that evicts, set " +
+			"maxkeys, or give every key a TTL.\n")
+	case used > maxmem:
+		fmt.Fprintf(&b, "The dataset is over its budget (%s > maxmemory %s) under "+
+			"maxmemory-policy %s. %s\n", formatMemoryHuman(used), formatMemoryHuman(maxmem),
+			policy, overBudgetAdvice(policy, volatile))
+	default:
+		fmt.Fprintf(&b, "The dataset is within its budget (%s of %s) under maxmemory-policy "+
+			"%s; %d keys evicted so far.\n", formatMemoryHuman(used),
+			formatMemoryHuman(maxmem), policy, s.EvictedKeys())
+	}
 	switch {
 	case cap0 == 0:
-		b.WriteString("Eviction is disabled (maxkeys 0): the keyspace grows until the process " +
-			"runs out of memory. Set maxkeys, or give every key a TTL.\n")
+		// Nothing to say: the key cap is off, and the byte budget above is the bound that
+		// matters.
 	case total > cap0:
-		fmt.Fprintf(&b, "The keyspace is over its cap (%d keys > maxkeys %d); the janitor is "+
-			"evicting. Sustained overshoot means writes are arriving faster than the "+
-			"eviction pass reclaims.\n", total, cap0)
+		fmt.Fprintf(&b, "The keyspace is also over its key cap (%d keys > maxkeys %d); the "+
+			"janitor is evicting. Sustained overshoot means writes are arriving faster than "+
+			"the eviction pass reclaims.\n", total, cap0)
 	default:
-		fmt.Fprintf(&b, "The keyspace is within its cap (maxkeys %d), %d keys evicted so far.\n",
-			cap0, s.store.Evicted())
+		fmt.Fprintf(&b, "The keyspace is within its key cap (maxkeys %d).\n", cap0)
 	}
-	b.WriteString("This server bounds the keyspace by key count, not by bytes, so there is no " +
-		"maxmemory, no fragmentation ratio and no allocator report to diagnose. " +
-		"MEMORY USAGE estimates a single key's footprint from its contents.\n")
+	b.WriteString("The byte figures are the dataset only -- keys, values and the keyspace's " +
+		"per-key overhead. They exclude the Go runtime, the replication backlog and client " +
+		"buffers, so there is no fragmentation ratio and no allocator report to diagnose: " +
+		"Go publishes neither. MEMORY USAGE estimates a single key's footprint from its " +
+		"contents.\n")
 	return b.String()
+}
+
+// overBudgetAdvice says what an operator can do about a dataset that is over its budget,
+// which depends entirely on the policy: noeviction is refusing writes right now, and a
+// volatile-* policy over a keyspace with nothing volatile is refusing them for a reason that
+// looks like a bug until it is named.
+func overBudgetAdvice(policy string, volatile int) string {
+	switch {
+	case policy == "noeviction":
+		return "Writes that could grow the dataset are being refused with an OOM error. " +
+			"Raise maxmemory, delete keys, or choose a policy that evicts."
+	case strings.HasPrefix(policy, "volatile-") && volatile == 0:
+		return "No key carries a TTL, so this policy has nothing it is allowed to evict and " +
+			"writes are being refused. Give keys a TTL, or switch to an allkeys-* policy."
+	default:
+		return "Eviction runs on the next write that would exceed the budget."
+	}
 }
 
 // --- COMMAND GETKEYS ----------------------------------------------------------

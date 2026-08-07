@@ -319,9 +319,43 @@ func TestMemoryUsageAndDoctor(t *testing.T) {
 	if got := c.cmd("MEMORY DOCTOR"); !strings.Contains(got, "Memory doctor report") {
 		t.Errorf("MEMORY DOCTOR = %q", got)
 	}
-	if got := c.cmd("MEMORY DOCTOR"); !strings.Contains(got, "Eviction is disabled") {
-		t.Errorf("MEMORY DOCTOR with no cap = %q; want the eviction warning", got)
+	// The wording moved with the feature: the report used to say "Eviction is disabled
+	// (maxkeys 0)" because a key cap was the only bound there was. There is a byte budget
+	// now, so the unbounded case is stated in its terms -- and the advice names all three
+	// ways out rather than only maxkeys.
+	doctor := c.cmd("MEMORY DOCTOR")
+	for _, want := range []string{
+		"No byte budget is set (maxmemory 0)",
+		"grows until the process runs out of memory",
+		"Dataset:",
+	} {
+		if !strings.Contains(doctor, want) {
+			t.Errorf("MEMORY DOCTOR with no budget = %q; want it to mention %q", doctor, want)
+		}
 	}
+	// And with a budget and a policy that refuses, it says so, because that is the state an
+	// operator runs this command in.
+	c.cmd("CONFIG SET maxmemory-policy noeviction")
+	c.cmd("CONFIG SET maxmemory 1kb")
+	doctor = c.cmd("MEMORY DOCTOR")
+	for _, want := range []string{
+		"over its budget",
+		"being refused with an OOM error",
+		"maxmemory-policy noeviction",
+	} {
+		if !strings.Contains(doctor, want) {
+			t.Errorf("MEMORY DOCTOR over budget = %q; want it to mention %q", doctor, want)
+		}
+	}
+	// A volatile-* policy with nothing volatile is refusing writes for a reason that looks
+	// like a bug until it is named, so the report names it.
+	c.cmd("CONFIG SET maxmemory-policy volatile-lru")
+	if got := c.cmd("MEMORY DOCTOR"); !strings.Contains(got, "No key carries a TTL") {
+		t.Errorf("MEMORY DOCTOR under volatile-lru with no TTLs = %q; want it to explain why"+
+			" writes are being refused", got)
+	}
+	c.cmd("CONFIG SET maxmemory 0")
+	c.cmd("CONFIG SET maxmemory-policy noeviction")
 }
 
 func mustInt(t *testing.T, reply string) int64 {

@@ -489,12 +489,32 @@ func TestEncodingThresholdsAreConfigurable(t *testing.T) {
 		{"CONFIG SET list-compress-depth 2", "+OK"},
 		{"CONFIG GET list-compress-depth", "[list-compress-depth 2]"},
 
-		// The RDB schedule reads empty because there is no RDB, and only an empty schedule
-		// can be set: a non-empty one is a durability promise this server cannot keep.
-		{"CONFIG GET save", "[save ]"},
+		// The snapshot schedule. These three expectations were correct while there was no
+		// snapshot mechanism -- an empty schedule was the literal truth, and a non-empty one
+		// would have been a durability promise the server could not keep -- and they are
+		// obsolete now that snapshots exist. The schedule is real, and the default is Redis's
+		// own: measured on redis 7.2, `CONFIG GET save` answers `3600 1 300 100 60 10000`.
+		{"CONFIG GET save", "[save 3600 1 300 100 60 10000]"},
+		{`CONFIG SET save "3600 1"`, "+OK"},
+		{"CONFIG GET save", "[save 3600 1]"},
+		// Measured on redis 7.2: the empty string is accepted and means "no snapshots".
 		{`CONFIG SET save ""`, "+OK"},
-		{`CONFIG SET save "3600 1"`,
+		{"CONFIG GET save", "[save ]"},
+		// Measured on redis 7.2: a lone number, a non-numeric operand and a negative one are
+		// all refused with this wording. A half-applied schedule would be a durability
+		// setting that does not do what the operator wrote down.
+		{`CONFIG SET save "900"`,
 			"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters"},
+		{`CONFIG SET save "abc 1"`,
+			"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters"},
+		{`CONFIG SET save "900 -1"`,
+			"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters"},
+		// dbfilename and dir read empty when no snapshot path was configured, which is how
+		// this table already reports an unconfigured file. "." -- what filepath.Base and
+		// filepath.Dir answer for an empty path -- is a real relative directory, so
+		// reporting it would name a file this server has no intention of writing.
+		{"CONFIG GET dbfilename", "[dbfilename ]"},
+		{"CONFIG GET dir", "[dir ]"},
 	}
 	for _, tc := range cases {
 		if got := c.cmd(tc.cmd); got != tc.want {
