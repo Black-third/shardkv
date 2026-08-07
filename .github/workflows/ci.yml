@@ -19,13 +19,18 @@ jobs:
         go-version: ['1.26.4', 'stable']
     name: test (go ${{ matrix.go-version }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
-          cache: true
+          # false: this module has no dependencies, so there is no go.sum -- the file
+          # setup-go derives its cache key from. With cache: true every job logged
+          # "Restore cache failed: Dependencies file is not found" and cached nothing,
+          # which is a warning on every job for a cache that cannot exist. Zero
+          # third-party dependencies is the point of the project, so this stays off.
+          cache: false
 
       - name: Formatting
         run: |
@@ -73,21 +78,30 @@ jobs:
     runs-on: ubuntu-latest
     name: client-library compatibility
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
-          cache: true
+          cache: false
 
-      # The client images are the slow part (npm install, go mod download, pip
-      # install), and they change only when a suite's Dockerfile does.
+      # The client images are the slow part (npm install, go mod download, pip install), so
+      # they are cached and reloaded rather than rebuilt.
+      #
+      # The key hashes every file in each suite directory, not just the Dockerfile. That is
+      # the whole correctness of this cache: each Dockerfile COPYs its suite's source in
+      # (`main.go`, `compat.mjs`, `compat.py`), so the image *contains* the checks. Keying on
+      # the Dockerfile alone -- which is what this did -- meant editing a check without
+      # touching its Dockerfile restored an image holding the previous version of that check
+      # and ran it. CI would then be testing code that is not in the tree, disagree with a
+      # local run, and report neither fact. Hashing the sources makes an edited check a cache
+      # miss, which is what it has to be.
       - name: Cache the client images
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/compat-images
-          key: compat-images-${{ hashFiles('test/compat/*/Dockerfile') }}
+          key: compat-images-${{ hashFiles('test/compat/*/*') }}
 
       - name: Load cached client images
         run: |
@@ -111,7 +125,7 @@ jobs:
       # the run rather than reproduced first.
       - name: Upload the results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: compat-results
           path: test/compat/.results/
@@ -126,21 +140,22 @@ jobs:
     runs-on: ubuntu-latest
     name: lint
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
-          cache: true
+          cache: false
 
       - name: golangci-lint
-        # v8 of the action, and v2 of the linter, because `.golangci.yml` is a v2 config and
-        # `make lint` installs `golangci-lint/v2` -- the action's v6 line only ever installs
-        # golangci-lint v1, which cannot read that file. CI was therefore running a different
-        # linter from the one the project holds itself to, and failing for a third reason
-        # before it got far enough to notice.
-        uses: golangci/golangci-lint-action@v8
+        # v2 of the *linter* is the load-bearing part: `.golangci.yml` is a v2 config and
+        # `make lint` installs `golangci-lint/v2`, while the action's v6 line only ever
+        # installed golangci-lint v1, which cannot read that file. CI was therefore running a
+        # different linter from the one the project holds itself to, and failing for a third
+        # reason before it got far enough to notice. The action is on v9 because that is its
+        # first Node 24 line; v8 was the last on Node 20, which GitHub now force-migrates.
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
 
@@ -172,13 +187,13 @@ jobs:
             goarch: arm
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.26'
-          cache: true
+          cache: false
 
       - name: Build
         env:

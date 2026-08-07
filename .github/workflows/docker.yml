@@ -21,7 +21,7 @@ jobs:
     name: ghcr.io/${{ github.repository }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # arm64 is built by emulation on an amd64 runner. The build is a Go
       # cross-compile (CGO_ENABLED=0 in the Dockerfile), so QEMU only has to run the

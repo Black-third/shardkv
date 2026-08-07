@@ -19,7 +19,7 @@ jobs:
     name: goreleaser
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # The changelog is built from the commits between this tag and the previous
           # one, so the whole history has to be present. A shallow clone silently
@@ -27,10 +27,15 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache: true
+          # false: this module has no dependencies, so there is no go.sum -- the file
+          # setup-go derives its cache key from. With cache: true every job logged
+          # "Restore cache failed: Dependencies file is not found" and cached nothing,
+          # which is a warning on every job for a cache that cannot exist. Zero
+          # third-party dependencies is the point of the project, so this stays off.
+          cache: false
 
       - name: Build
         run: go build ./...

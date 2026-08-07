@@ -38,20 +38,25 @@ jobs:
     name: redis tcl suite (external mode)
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
-          cache: true
+          # false: this module has no dependencies, so there is no go.sum -- the file
+          # setup-go derives its cache key from. With cache: true every job logged
+          # "Restore cache failed: Dependencies file is not found" and cached nothing,
+          # which is a warning on every job for a cache that cannot exist. Zero
+          # third-party dependencies is the point of the project, so this stays off.
+          cache: false
 
       - name: Run Redis's unit tests against shardkv and against Redis
         run: ./test/compat/run.sh tcl
 
       - name: Upload the results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: compat-tcl-results
           path: test/compat/.results/
