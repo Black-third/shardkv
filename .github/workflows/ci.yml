@@ -45,8 +45,17 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # -v so a failure names itself. The output is kept rather than streamed alone,
+      # because the step that follows turns it into the run summary: downloading a job
+      # log needs admin rights on the repository, so a contributor without them -- or
+      # anyone reading the run from a phone -- otherwise sees only "Process completed
+      # with exit code 1" and has to reproduce the failure before they can read it.
+      # This suite is concurrent and timing-sensitive; the failures worth catching are
+      # exactly the ones that do not reproduce on demand.
       - name: Test (race detector)
-        run: go test -race -count=1 ./...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./... 2>&1 | tee /tmp/test-race.log
 
       # The blocking commands and the protocol tests are the timing-sensitive part of
       # the suite: real concurrent TCP clients, real wakeups, real timeouts. A single
@@ -55,9 +64,45 @@ jobs:
       # half-minute this costs.
       - name: Repeat the concurrency-sensitive tests
         run: |
-          go test -race -count=3 \
+          set -o pipefail
+          go test -race -count=3 -v \
             -run 'TestBlocking|TestClientUnblock|TestRESP|TestDatabase|TestSwapDB|TestSelectFrames' \
-            ./internal/server
+            ./internal/server 2>&1 | tee /tmp/test-repeat.log
+
+      # What failed, in the run's Summary tab, readable by anyone who can see the run.
+      # A data race is extracted separately and first: its report is the whole diagnosis
+      # and it is printed by the runtime rather than by the test, so it does not
+      # necessarily sit under any "--- FAIL" line.
+      - name: Report what failed
+        if: failure()
+        run: |
+          {
+            echo "## Test failures (go ${{ matrix.go-version }})"
+            for log in /tmp/test-race.log /tmp/test-repeat.log; do
+              [ -f "$log" ] || continue
+              if grep -q "WARNING: DATA RACE" "$log"; then
+                echo "### Data race in $(basename "$log")"
+                echo '```'
+                awk '/WARNING: DATA RACE/{p=1} p&&n++<120' "$log"
+                echo '```'
+              fi
+              if grep -qE '^\s*--- FAIL' "$log"; then
+                echo "### Failing tests in $(basename "$log")"
+                echo '```'
+                grep -E '^\s*--- FAIL' "$log" | sed 's/^[[:space:]]*//'
+                echo '```'
+                echo "<details><summary>output</summary>"
+                echo
+                echo '```'
+                # -B, not -A: with -v, a test's own log lines are printed *before* its
+                # "--- FAIL" marker, so trailing context shows the next test rather than
+                # the reason this one failed. That is where t.Errorf/t.Fatalf output is.
+                grep -B 40 -A 2 -E '^\s*--- FAIL' "$log" | head -400
+                echo '```'
+                echo "</details>"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fuzz the RESP parser (short)
         run: go test -run=^$ -fuzz=FuzzReadCommand -fuzztime=20s ./internal/resp
