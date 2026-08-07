@@ -62,6 +62,15 @@ of goroutines and TCP clients — passes under the Go race detector.
   slot migration via `DUMP`/`RESTORE`/`MIGRATE`. `redis-cli -c` works against it.
   The **client-facing half of Redis Cluster is implemented; the binary gossip bus
   is deliberately not** — see [Cluster](#cluster) for the precise boundary.
+- **Embeddable as a Go library** — the root package starts the whole server inside your
+  process and lets you issue commands **with no socket at all**: `db.Do("SET", "k", "v")`
+  costs a buffer write and a parse rather than a round trip, and a test needs no port, no
+  readiness poll and no cleanup goroutine. This is the one thing real Redis cannot be asked
+  to do, since it is a separate process by construction. The same `DB` can serve real Redis
+  clients at the same time over one keyspace, `Options.Now` replaces the clock so a TTL is
+  testable without sleeping, and an in-process client is a *client* — authenticated,
+  refused on a replica, redirected in cluster mode — because it runs the same command path
+  a socket client does. See [Embedding it in a Go program](#embedding-it-in-a-go-program).
 - **Streams with consumer groups** — `XADD` (generated or explicit ids,
   `NOMKSTREAM`, `MAXLEN`/`MINID` trimming), `XRANGE`/`XREVRANGE` with exclusive
   bounds, `XREAD` with `BLOCK` and `$`, and the full group surface: `XGROUP`,
@@ -571,6 +580,177 @@ redis-cli -p 6380 subscribe news sports
 redis-cli -p 6380 publish news 'deploy finished'     # (integer) 1
 redis-cli -p 6380 pubsub channels                    # news, sports
 ```
+
+## Embedding it in a Go program
+
+The root package is an embedded server: the same command table, the same store, the same
+AOF and replication, running inside your process. **A Go program can issue commands with
+no socket at all** — which is the one thing real Redis cannot be asked to do, since it is
+a separate process by construction.
+
+```bash
+go get github.com/Black-third/shardkv
+```
+
+The whole of it, and this runs as written:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/Black-third/shardkv"
+)
+
+func main() {
+	// The zero Options is a complete configuration: 256 shards, 16 databases, no
+	// listener, no persistence. Nothing binds a port, so nothing can fail to.
+	db, err := shardkv.Open(shardkv.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Do takes a command and its operands and returns the decoded reply.
+	if _, err := db.Do("SET", "greeting", "hello"); err != nil {
+		log.Fatal(err)
+	}
+
+	// Or ask for the shape you expect. Bytes reports whether the key was there at all,
+	// which "" cannot: an absent key and an empty value are different states.
+	greeting, ok, err := db.Bytes("GET", "greeting")
+	fmt.Println(string(greeting), ok, err) // hello true <nil>
+
+	db.Do("ZADD", "board", "100", "alice", "200", "bob")
+	members, _ := db.Strings("ZRANGE", "board", "0", "-1")
+	fmt.Println(members) // [alice bob]
+
+	score, _ := db.Float("ZSCORE", "board", "bob")
+	fmt.Println(score) // 200
+
+	db.Do("HSET", "user:1", "name", "ada", "role", "admin")
+	fields, _ := db.Map("HGETALL", "user:1")
+	fmt.Println(fields["role"]) // admin
+
+	// A transaction, because a Client is a connection's worth of state and has its own.
+	db.Do("MULTI")
+	db.Do("INCR", "hits")
+	db.Do("INCR", "hits")
+	results, _ := db.Do("EXEC")
+	fmt.Println(results) // [1 2]
+}
+```
+
+**Eight methods, not 224 wrappers.** There is deliberately no method per command. What a
+caller actually repeats is not the command — it is the type assertion on the reply, and the
+224 commands answer in far fewer distinct shapes than there are commands. So the conversion
+is named once per *shape* and serves every command that has it, including ones that do not
+exist yet: `Do` (the raw value), `OK` (a status, discarded), `Int`, `Float`, `Bool`,
+`Bytes` (with the exists flag), `Strings`, `Map`. A mirror of 224 commands would be a second
+interface to keep correct against the first, and every mismatch would surface as an embedded
+caller unable to reach a command a socket client can.
+
+Each accessor also absorbs the RESP2/RESP3 difference where there is one, so
+`db.Do("HELLO", "3")` — an ordinary command, so no API is needed for it — changes the reply
+*shapes* without changing your code: `Map` reads both RESP3's map and RESP2's flat array,
+`Float` reads both the double and the text of one.
+
+**It is a client, not a back door.** Commands go through the server's client entry point,
+not the replay path an AOF and a master's stream take. That is a deliberate choice and it
+is the one worth knowing about: the replay path is never gated, because a replica must
+apply every write its master sends whatever its own slot map says. So an in-process client
+is authenticated if a password is set, is refused a write on a replica with `READONLY`, is
+refused a write over the `maxmemory` budget with `OOM`, is redirected with `MOVED`/`ASK`
+in cluster mode for a slot this node does not own, and queues rather than runs inside
+`MULTI` — all identically to a client on a socket, because it is the same code. Anything
+else would make the embedded API a hole through every gate the client path exists to
+enforce.
+
+**Configuration is the same table `CONFIG SET` uses.** The named options are the structural
+decisions that cannot be taken back; everything else is a `Config` entry by the name
+`CONFIG SET` knows it, applied through that one parser — so `"256mb"` cannot come to mean a
+different number at startup than at runtime, and a value the server would refuse from a
+client fails `Open` with the same sentence rather than being silently dropped.
+
+```go
+db, err := shardkv.Open(shardkv.Options{
+	Addr:            ":6380",         // also serve real Redis clients; "" for none
+	AOFPath:         "data/dump.aof", // replayed before Open returns
+	AOFSync:         "everysec",
+	SnapshotPath:    "data/dump.skv",
+	Databases:       4,
+	Shards:          512,
+	Password:        "s3cr3t",
+	MaxMemory:       "256mb",
+	MaxMemoryPolicy: "allkeys-lru",
+	Config: map[string]string{
+		"maxclients":             "500",
+		"notify-keyspace-events": "KEA",
+		"save":                   "300 100 60 10000",
+	},
+})
+```
+
+With an `Addr` the same `DB` does both jobs at once, over one keyspace — so an embedded
+cache and the `redis-cli` an operator debugs it with are looking at the same data:
+
+```go
+db, _ := shardkv.Open(shardkv.Options{Addr: "127.0.0.1:0"}) // :0 — the kernel picks
+defer db.Close()
+db.Do("SET", "written-in-process", "1")
+fmt.Println(db.Addr()) // 127.0.0.1:54321 — bound before Open returned, so nothing to poll
+```
+
+**Testing is what it is best at.** No port to reserve, no readiness to poll, no cleanup
+goroutine — and `Options.Now` replaces the clock the server reads for expiry, so a TTL is
+testable without sleeping through it:
+
+```go
+func TestSessionExpiry(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	db, err := shardkv.Open(shardkv.Options{
+		Now: func() time.Time { return time.Unix(0, now.Load()) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	db.Do("SET", "session:abc", "user-1", "EX", "1800")
+	now.Add(int64(31 * time.Minute)) // no sleep; the server reads this clock
+
+	if _, ok, _ := db.Bytes("GET", "session:abc"); ok {
+		t.Error("the session outlived its TTL")
+	}
+}
+```
+
+One clock serves every database, deliberately: every deadline on the wire is absolute, so
+two databases reading different clocks would expire keys at instants the propagated
+deadlines were never computed against.
+
+**Concurrency comes from clients.** One `Client` is safe to use from several goroutines but
+serializes them, exactly as one connection does and for the same reason — a session's
+transaction state, database and authentication belong to whoever is using it, and
+interleaving two callers through one would let one goroutine's `EXEC` run another's queue.
+`db.NewClient()` returns an independent one, which is what a connection pool is:
+
+```go
+c := db.NewClient()
+defer c.Close()
+c.OK("SELECT", "3") // this client's database; the others are unaffected
+```
+
+**What it does not do.** Pub/Sub needs a listener and a real client: a subscription is a
+server-initiated stream and delivering it needs somewhere to push to, which a
+request/reply channel has not got. Cluster mode with no listener needs an explicit
+`Cluster.AnnouncePort`, since a node's announced port otherwise defaults to the one it
+bound. And no type from `internal/` appears in any signature the package exposes — that is
+what lets the server be refactored without breaking a caller, and it is checked by the
+package existing outside `internal/` at all.
 
 ## Persistence (AOF)
 
@@ -2274,43 +2454,310 @@ go test -bench=. -benchmem ./internal/store
 The write-path allocation is the `*entry` that enables in-place LRU bookkeeping
 (see design notes).
 
-### End-to-end throughput: no trustworthy numbers yet
+### End-to-end throughput: shardkv against a real Redis
 
-There is deliberately **no server-level benchmark table here**, because attempts to
-produce one on a development machine were not reproducible: three consecutive identical
-`redis-benchmark` runs against the same real Redis on Docker Desktop for macOS measured
-78k, 191k and 781k SET/sec — a tenfold spread on the reference implementation itself.
-Publishing a comparison from that host would be publishing noise with a favourable
-number selected from it.
+The claim this project rests on is that sharding a keyspace across independently locked
+partitions turns lock contention into something that scales with cores. That is a claim
+about *concurrent* load, and unmeasured it is worth nothing. So: the same load generator,
+the same host, the same container runtime, the same network, the same base image for both
+servers, persistence off on both, five repetitions, the two servers interleaved inside
+each repetition.
 
-Doing this properly needs a Linux host, cores pinned, the client on separate hardware
-from the server, `memtier_benchmark` rather than a single-threaded driver, and several
-runs with the variance reported alongside the median. Until that exists, the honest
-statement is that end-to-end performance relative to Redis is **unmeasured**.
+`make bench-vs-redis` produces every number below, including the host block.
 
-The harness for doing it is here, so that the missing number is a matter of hardware
-rather than of tooling:
+**The headline, stated before the tables. The throughput comparison failed; one latency
+comparison succeeded.** On the host available for this run, 34 of 37 measured cases produced
+no certifiable throughput ratio and 3 established only a direction — and two independent
+runs of the same sweep disagree about which server is faster at c=128. No throughput number
+here is quotable, and the tool exits non-zero saying so.
+
+What did survive, because a paired sign test needs the noise to be common-mode and not
+small: **at 32 connections and above, unpipelined, shardkv's median latency was the lower of
+the two in 29 of 30 paired comparisons — 0.44–0.75x Redis's — and under `-P 16` pipelining
+its p99 was the worse of the two in 37 of 50.** Faster at the median under concurrency,
+worse in the tail under pipelining. Those two sentences are the result; everything else in
+this section is either the evidence for them or the reason the throughput table is not
+evidence for anything.
+
+#### The host these numbers came from
+
+    date:             2026-08-07T07:33:17Z
+    cpu:              Apple M2
+    cores:            8
+    memory:           16 GiB
+    kernel:           Darwin 25.5.0 arm64
+    docker:           28.2.2  (8 CPUs, 7 GiB allotted to the VM)
+    redis:            redis:7-alpine — redis-server 7.4.10
+    shardkv:          go1.26.4, static CGO_ENABLED=0 binary
+    benchmark tool:   redis-benchmark from redis:7-alpine
+    reps:             5
+    load avg:         276 at the start of the run, 322 at the end
+    other tenants:    12 unrelated containers running on the same daemon
+
+**That load average is the finding.** A one-minute load average of ~300 on eight cores is
+a machine oversubscribed roughly fortyfold by work that has nothing to do with this
+benchmark. Both servers were measured under it, back to back, so the comparison is not
+*biased* by it — but it is swamped by it.
+
+#### How the comparison is computed, and why it still mostly fails
+
+Absolute throughput on such a host is wildly unstable, and the tables report that
+honestly in the `abs CV` column: the coefficient of variation of the same measurement
+across repetitions, frequently 30–70%.
+
+The *comparison* does not have to inherit that. The runner measures shardkv and Redis back
+to back inside each repetition, so whatever the machine was doing to one it was very nearly
+doing to the other, and a ratio taken *inside* a repetition cancels the common part. The
+`ratio` column is therefore the median of the per-repetition ratios — not one median
+divided by another, which would throw the pairing away — and `ratio CV` is how much of the
+noise survived it. Magnitudes with a `ratio CV` above 10% are withheld.
+
+That pairing works: fed synthetic data where shardkv is exactly 2x Redis in every
+repetition while both swing fivefold between repetitions, the harness reports 78% `abs CV`
+and a 2.00x ratio at 0.0% `ratio CV`. It is the real host's noise that is not common-mode
+enough — the bursts land on one server's measurement and not the other's.
+
+Two things partly recover from that, and both are reported.
+
+**Direction survives what magnitude does not.** The `won` column is how many of the five
+paired repetitions shardkv was faster in. A unanimous `5/5` or `0/5` is a sign test at
+p≈0.06 — weak alone, meaningful when it agrees with a mechanism predicted in advance —
+and it holds even when the magnitude does not. Three cases reached it here.
+
+**Longer measurements should shrink the residual noise. On this host they did not.** The
+idea is sound — averaging a single measurement over more of the host's bursts leaves less
+to survive the pairing — and a first probe supported it: `sweep c=128 SET` over four paired
+repetitions gave a ratio CV of 27.2% at the default request count and 11.9% at five times
+it. That is what `MULT` is for.
+
+Then the whole sweep was re-run at `MULT=4`, and the improvement did not generalise: ratio
+CV fell in **5 of 10** cases and rose in the other 5, which is a coin flip. The first probe
+was itself noise. This is recorded rather than deleted because a benchmark section that
+only keeps the experiments that worked is the thing this section is trying not to be.
+
+Worse, and more usefully: **the two runs disagree about who wins.** Same sweep, same host,
+same harness, an hour apart. Both columns are shardkv ÷ redis, so a figure below 1 favours
+Redis.
+
+| conns | test | default counts, 5 reps | `MULT=4`, 4 reps |
+| --- | --- | --- | --- |
+| 1 | SET | 0.84x | 0.54x |
+| 1 | GET | 0.71x | 0.77x |
+| 8 | SET | 1.17x | 1.03x |
+| 8 | GET | 0.79x | 0.85x |
+| 32 | SET | 1.62x | 1.36x |
+| 32 | GET | 1.18x | 1.40x |
+| 128 | SET | **1.30x** | **0.95x** |
+| 128 | GET | **1.39x** | **0.96x** |
+| 512 | SET | 1.12x | 1.47x |
+| 512 | GET | 1.12x | 1.64x |
+
+At c=128 one run puts shardkv 30–39% ahead and the other puts Redis marginally ahead. Those
+are not two estimates of one quantity; they are two samples of the host. This table is the
+single most useful result of the exercise, and what it establishes is that **no ratio from
+this machine should be quoted, including the ones in the tables below.**
+
+#### The mistake this harness exists to avoid
+
+`redis-benchmark` without `-r` sends every request to the **same key**. The `__rand_int__`
+placeholder is only substituted when `-r` is given, so the key is literally
+`key:__rand_int__`; run `redis-benchmark -t set -n 1000` against anything and then
+`DBSIZE`, and the answer is `1`. On a store that shards by key hash that funnels the whole
+load through one of 256 shards, measuring single-shard lock contention — the exact opposite
+of what a sharded server is for, and a benchmark that would be blind to this project's only
+interesting claim. Every suite here passes `-r 100000`. The `single_key` suite keeps the
+unspread case deliberately, as the control for what sharding cannot do for you.
+
+Three further properties of the setup shape what the numbers mean.
+
+**The load generator shares the machine with the servers.** `redis-benchmark` is
+single-threaded unless told otherwise, and one thread saturates before an eight-core server
+does, at which point the benchmark measures the client. Each case gets a `--threads` count
+sized to its connection count, capped at 4 — a client that takes every core starves the
+server it is measuring. It is still a partial bottleneck at the top of the sweep: c=128
+unpipelined SET rose from 38.9k to 49.6k for shardkv and 33.4k to 48.7k for Redis when the
+client went from one thread to eight. Both sides gain, so the ratio roughly survives, but
+every absolute figure here is a floor rather than either server's ceiling.
+
+**This is process against process, not core against core.** Neither container gets a CPU
+limit, so shardkv's Go runtime uses all eight cores while Redis executes commands on one,
+by design. A throughput ratio above 1 at high concurrency is one shardkv process beating
+one Redis process; it is *not* evidence of a faster per-operation path, and Redis's own
+answer to more cores is more processes. Redis runs at its defaults, which means
+`io-threads 1`; Redis 7 can move network I/O — not command execution — onto more threads,
+and a reader who wants the strongest possible Redis should re-run with `--io-threads 4`
+added to the `redis-server` line in `start_servers`.
+
+There is a corollary worth stating, because it showed up in the measurements: **sharding
+can only spend cores that exist.** At load ~330 there were no spare cores to scale onto,
+and a five-times-longer `sweep c=128 SET` measurement put the two servers level (median
+ratio 0.97) where a shorter one on a quieter moment of the same host had shardkv well
+ahead. A multi-threaded server on a saturated box degenerates toward the single-threaded
+one. That is a real property of the design, not an artifact.
+
+**These numbers are the pure-cache configuration.** Both servers run with persistence off,
+which for shardkv means `propagating` is false and writes stay sharded-concurrent
+(invariant 1 above). Attach an AOF or a replica and every write additionally passes through
+one ordering lock spanning mutation, AOF append and replica enqueue — so the write-side
+scaling here is what a cache gets, not what a persisting or replicating server gets. The
+read path is unaffected either way.
+
+#### Results
+
+Medians over 5 repetitions. `won` is how many repetitions shardkv was faster in; `abs CV`
+is the instability of the absolute figure; `ratio CV` is what survived the pairing.
+Withheld means withheld — not "roughly equal".
+
+**GET/SET, one request in flight per connection, keys spread over 100k slots.** If a
+per-shard lock buys anything it shows up as connections climb; if it costs anything it
+shows up at c=1.
+
+| conns | test | shardkv ops/sec | redis ops/sec | verdict | won | ratio CV | abs CV | shardkv p50/p99 ms | redis p50/p99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | SET | 1,455 | 1,700 | no conclusion | 1/5 | 29.4% | 27.1% | 0.239 / 8.487 | 0.231 / 5.751 |
+| 1 | GET | 1,413 | 1,644 | no conclusion | 1/5 | 25.7% | 22.3% | 0.215 / 6.967 | 0.183 / 5.159 |
+| 8 | SET | 8,230 | 8,221 | no conclusion | 3/5 | 57.3% | 45.4% | 0.367 / 8.695 | 0.383 / 8.535 |
+| 8 | GET | 6,982 | 8,807 | no conclusion | 2/5 | 30.5% | 32.9% | 0.343 / 9.503 | 0.343 / 7.751 |
+| 32 | SET | 21,536 | 18,075 | no conclusion | 3/5 | 49.9% | 38.2% | 0.303 / 12.759 | 0.511 / 18.543 |
+| 32 | GET | 23,715 | 18,921 | no conclusion | 4/5 | 22.5% | 27.1% | 0.247 / 13.031 | 0.567 / 12.095 |
+| 128 | SET | 58,388 | 37,046 | no conclusion | 4/5 | 24.3% | 53.0% | 1.071 / 15.287 | 1.463 / 20.111 |
+| 128 | GET | 59,125 | 33,998 | **shardkv, size withheld** | 5/5 | 36.2% | 47.9% | 0.983 / 13.239 | 1.439 / 18.735 |
+| 512 | SET | 58,027 | 52,836 | no conclusion | 3/5 | 41.9% | 36.6% | 2.823 / 48.095 | 5.047 / 53.887 |
+| 512 | GET | 72,886 | 53,744 | no conclusion | 3/5 | 37.3% | 30.2% | 2.967 / 35.807 | 5.607 / 46.975 |
+
+**The same sweep pipelined 16 deep (`-P 16`).** Pipelining amortises the syscall pair away,
+leaving per-operation work: parsing, dispatch, allocation. This is the least flattering
+shape for a Go server against hand-tuned C, and it is where shardkv's tail latency is
+visibly worse.
+
+| conns | test | shardkv ops/sec | redis ops/sec | verdict | won | ratio CV | abs CV | shardkv p50/p99 ms | redis p50/p99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | SET | 21,505 | 30,912 | no conclusion | 2/5 | 38.4% | 49.4% | 0.271 / 6.471 | 0.183 / 5.407 |
+| 1 | GET | 23,981 | 27,360 | no conclusion | 1/5 | 39.9% | 39.5% | 0.247 / 5.847 | 0.263 / 5.671 |
+| 8 | SET | 113,863 | 105,708 | no conclusion | 2/5 | 44.0% | 30.1% | 0.591 / 10.919 | 0.535 / 8.599 |
+| 8 | GET | 105,125 | 113,572 | no conclusion | 3/5 | 23.2% | 31.5% | 0.511 / 8.343 | 0.463 / 7.871 |
+| 32 | SET | 226,372 | 197,628 | no conclusion | 4/5 | 33.1% | 32.9% | 1.159 / 12.063 | 1.263 / 10.559 |
+| 32 | GET | 258,398 | 225,989 | no conclusion | 4/5 | 14.7% | 25.9% | 0.839 / 18.831 | 1.151 / 12.359 |
+| 128 | SET | 223,339 | 315,706 | no conclusion | 2/5 | 50.5% | 37.8% | 2.575 / 52.959 | 4.191 / **18.943** |
+| 128 | GET | 306,044 | 315,706 | no conclusion | 1/5 | 29.0% | 36.4% | 1.991 / 48.895 | 3.767 / **19.567** |
+| 512 | SET | 305,111 | 390,625 | no conclusion | 2/5 | 49.6% | 52.3% | 11.039 / 119.295 | 15.087 / **73.151** |
+| 512 | GET | 380,952 | 261,438 | no conclusion | 3/5 | 21.0% | 41.7% | 8.231 / 119.679 | 16.911 / 117.631 |
+
+**The typed collections plus INCR**, at low and high concurrency — each a different store
+method behind the same shard lock, so this checks the sweep's shape is a property of the
+store and not of the string path alone.
+
+| conns | test | shardkv ops/sec | redis ops/sec | verdict | won | ratio CV | abs CV | shardkv p50/p99 ms | redis p50/p99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | INCR | 8,521 | 10,046 | no conclusion | 1/5 | 64.3% | 58.2% | 0.207 / 9.287 | 0.335 / 6.087 |
+| 8 | LPUSH | 8,632 | 9,091 | no conclusion | 2/5 | 62.0% | 79.9% | 0.223 / 6.863 | 0.367 / 6.639 |
+| 8 | LPOP | 7,056 | 9,973 | no conclusion | 1/5 | 54.6% | 49.4% | 0.287 / 7.623 | 0.287 / 5.439 |
+| 8 | SADD | 7,305 | 9,535 | **redis, size withheld** | 0/5 | 57.4% | 57.0% | 0.295 / 9.223 | 0.303 / 7.031 |
+| 8 | HSET | 8,240 | 7,625 | no conclusion | 4/5 | 39.5% | 67.2% | 0.327 / 7.879 | 0.383 / 8.327 |
+| 8 | ZADD | 5,791 | 6,560 | no conclusion | 2/5 | 16.3% | 35.7% | 0.479 / 9.711 | 0.479 / 8.887 |
+| 128 | INCR | 34,642 | 34,698 | no conclusion | 4/5 | 29.1% | 49.4% | 1.103 / 24.783 | 2.167 / 18.431 |
+| 128 | LPUSH | 35,377 | 39,662 | no conclusion | 3/5 | 29.1% | 38.0% | 1.263 / 28.751 | 1.895 / 12.951 |
+| 128 | LPOP | 37,046 | 39,714 | no conclusion | 3/5 | 40.5% | 64.5% | 1.127 / 22.703 | 1.935 / 15.191 |
+| 128 | SADD | 42,064 | 37,092 | no conclusion | 4/5 | 44.6% | 53.9% | 1.319 / 18.911 | 2.079 / 20.495 |
+| 128 | HSET | 39,205 | 34,301 | no conclusion | 3/5 | 34.6% | 47.5% | 1.231 / 21.711 | 1.783 / 25.823 |
+| 128 | ZADD | 27,568 | 26,695 | no conclusion | 4/5 | 49.5% | 32.8% | 2.063 / 24.271 | 2.607 / 35.583 |
+
+**4 KiB values, `XADD`, and the single-key control.** `large_4kb` is where per-operation
+cost is dominated by copying bytes; `single_key` omits `-r`, so all 128 connections
+serialise on one of the 256 shard locks and sharding can contribute nothing.
+
+| suite | conns | test | shardkv ops/sec | redis ops/sec | verdict | won | ratio CV | abs CV | shardkv p50/p99 ms | redis p50/p99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| large_4kb | 32 | SET | 18,070 | 5,807 | **shardkv, size withheld** | 5/5 | 45.6% | 65.9% | 0.407 / 14.391 | 2.959 / 21.023 |
+| large_4kb | 32 | GET | 18,012 | 11,631 | no conclusion | 3/5 | 61.9% | 73.3% | 0.479 / 13.959 | 1.719 / 11.591 |
+| streams | 32 | XADD | 18,744 | 20,890 | no conclusion | 2/5 | 26.5% | 46.2% | 0.423 / 16.751 | 0.647 / 10.975 |
+| single_key | 128 | SET | 32,352 | 35,894 | no conclusion | 1/5 | 46.5% | 41.7% | 1.135 / 32.399 | 1.687 / 22.495 |
+| single_key | 128 | GET | 39,231 | 49,554 | no conclusion | 2/5 | 26.5% | 44.5% | 0.999 / 21.711 | 1.559 / 16.639 |
+
+#### What this does and does not establish
+
+**Certified, such as it is.** Three cases had a unanimous direction across all five paired
+repetitions: shardkv faster on `sweep c=128 GET` and on `large_4kb c=32 SET`, Redis faster
+on `collections c=8 SADD`. Magnitudes for all three are withheld.
+
+**Where shardkv loses, and it does lose.** Redis is ahead on the median at **c=1**, both
+plain (1,700 vs 1,455 SET) and pipelined (30,912 vs 21,505 SET) — a single connection
+issuing one request at a time is pure per-operation cost with no concurrency to exploit,
+which is Redis's home ground and shardkv's worst shape. It is also ahead on the median in
+most of the **pipelined** high-concurrency cases, where the syscall pair is amortised away
+and what remains is parse-and-dispatch work.
+
+The most robust loss in the whole run is not throughput at all but **tail latency under
+pipelining**. Counting every paired repetition rather than comparing medians, shardkv's p99
+was the higher of the two in **37 of the 50** pipelined comparisons (10 cases × 5
+repetitions) — for a fair coin that is p≈0.0007 — with medians of 52.9 ms against Redis's
+18.9 ms at c=128 SET and 119.3 ms against 73.2 ms at c=512 SET, bolded above. A garbage
+collector and a goroutine scheduler cost tail latency that a single-threaded C event loop
+does not pay, and no amount of sharding addresses it.
+
+The same count on the *unpipelined* sweep is 27 of 50, i.e. nothing. So this is specifically
+a pipelining effect: it appears when many requests are in flight per connection and
+per-request work, allocation included, is the whole cost.
+
+**Where the medians favour shardkv**, uncertified and — for throughput — contradicted by
+the `MULT=4` re-run: everything unpipelined from c=32 up. Take that as a hypothesis the
+design predicts (concurrent unpipelined load is exactly what per-shard locking is for) and
+that this host was unable to test, not as a result.
+
+The one comparative signal that survived everything is **p50 latency under concurrent
+unpipelined load**, and it is the strongest result on this page. Counting paired
+repetitions at c=32 and above, shardkv's p50 was the lower of the two in **29 of 30**
+comparisons — p≈3×10⁻⁸ against a fair coin. It also reproduced across the two independent
+runs: the median p50 agreed on which server was lower in 8 of the 10 sweep cells overall,
+and in **all six** at c=32 and above, with margins that are wide rather than marginal:
+
+| conns | test | shardkv p50 (run 1 / run 2) | redis p50 (run 1 / run 2) |
+| --- | --- | --- | --- |
+| 32 | SET | 0.303 / 0.343 ms | 0.511 / 0.455 ms |
+| 32 | GET | 0.247 / 0.295 ms | 0.567 / 0.571 ms |
+| 128 | SET | 1.071 / 0.931 ms | 1.463 / 1.371 ms |
+| 128 | GET | 0.983 / 0.787 ms | 1.439 / 1.339 ms |
+| 512 | SET | 2.823 / 4.111 ms | 5.047 / 8.451 ms |
+| 512 | GET | 2.967 / 3.571 ms | 5.607 / 7.927 ms |
+
+The two disagreements are both at c=1 and c=8, where the gap is within a few hundredths of a
+millisecond either way. The same ordering appears across the collection types at c=128
+(`HSET` 1.231 vs 1.783 ms, `LPOP` 1.127 vs 1.935 ms). A queue drains faster when more than
+one thread can drain it, which is the mechanism the design predicted, and a median is the
+statistic least disturbed by a host that stalls everything periodically.
+
+So the defensible summary of the whole exercise is narrower than a throughput table and not
+nothing: **under concurrent unpipelined load shardkv answers a median request in 0.44–0.75x
+the time Redis does (all twelve cell-run pairs at c≥32 fall in that band), and under deep
+pipelining it pays a materially worse p99.** Both survive a paired sign test on a badly
+contended machine. Neither is a throughput claim.
+
+**What is not established** is any throughput magnitude, and — at c=128 and c=512 — not even
+its sign. Nothing in the ratio columns above should be quoted.
+
+#### Reproduce
 
 ```bash
-make bench-vs-redis              # ./test/bench/vs-redis.sh
-REPS=5 PROFILES="baseline pipelined" make bench-vs-redis
+make bench-vs-redis                            # what produced the tables above (~35 min)
+MULT=4 SUITES=sweep make bench-vs-redis        # 4x longer measurements (~45 min; no help here)
+SUITES="sweep pipelined" make bench-vs-redis   # just the two sweeps
+make bench-vs-redis-quick                      # SCALE=20: checks plumbing, measures nothing
 ```
 
-It starts shardkv and a real `redis:7-alpine` on one Docker network, with persistence off
-on both — an AOF against an RDB would be comparing two different durability contracts, not
-two servers — drives them with `redis-benchmark` out of the same image, and covers six
-profiles: a request at a time, deep pipelining (`-P 16`), a fan of 500 connections, 4 KiB
-values, the collection types, and `XADD`. Every profile is repeated, and the repetitions
-are **interleaved** between the two servers rather than run in blocks, so that load
-drifting during the run is shared instead of handed to one of them. It records the CPU,
-core count, container runtime and both server versions into the report, because a
-benchmark without its hardware is an anecdote.
+Output lands in `test/bench/.results/`: `raw.tsv` (one row per repetition, so the pairing
+can be recomputed), `report.txt`, and `report.md`. The harness creates a `shardkv-bench`
+docker network and three containers named `skbench-*`, and removes exactly those on exit —
+`KEEP=1` leaves the servers up for manual poking. It exits non-zero when any case has no
+conclusion, which on this host means it exits non-zero.
 
-The part that matters most: it computes a coefficient of variation across the repetitions
-of each cell and **refuses to print a ratio above 10%**, reporting the observed spread
-instead and exiting non-zero. On the machine this was developed on it refuses nearly
-everything, which is the correct answer — the tool declining to compare is the finding,
-and it is why there is no table above.
+#### What would make these numbers worth quoting
+
+In descending order of effect: an otherwise idle machine; the load generator on separate
+hardware from the servers; Linux with Docker running natively rather than in a VM; cores
+pinned so the client and server never share one; a fixed CPU governor; and
+`memtier_benchmark` alongside `redis-benchmark` for a second opinion on the driver. On such
+a host, raise `MULT` until `ratio CV` sits in single digits and only then read the
+magnitudes. The tooling is no longer the missing piece; the machine is.
 
 ## Compatibility: what is missing
 
@@ -2752,6 +3199,8 @@ argument count. On top of that, the properties a single command's test cannot se
 ## Layout
 
 ```text
+shardkv.go         the embedded API: Options, Open, DB, the lifetime and the defaults        (+ tests)
+client.go            the in-process client and the eight typed reply accessors
 cmd/shardkv        entrypoint: flags, signal handling, AOF/replication/TLS wiring
 internal/store     sharded store, typed values, skip-list sorted set, LRU eviction, snapshot   (+ tests, benchmarks)
   databases.go       the cross-store operations SWAPDB/MOVE/COPY ... DB need
@@ -2761,9 +3210,11 @@ internal/store     sharded store, typed values, skip-list sorted set, LRU evicti
   memory.go          the per-key footprint estimate MEMORY USAGE reports
 internal/resp      RESP protocol reader/writer, size accounting                                 (+ tests, fuzz)
 internal/resp      + the RESP3 types and their RESP2 fallbacks, per-connection version
+  reply.go           the reply decoder, for the embedded client that issues commands
 internal/server    TCP server, command table + handlers, transactions, replication             (+ tests)
   server.go          connection loop, dispatch, the database views, propagation funnels
   session.go         per-connection state: database, transaction, auth, subscriptions
+  embed.go           in-process command execution: a session with no socket behind it
   reply.go           the reply shapes RESP3 changes, written once for both protocols
   blocking.go        wait queues, FIFO wakeup, disconnect watchdog, CLIENT UNBLOCK
   auth.go            requirepass/masterauth, AUTH, the NOAUTH gate

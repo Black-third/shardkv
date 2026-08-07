@@ -37,8 +37,12 @@ bench: ## Run the store benchmarks with allocation counts.
 	$(GO) test -bench=. -benchmem ./internal/store
 
 .PHONY: bench-vs-redis
-bench-vs-redis: ## End-to-end throughput vs a real Redis (docker; reports its own variance).
+bench-vs-redis: ## End-to-end throughput/latency vs a real Redis (docker; reports its own variance).
 	./test/bench/vs-redis.sh
+
+.PHONY: bench-vs-redis-quick
+bench-vs-redis-quick: ## Same harness, request counts cut 20x: checks the plumbing, measures nothing.
+	SCALE=20 REPS=2 ./test/bench/vs-redis.sh
 
 .PHONY: compat
 compat: ## Drive the server with real client libraries in containers (docker).
