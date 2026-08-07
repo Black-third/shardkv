@@ -320,7 +320,7 @@ func (s *Server) writeSortReply(w *resp.Writer, spec sortSpec, ordered []string)
 	if len(spec.getPattern) == 0 {
 		w.WriteArrayHeader(len(ordered))
 		for _, e := range ordered {
-			w.WriteBulk([]byte(e))
+			w.WriteBulkString(e)
 		}
 		return
 	}
@@ -332,7 +332,7 @@ func (s *Server) writeSortReply(w *resp.Writer, spec sortSpec, ordered []string)
 				w.WriteNull()
 				continue
 			}
-			w.WriteBulk([]byte(v))
+			w.WriteBulkString(v)
 		}
 	}
 }

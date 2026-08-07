@@ -66,13 +66,13 @@ func (s *Server) clusterSubcommand(w *resp.Writer, sub string, args [][]byte) bo
 	cs := s.cluster
 	switch sub {
 	case "MYID":
-		w.WriteBulk([]byte(cs.myself().id))
+		w.WriteBulkString(cs.myself().id)
 
 	case "INFO":
 		w.WriteVerbatim("txt", []byte(s.clusterInfo()))
 
 	case "NODES":
-		w.WriteBulk([]byte(s.clusterNodesText()))
+		w.WriteBulkString(s.clusterNodesText())
 
 	case "SLOTS":
 		s.writeClusterSlots(w)
@@ -695,9 +695,9 @@ func (s *Server) writeClusterSlots(w *resp.Writer) {
 
 func writeClusterSlotNode(w *resp.Writer, n *clusterNode) {
 	w.WriteArrayHeader(4)
-	w.WriteBulk([]byte(n.ip))
+	w.WriteBulkString(n.ip)
 	w.WriteInt(int64(n.port))
-	w.WriteBulk([]byte(n.id))
+	w.WriteBulkString(n.id)
 	w.WriteArrayHeader(0)
 }
 
@@ -776,13 +776,13 @@ func (s *Server) writeClusterShards(w *resp.Writer) {
 	for _, m := range masters {
 		ranges := cs.ownedSlots(m)
 		w.WriteMapHeader(2)
-		w.WriteBulk([]byte("slots"))
+		w.WriteBulkString("slots")
 		w.WriteArrayHeader(len(ranges) * 2)
 		for _, r := range ranges {
 			w.WriteInt(int64(r[0]))
 			w.WriteInt(int64(r[1]))
 		}
-		w.WriteBulk([]byte("nodes"))
+		w.WriteBulkString("nodes")
 		w.WriteArrayHeader(1 + len(replicas[m.id]))
 		writeShardNode(w, m, "master")
 		for _, r := range replicas[m.id] {
@@ -793,20 +793,20 @@ func (s *Server) writeClusterShards(w *resp.Writer) {
 
 func writeShardNode(w *resp.Writer, n *clusterNode, role string) {
 	w.WriteMapHeader(7)
-	w.WriteBulk([]byte("id"))
-	w.WriteBulk([]byte(n.id))
-	w.WriteBulk([]byte("port"))
+	w.WriteBulkString("id")
+	w.WriteBulkString(n.id)
+	w.WriteBulkString("port")
 	w.WriteInt(int64(n.port))
-	w.WriteBulk([]byte("ip"))
-	w.WriteBulk([]byte(n.ip))
-	w.WriteBulk([]byte("endpoint"))
-	w.WriteBulk([]byte(n.ip))
-	w.WriteBulk([]byte("role"))
-	w.WriteBulk([]byte(role))
-	w.WriteBulk([]byte("replication-offset"))
+	w.WriteBulkString("ip")
+	w.WriteBulkString(n.ip)
+	w.WriteBulkString("endpoint")
+	w.WriteBulkString(n.ip)
+	w.WriteBulkString("role")
+	w.WriteBulkString(role)
+	w.WriteBulkString("replication-offset")
 	w.WriteInt(0)
-	w.WriteBulk([]byte("health"))
-	w.WriteBulk([]byte("online"))
+	w.WriteBulkString("health")
+	w.WriteBulkString("online")
 }
 
 func writeClusterHelp(w *resp.Writer) {

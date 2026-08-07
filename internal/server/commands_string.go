@@ -347,7 +347,7 @@ func cmdIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 		writeStoreErr(w, err)
 		return nil
 	}
-	w.WriteBulk([]byte(val))
+	w.WriteBulkString(val)
 	return [][][]byte{{[]byte("SET"), args[1], []byte(val), []byte("KEEPTTL")}}
 }
 
@@ -619,7 +619,7 @@ func writeLCSMatches(w *resp.Writer, res store.LCSResult, minMatchLen int, withM
 		}
 	}
 	w.WriteMapHeader(2)
-	w.WriteBulk([]byte("matches"))
+	w.WriteBulkString("matches")
 	w.WriteArrayHeader(len(kept))
 	for _, m := range kept {
 		if withMatchLen {
@@ -640,6 +640,6 @@ func writeLCSMatches(w *resp.Writer, res store.LCSResult, minMatchLen int, withM
 	// The length reported is the whole subsequence's, even when MINMATCHLEN filtered runs
 	// out of the reply. That is Redis's behaviour and the useful one: the filter is about
 	// which alignments are worth looking at, not about how similar the two values are.
-	w.WriteBulk([]byte("len"))
+	w.WriteBulkString("len")
 	w.WriteInt(int64(res.Len))
 }

@@ -140,13 +140,13 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteArrayHeader(len(consumers))
 		for _, c := range consumers {
 			w.WriteMapHeader(4)
-			w.WriteBulk([]byte("name"))
-			w.WriteBulk([]byte(c.Name))
-			w.WriteBulk([]byte("pending"))
+			w.WriteBulkString("name")
+			w.WriteBulkString(c.Name)
+			w.WriteBulkString("pending")
 			w.WriteInt(c.Pending)
-			w.WriteBulk([]byte("idle"))
+			w.WriteBulkString("idle")
 			w.WriteInt(c.IdleMs)
-			w.WriteBulk([]byte("inactive"))
+			w.WriteBulkString("inactive")
 			w.WriteInt(c.InactiveMs)
 		}
 
@@ -158,37 +158,37 @@ func cmdXInfo(s *Server, w *resp.Writer, args [][]byte) bool {
 
 func writeXInfoStream(w *resp.Writer, info store.StreamInfo) {
 	w.WriteMapHeader(10)
-	w.WriteBulk([]byte("length"))
+	w.WriteBulkString("length")
 	w.WriteInt(info.Length)
-	w.WriteBulk([]byte("radix-tree-keys"))
+	w.WriteBulkString("radix-tree-keys")
 	// Both radix-tree fields are reported as the entry count rather than invented: this
 	// server keeps entries in a sorted slice, not a radix tree of listpacks, so there are no
 	// internal nodes to count. They exist because clients read them, and the honest value for
 	// a structure with one level is "one node per entry" -- which is also why they are equal
 	// here and are not in Redis.
 	w.WriteInt(info.Length)
-	w.WriteBulk([]byte("radix-tree-nodes"))
+	w.WriteBulkString("radix-tree-nodes")
 	w.WriteInt(info.Length)
-	w.WriteBulk([]byte("last-generated-id"))
-	w.WriteBulk([]byte(info.LastID.String()))
-	w.WriteBulk([]byte("max-deleted-entry-id"))
-	w.WriteBulk([]byte(info.MaxDeletedID.String()))
-	w.WriteBulk([]byte("entries-added"))
+	w.WriteBulkString("last-generated-id")
+	w.WriteBulkString(info.LastID.String())
+	w.WriteBulkString("max-deleted-entry-id")
+	w.WriteBulkString(info.MaxDeletedID.String())
+	w.WriteBulkString("entries-added")
 	w.WriteInt(info.EntriesAdded)
-	w.WriteBulk([]byte("recorded-first-entry-id"))
-	w.WriteBulk([]byte(info.RecordedFirstID.String()))
+	w.WriteBulkString("recorded-first-entry-id")
+	w.WriteBulkString(info.RecordedFirstID.String())
 	// The number of consumer groups on the stream. It was computed and then dropped, which
 	// is the worst of the three options: a client reading XINFO STREAM to decide whether a
 	// stream has consumers found the field missing rather than zero.
-	w.WriteBulk([]byte("groups"))
+	w.WriteBulkString("groups")
 	w.WriteInt(info.Groups)
-	w.WriteBulk([]byte("first-entry"))
+	w.WriteBulkString("first-entry")
 	if info.HasEntries {
 		writeStreamEntry(w, info.First)
 	} else {
 		w.WriteNull()
 	}
-	w.WriteBulk([]byte("last-entry"))
+	w.WriteBulkString("last-entry")
 	if info.HasEntries {
 		writeStreamEntry(w, info.Last)
 	} else {
@@ -198,15 +198,15 @@ func writeXInfoStream(w *resp.Writer, info store.StreamInfo) {
 
 func writeXInfoGroup(w *resp.Writer, g store.StreamGroupInfo) {
 	w.WriteMapHeader(6)
-	w.WriteBulk([]byte("name"))
-	w.WriteBulk([]byte(g.Name))
-	w.WriteBulk([]byte("consumers"))
+	w.WriteBulkString("name")
+	w.WriteBulkString(g.Name)
+	w.WriteBulkString("consumers")
 	w.WriteInt(g.Consumers)
-	w.WriteBulk([]byte("pending"))
+	w.WriteBulkString("pending")
 	w.WriteInt(g.Pending)
-	w.WriteBulk([]byte("last-delivered-id"))
-	w.WriteBulk([]byte(g.LastDelivered.String()))
-	w.WriteBulk([]byte("entries-read"))
+	w.WriteBulkString("last-delivered-id")
+	w.WriteBulkString(g.LastDelivered.String())
+	w.WriteBulkString("entries-read")
 	// A null entries-read means the count is not established, which is different from
 	// zero: a group created at "$" and one created at "0" have both read nothing, but the
 	// first is caught up and the second is the whole stream behind. Reporting 0 for both
@@ -216,7 +216,7 @@ func writeXInfoGroup(w *resp.Writer, g store.StreamGroupInfo) {
 	} else {
 		w.WriteNull()
 	}
-	w.WriteBulk([]byte("lag"))
+	w.WriteBulkString("lag")
 	// A null lag means "not knowable": the group sits inside a stream with a hole ahead of
 	// it, so there is no cheap way to count what it has left to read. Redis will sometimes
 	// estimate here and this does not -- a deliberate difference, because the lag is the
@@ -277,80 +277,80 @@ func xinfoFullCount(args [][]byte) (int, bool) {
 // both pending lists are arrays. All of it was captured from redis:7.2 over both protocols.
 func writeXInfoStreamFull(w *resp.Writer, info store.StreamFullInfo) {
 	w.WriteMapHeader(9)
-	w.WriteBulk([]byte("length"))
+	w.WriteBulkString("length")
 	w.WriteInt(info.Length)
 	// Both radix-tree fields are the entry count rather than an invention: this server
 	// keeps entries in a sorted slice, so there are no internal nodes to count. See
 	// writeXInfoStream, which reports them the same way and explains why.
-	w.WriteBulk([]byte("radix-tree-keys"))
+	w.WriteBulkString("radix-tree-keys")
 	w.WriteInt(info.Length)
-	w.WriteBulk([]byte("radix-tree-nodes"))
+	w.WriteBulkString("radix-tree-nodes")
 	w.WriteInt(info.Length)
-	w.WriteBulk([]byte("last-generated-id"))
-	w.WriteBulk([]byte(info.LastID.String()))
-	w.WriteBulk([]byte("max-deleted-entry-id"))
-	w.WriteBulk([]byte(info.MaxDeletedID.String()))
-	w.WriteBulk([]byte("entries-added"))
+	w.WriteBulkString("last-generated-id")
+	w.WriteBulkString(info.LastID.String())
+	w.WriteBulkString("max-deleted-entry-id")
+	w.WriteBulkString(info.MaxDeletedID.String())
+	w.WriteBulkString("entries-added")
 	w.WriteInt(info.EntriesAdded)
-	w.WriteBulk([]byte("recorded-first-entry-id"))
-	w.WriteBulk([]byte(info.RecordedFirstID.String()))
-	w.WriteBulk([]byte("entries"))
+	w.WriteBulkString("recorded-first-entry-id")
+	w.WriteBulkString(info.RecordedFirstID.String())
+	w.WriteBulkString("entries")
 	w.WriteArrayHeader(len(info.Entries))
 	for _, ent := range info.Entries {
 		writeStreamEntry(w, ent)
 	}
-	w.WriteBulk([]byte("groups"))
+	w.WriteBulkString("groups")
 	w.WriteArrayHeader(len(info.Groups))
 	for _, g := range info.Groups {
 		w.WriteMapHeader(7)
-		w.WriteBulk([]byte("name"))
-		w.WriteBulk([]byte(g.Name))
-		w.WriteBulk([]byte("last-delivered-id"))
-		w.WriteBulk([]byte(g.LastDelivered.String()))
-		w.WriteBulk([]byte("entries-read"))
+		w.WriteBulkString("name")
+		w.WriteBulkString(g.Name)
+		w.WriteBulkString("last-delivered-id")
+		w.WriteBulkString(g.LastDelivered.String())
+		w.WriteBulkString("entries-read")
 		if g.HasEntriesRead {
 			w.WriteInt(g.EntriesRead)
 		} else {
 			w.WriteNull()
 		}
-		w.WriteBulk([]byte("lag"))
+		w.WriteBulkString("lag")
 		if g.HasLag {
 			w.WriteInt(g.Lag)
 		} else {
 			w.WriteNull()
 		}
-		w.WriteBulk([]byte("pel-count"))
+		w.WriteBulkString("pel-count")
 		w.WriteInt(g.PelCount)
-		w.WriteBulk([]byte("pending"))
+		w.WriteBulkString("pending")
 		w.WriteArrayHeader(len(g.Pending))
 		for _, p := range g.Pending {
 			// Four fields in a group's list: the entry, who holds it, when it was last
 			// delivered and how many times. The consumer's own list below omits the name.
 			w.WriteArrayHeader(4)
-			w.WriteBulk([]byte(p.ID.String()))
-			w.WriteBulk([]byte(p.Consumer))
+			w.WriteBulkString(p.ID.String())
+			w.WriteBulkString(p.Consumer)
 			w.WriteInt(p.DeliveryMs)
 			w.WriteInt(p.DeliveryCount)
 		}
-		w.WriteBulk([]byte("consumers"))
+		w.WriteBulkString("consumers")
 		w.WriteArrayHeader(len(g.Consumers))
 		for _, c := range g.Consumers {
 			w.WriteMapHeader(5)
-			w.WriteBulk([]byte("name"))
-			w.WriteBulk([]byte(c.Name))
+			w.WriteBulkString("name")
+			w.WriteBulkString(c.Name)
 			// Absolute instants, not durations -- see StreamFullConsumerInfo for why the
 			// full form differs from XINFO CONSUMERS here.
-			w.WriteBulk([]byte("seen-time"))
+			w.WriteBulkString("seen-time")
 			w.WriteInt(c.SeenMs)
-			w.WriteBulk([]byte("active-time"))
+			w.WriteBulkString("active-time")
 			w.WriteInt(c.ActiveMs)
-			w.WriteBulk([]byte("pel-count"))
+			w.WriteBulkString("pel-count")
 			w.WriteInt(c.PelCount)
-			w.WriteBulk([]byte("pending"))
+			w.WriteBulkString("pending")
 			w.WriteArrayHeader(len(c.Pending))
 			for _, p := range c.Pending {
 				w.WriteArrayHeader(3)
-				w.WriteBulk([]byte(p.ID.String()))
+				w.WriteBulkString(p.ID.String())
 				w.WriteInt(p.DeliveryMs)
 				w.WriteInt(p.DeliveryCount)
 			}

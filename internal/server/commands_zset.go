@@ -478,7 +478,7 @@ func cmdZRandMember(s *Server, w *resp.Writer, args [][]byte) bool {
 			w.WriteNull()
 			return false
 		}
-		w.WriteBulk([]byte(members[0].Member))
+		w.WriteBulkString(members[0].Member)
 		return false
 	}
 	// WITHSCORES first, for the reason cmdHRandField reads WITHVALUES first: it halves the
@@ -551,7 +551,7 @@ func zPop(s *Server, w *resp.Writer, args [][]byte, fromMin bool) [][][]byte {
 	} else {
 		w.WriteArrayHeader(len(popped) * 2)
 		for _, m := range popped {
-			w.WriteBulk([]byte(m.Member))
+			w.WriteBulkString(m.Member)
 			w.WriteDouble(m.Score)
 		}
 	}
@@ -641,14 +641,14 @@ func writeZMembers(w *resp.Writer, members []store.ZMember, withScores bool) {
 			if nested {
 				w.WriteArrayHeader(2)
 			}
-			w.WriteBulk([]byte(m.Member))
+			w.WriteBulkString(m.Member)
 			w.WriteDouble(m.Score)
 		}
 		return
 	}
 	w.WriteArrayHeader(len(members))
 	for _, m := range members {
-		w.WriteBulk([]byte(m.Member))
+		w.WriteBulkString(m.Member)
 	}
 }
 

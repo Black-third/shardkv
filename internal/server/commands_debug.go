@@ -254,7 +254,7 @@ func cmdDebug(s *Server, w *resp.Writer, args [][]byte) bool {
 func debugProtocol(w *resp.Writer, typ string) {
 	switch typ {
 	case "string":
-		w.WriteBulk([]byte("Hello World"))
+		w.WriteBulkString("Hello World")
 	case "integer":
 		w.WriteInt(12345)
 	case "double":
@@ -285,12 +285,12 @@ func debugProtocol(w *resp.Writer, typ string) {
 		// one of the two places that has to test Proto() itself.
 		if w.Proto() >= resp.ProtoRESP3 {
 			w.WriteAttributeHeader(1)
-			w.WriteBulk([]byte("key-popularity"))
+			w.WriteBulkString("key-popularity")
 			w.WriteArrayHeader(2)
-			w.WriteBulk([]byte("key:123"))
+			w.WriteBulkString("key:123")
 			w.WriteInt(90)
 		}
-		w.WriteBulk([]byte("Some real reply following the attribute"))
+		w.WriteBulkString("Some real reply following the attribute")
 	case "push":
 		// A push has no RESP2 equivalent at all outside subscriber mode, where a RESP2
 		// client demultiplexes positionally; sending one to a RESP2 client here would be
@@ -299,9 +299,9 @@ func debugProtocol(w *resp.Writer, typ string) {
 			w.WriteError("ERR RESP2 is not supported by this command")
 			return
 		}
-		w.WriteBulk([]byte("Some real reply following the push reply"))
+		w.WriteBulkString("Some real reply following the push reply")
 		w.WritePushHeader(2)
-		w.WriteBulk([]byte("server-cpu-usage"))
+		w.WriteBulkString("server-cpu-usage")
 		w.WriteInt(42)
 	case "verbatim":
 		w.WriteVerbatim("txt", []byte("This is a verbatim\nstring"))

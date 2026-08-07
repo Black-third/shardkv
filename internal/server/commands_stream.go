@@ -333,7 +333,7 @@ parse:
 		w.WriteNull() // NOMKSTREAM and no such key
 		return nil
 	}
-	w.WriteBulk([]byte(id.String()))
+	w.WriteBulkString(id.String())
 
 	// The effect: the concrete id, never "*", and the trim as the exact operation it
 	// turned out to be. A replica running this sequence ends with the same entries under
@@ -452,7 +452,7 @@ func writeStreamEntries(w *resp.Writer, entries []store.StreamEntry) {
 
 func writeStreamEntry(w *resp.Writer, e store.StreamEntry) {
 	w.WriteArrayHeader(2)
-	w.WriteBulk([]byte(e.ID.String()))
+	w.WriteBulkString(e.ID.String())
 	// A pending entry whose data has been deleted is reported as an id with a null field
 	// list, which is how Redis says "you still owe an acknowledgement for something that
 	// is gone".

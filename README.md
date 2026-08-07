@@ -2444,15 +2444,27 @@ Apple Silicon, `go test -bench`, 8 logical cores:
 | Operation         | ns/op | allocs/op | in-process rate |
 | ----------------- | ----- | --------- | --------------- |
 | `GET` (parallel)  | ~28   | 2         | ~35 M ops/sec   |
-| `SET`             | ~115  | 3         | ~9 M ops/sec    |
-| `INCR` (parallel) | ~77   | 3         | ~13 M ops/sec   |
+| `SET`             | ~115  | 2         | ~9 M ops/sec    |
+| `INCR` (parallel) | ~77   | 2         | ~13 M ops/sec   |
 
 ```bash
 go test -bench=. -benchmem ./internal/store
 ```
 
-The write-path allocation is the `*entry` that enables in-place LRU bookkeeping
-(see design notes).
+The `ns/op` column is from a quiet host and has not been re-measured since; the
+`allocs/op` column has, and the two are deliberately treated differently — an
+allocation count is a property of the code and reproduces on a machine running
+anything, while a nanosecond figure on a host at load average 280 is a
+measurement of the host (see the tail-latency section below, which is the whole
+argument for reading the allocation column first).
+
+`SET` and `INCR` allocate what they store — the value's bytes — and nothing else.
+Neither allocates an `*entry` when the key already holds a string: the entry it
+found is overwritten in place, the way `LPUSH` and `HSET` have always mutated
+theirs. An entry is ~128 bytes, so a fresh one per overwrite was about half of
+what a pipelined `SET` cost the garbage collector; see `putString`, which also
+records why the reused entry's LRU and LFU counters are reset rather than carried
+over.
 
 ### End-to-end throughput: shardkv against a real Redis
 
@@ -2693,7 +2705,10 @@ was the higher of the two in **37 of the 50** pipelined comparisons (10 cases ×
 repetitions) — for a fair coin that is p≈0.0007 — with medians of 52.9 ms against Redis's
 18.9 ms at c=128 SET and 119.3 ms against 73.2 ms at c=512 SET, bolded above. A garbage
 collector and a goroutine scheduler cost tail latency that a single-threaded C event loop
-does not pay, and no amount of sharding addresses it.
+does not pay, and no amount of sharding addresses it. Which of those two it was is a
+testable question rather than a rhetorical one, and it was subsequently tested: it is the
+collector, and the per-command allocation behind it has since been cut by half. See "The
+pipelined tail: tested, then attacked" below — the tables here predate that work.
 
 The same count on the *unpipelined* sweep is 27 of 50, i.e. nothing. So this is specifically
 a pipelining effect: it appears when many requests are in flight per connection and
@@ -2735,6 +2750,91 @@ contended machine. Neither is a throughput claim.
 **What is not established** is any throughput magnitude, and — at c=128 and c=512 — not even
 its sign. Nothing in the ratio columns above should be quoted.
 
+#### The pipelined tail: tested, then attacked
+
+The p99 loss above was attributed to "a garbage collector and a goroutine scheduler". That
+was a hypothesis, and the tables above do not distinguish the two. It has since been tested
+directly, and then acted on.
+
+**The test.** Run one pipelined load twice against the same binary — once with the collector
+at its default pacing, once with `debug.SetGCPercent(-1)` — and compare the distributions. If
+the tail is collector cost, turning the collector off has to collapse it. At 32 connections,
+16 deep, 768k `SET`s per run, five paired repetitions:
+
+| | p50 | p99 | p99.9 | collections | total STW pause |
+| --- | --- | --- | --- | --- | --- |
+| GC at default pacing | 0.30–0.37 ms | 36.8–49.2 ms | 94–162 ms | 30–36 per run | 0.47–0.74 s |
+| GC off | 0.31–0.45 ms | **12.3–28.0 ms** | 59–91 ms | 0 | 0 |
+
+The p99 was lower with the collector off in **5 of 5** paired repetitions, at 0.25–0.66x, and
+throughput was higher in 5 of 5. The mechanism is visible in the last two columns: ~35
+collections in a ~3-second run, and a stop-the-world total of half a second. (Those pauses
+are themselves inflated by the host — stopping the world means waiting for every P to be
+scheduled, and this host is oversubscribed fortyfold. That makes the *size* of the effect
+specific to a contended machine, not the direction of it.) **So the tail is allocation-driven,
+and the p50 is not: the median moved by nothing.**
+
+**What was done about it.** Per-command allocation on the wire path, measured with
+`-benchmem` over a real socket at `-P 16` (`internal/server/pipeline_bench_test.go`):
+
+| command | before | after |
+| --- | --- | --- |
+| `SET key:N xxx` | 12 allocs, 283 B | **5 allocs, 126 B** |
+| `GET key:N` | 8 allocs, 91 B | **4 allocs, 67 B** |
+| `INCRBY key:N 0` | 11 allocs, 259 B | **4 allocs, 112 B** |
+| `SMEMBERS key:N` (8 members) | 15 allocs, 272 B | **3 allocs, 192 B** |
+| `LRANGE key:N 0 -1` (8 elements) | 19 allocs, 368 B | **11 allocs, 329 B** |
+
+Five changes, in descending order of effect.
+
+- **The request parse.** A frame that is already buffered is walked in place and its payloads
+  copied into one exactly-sized block, instead of one `bufio.ReadBytes` buffer per line, one
+  `strconv.Atoi` string per header and one buffer per argument: 8 allocations to 2 for a
+  `SET`. See `readBufferedCommand`, and the two tests that keep its slower sibling honest.
+- **The entry.** A `SET` or `INCR` over a key that already holds a string overwrites the
+  entry it found rather than allocating a fresh ~128-byte one, which is what every
+  collection write in the store already did. See `putString`.
+- **String elements.** A reply element the store hands back as a Go string — a set member, a
+  hash field, a key from `KEYS`, a sorted-set member — used to be converted to `[]byte` to be
+  written, and that conversion allocates, once per element. `resp.WriteBulkString` writes the
+  string directly; that is the whole of the `SMEMBERS` row above, and it applies to every
+  such reply on the server including `INFO`, `CLIENT LIST` and `XINFO`.
+- **Integer encoding.** Integer replies, bulk-length headers and array counts format into a
+  scratch buffer on the writer instead of through `strconv.FormatInt`, which allocates for
+  any value of 100 or more — so a `GET` of a 4 KB value no longer allocates in order to
+  write "4096".
+- **`INCR`'s result** is formatted with `AppendInt` onto one buffer rather than into a string
+  that is then copied into one.
+
+The `LRANGE` row is the floor, and shows what is left: its remaining 11 allocations are the
+request's two plus one copy per element, because a list's elements are byte slices that the
+store must copy out while it holds the shard lock. Handing a caller the buffer itself would
+be free and wrong.
+
+What that bought, twelve paired repetitions of the same load, alternating which binary ran
+first:
+
+| | before | after | paired |
+| --- | --- | --- | --- |
+| collections per run | 36 | **22** | lower in 12 of 12 |
+| total STW pause | 521 ms | **402 ms** | lower in 10 of 12 |
+| p90 per batch | 1.33 ms | **1.05 ms** | lower in 9 of 12 |
+| p99 per batch | 39.5 ms | **28.5 ms** | lower in 9 of 12 |
+
+Medians, and the same caveat as everywhere else on this page applies to the last three rows:
+they are wall-clock on a host at load average 280, which is why the count of paired wins is
+reported beside each. The first row is not wall-clock — a collection count for a fixed
+workload is decided by bytes allocated, so 12 of 12 at -39% is the load-independent result,
+and the allocation table above it is exact.
+
+**What was deliberately not done.** The argument slices are not pooled and must not be: a
+write's `[][]byte` is handed to the AOF and to every connected replica's feed channel and
+read by another goroutine *after* the command has returned, so reusing one would corrupt the
+replication stream and the log rather than the next command — silently, and only on a server
+that had a replica or persistence attached. `toArgs` in `client.go` carries the same warning
+for the same reason. Nor do parsed arguments alias the reader's buffer, which would be free
+and is the same bug wearing a different hat.
+
 #### Reproduce
 
 ```bash
@@ -2742,6 +2842,13 @@ make bench-vs-redis                            # what produced the tables above 
 MULT=4 SUITES=sweep make bench-vs-redis        # 4x longer measurements (~45 min; no help here)
 SUITES="sweep pipelined" make bench-vs-redis   # just the two sweeps
 make bench-vs-redis-quick                      # SCALE=20: checks plumbing, measures nothing
+```
+
+The allocation figures in the tail-latency section come from Go benchmarks instead, and need
+no containers or quiet host:
+
+```bash
+make bench-alloc   # per command over a socket at -P 16, and the codec on its own
 ```
 
 Output lands in `test/bench/.results/`: `raw.tsv` (one row per repetition, so the pairing

@@ -10,14 +10,12 @@ import "time"
 // clock.
 func (s *Store) SetDeadline(key string, val []byte, deadline time.Time) {
 	now := s.clock()
-	e := &entry{kind: kindString, str: copyBytes(val), expireAt: deadline}
-	s.touch(e, now)
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
 	defer s.settle(sh, key, charged)
-	sh.data[key] = e
+	s.putString(sh, key, val, deadline, now)
 }
 
 // SetNX sets key to val only if it does not already exist. Reports whether it
@@ -87,9 +85,7 @@ func (s *Store) GetSet(key string, val []byte) (old []byte, oldOK bool, err erro
 		old = copyBytes(e.str)
 		oldOK = true
 	}
-	ne := &entry{kind: kindString, str: copyBytes(val)}
-	s.touch(ne, now)
-	sh.data[key] = ne
+	s.putString(sh, key, val, time.Time{}, now)
 	return old, oldOK, nil
 }
 

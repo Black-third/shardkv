@@ -236,6 +236,6 @@ func collectionScan(s *Server, w *resp.Writer, args [][]byte, f scanFlags,
 // command shares.
 func writeScanReply(w *resp.Writer, next uint64, items []string) {
 	w.WriteArrayHeader(2)
-	w.WriteBulk([]byte(strconv.FormatUint(next, 10)))
+	w.WriteBulkString(strconv.FormatUint(next, 10))
 	writeStrings(w, items)
 }

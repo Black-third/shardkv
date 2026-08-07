@@ -129,7 +129,7 @@ func cmdHKeys(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 	w.WriteArrayHeader(len(fields))
 	for _, f := range fields {
-		w.WriteBulk([]byte(f))
+		w.WriteBulkString(f)
 	}
 	return false
 }
@@ -241,7 +241,7 @@ func cmdHIncrByFloat(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 		writeStoreErr(w, err)
 		return nil
 	}
-	w.WriteBulk([]byte(val))
+	w.WriteBulkString(val)
 	return [][][]byte{{[]byte("HSET"), args[1], args[2], []byte(val)}}
 }
 

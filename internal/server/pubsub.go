@@ -52,7 +52,7 @@ func writeSubscriberPong(w *resp.Writer, args [][]byte) {
 	w.BeginPush()
 	defer w.EndPush()
 	w.WritePushHeader(2)
-	w.WriteBulk([]byte("pong"))
+	w.WriteBulkString("pong")
 	if len(args) > 1 {
 		w.WriteBulk(args[1])
 		return
@@ -323,7 +323,7 @@ func writeSubscribeReply(w *resp.Writer, kind string, name []byte, total int) {
 	w.BeginPush()
 	defer w.EndPush()
 	w.WritePushHeader(3)
-	w.WriteBulk([]byte(kind))
+	w.WriteBulkString(kind)
 	w.WriteBulk(name)
 	w.WriteInt(int64(total))
 }

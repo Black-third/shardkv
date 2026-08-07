@@ -8,8 +8,16 @@ import (
 )
 
 // FuzzReadCommand checks that the request parser never panics on arbitrary
-// input, and that any command it successfully parses round-trips: re-encoding
-// the parsed arguments and parsing them again yields the same arguments.
+// input, that any command it successfully parses round-trips -- re-encoding
+// the parsed arguments and parsing them again yields the same arguments -- and
+// that ReadCommand's two paths agree.
+//
+// The last of those is why the same input is parsed twice here. A frame that is
+// entirely buffered is walked in place; one that is still arriving is parsed a
+// line at a time, and feeding the bytes one at a time is what forces the second
+// path (the buffer is empty every time ReadCommand is entered). Two pieces of
+// code over one grammar is the drift risk this project's notes warn about, so
+// the fuzzer is pointed at the difference rather than only at the parse.
 func FuzzReadCommand(f *testing.F) {
 	seeds := []string{
 		"*1\r\n$4\r\nPING\r\n",
@@ -28,6 +36,28 @@ func FuzzReadCommand(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		r := NewReader(bytes.NewReader(data))
 		args, err := r.ReadCommand() // must never panic
+
+		slow := NewReader(&byteAtATimeReader{s: string(data)})
+		slowArgs, slowErr := slow.ReadCommand()
+		if (err == nil) != (slowErr == nil) ||
+			(err != nil && slowErr != nil && err.Error() != slowErr.Error()) {
+			t.Fatalf("buffered parse of %q gave (%q, %v), streamed gave (%q, %v)",
+				data, args, err, slowArgs, slowErr)
+		}
+		if err == nil {
+			if len(args) != len(slowArgs) {
+				t.Fatalf("buffered parse of %q gave %d arguments, streamed gave %d",
+					data, len(args), len(slowArgs))
+			}
+			for i := range args {
+				if !bytes.Equal(args[i], slowArgs[i]) {
+					t.Fatalf("argument %d of %q: %q buffered, %q streamed", i, data, args[i], slowArgs[i])
+				}
+			}
+			if r.Consumed() != slow.Consumed() {
+				t.Fatalf("%q consumed %d bytes buffered and %d streamed", data, r.Consumed(), slow.Consumed())
+			}
+		}
 		if err != nil {
 			return
 		}

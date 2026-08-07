@@ -154,19 +154,19 @@ func cmdHello(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 		// RESP3: a map, with proto and id as integers rather than strings -- the shape
 		// real Redis sends, which is what a RESP3 client library validates.
 		w.WriteMapHeader(7)
-		w.WriteBulk([]byte("server"))
-		w.WriteBulk([]byte("shardkv"))
-		w.WriteBulk([]byte("version"))
-		w.WriteBulk([]byte(Version))
-		w.WriteBulk([]byte("proto"))
+		w.WriteBulkString("server")
+		w.WriteBulkString("shardkv")
+		w.WriteBulkString("version")
+		w.WriteBulkString(Version)
+		w.WriteBulkString("proto")
 		w.WriteInt(int64(proto))
-		w.WriteBulk([]byte("id"))
+		w.WriteBulkString("id")
 		w.WriteInt(sess.id)
-		w.WriteBulk([]byte("mode"))
-		w.WriteBulk([]byte("standalone"))
-		w.WriteBulk([]byte("role"))
-		w.WriteBulk([]byte(role))
-		w.WriteBulk([]byte("modules"))
+		w.WriteBulkString("mode")
+		w.WriteBulkString("standalone")
+		w.WriteBulkString("role")
+		w.WriteBulkString(role)
+		w.WriteBulkString("modules")
 		w.WriteArrayHeader(0)
 		return
 	}
@@ -182,9 +182,9 @@ func cmdHello(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 	}
 	w.WriteArrayHeader(len(fields) + 2)
 	for _, f := range fields {
-		w.WriteBulk([]byte(f))
+		w.WriteBulkString(f)
 	}
-	w.WriteBulk([]byte("modules"))
+	w.WriteBulkString("modules")
 	w.WriteArrayHeader(0)
 }
 
@@ -203,7 +203,7 @@ func cmdClient(s *Server, sess *session, w *resp.Writer, args [][]byte) {
 
 	case "GETNAME":
 		if name := sess.clientName(); name != "" {
-			w.WriteBulk([]byte(name))
+			w.WriteBulkString(name)
 		} else {
 			w.WriteNull() // unnamed is a null bulk string, not an empty one
 		}

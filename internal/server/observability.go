@@ -321,10 +321,10 @@ func writeSlowlog(w *resp.Writer, entries []slowlogEntry) {
 		w.WriteInt(e.durUs)
 		w.WriteArrayHeader(len(e.args))
 		for _, a := range e.args {
-			w.WriteBulk([]byte(a))
+			w.WriteBulkString(a)
 		}
-		w.WriteBulk([]byte(e.addr))
-		w.WriteBulk([]byte(e.name))
+		w.WriteBulkString(e.addr)
+		w.WriteBulkString(e.name)
 	}
 }
 
@@ -453,7 +453,7 @@ func cmdLatency(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteArrayHeader(len(out))
 		for _, l := range out {
 			w.WriteArrayHeader(4)
-			w.WriteBulk([]byte(l.event))
+			w.WriteBulkString(l.event)
 			w.WriteInt(l.secs)
 			w.WriteInt(l.ms)
 			w.WriteInt(l.max)
@@ -519,12 +519,12 @@ func latencyHistogram(w *resp.Writer, names [][]byte) {
 
 	w.WriteMapHeader(len(out))
 	for _, e := range out {
-		w.WriteBulk([]byte(e.name))
+		w.WriteBulkString(e.name)
 		buckets, calls := e.cmd.cumulativeLatency()
 		w.WriteMapHeader(2)
-		w.WriteBulk([]byte("calls"))
+		w.WriteBulkString("calls")
 		w.WriteInt(calls)
-		w.WriteBulk([]byte("histogram_usec"))
+		w.WriteBulkString("histogram_usec")
 		w.WriteMapHeader(len(buckets))
 		for _, b := range buckets {
 			w.WriteInt(b.upperUs)
@@ -1044,23 +1044,23 @@ func (s *Server) memoryStats(w *resp.Writer) {
 	}
 	w.WriteMapHeader(len(fields) + len(dbs) + 4)
 	for _, f := range fields {
-		w.WriteBulk([]byte(f.name))
+		w.WriteBulkString(f.name)
 		w.WriteInt(f.value)
 	}
 	for _, db := range dbs {
-		w.WriteBulk([]byte("db." + strconv.Itoa(db.index)))
+		w.WriteBulkString("db." + strconv.Itoa(db.index))
 		// A nested map: RESP3 writes a map, RESP2 the flat array Redis sends there.
 		w.WriteMapHeader(1)
-		w.WriteBulk([]byte("overhead.hashtable.main"))
+		w.WriteBulkString("overhead.hashtable.main")
 		w.WriteInt(db.fp.Overhead)
 	}
-	w.WriteBulk([]byte("overhead.total"))
+	w.WriteBulkString("overhead.total")
 	w.WriteInt(overheadTotal)
-	w.WriteBulk([]byte("keys.count"))
+	w.WriteBulkString("keys.count")
 	w.WriteInt(keys)
-	w.WriteBulk([]byte("keys.bytes-per-key"))
+	w.WriteBulkString("keys.bytes-per-key")
 	w.WriteInt(bytesPerKey)
-	w.WriteBulk([]byte("dataset.bytes"))
+	w.WriteBulkString("dataset.bytes")
 	w.WriteInt(dataset)
 }
 

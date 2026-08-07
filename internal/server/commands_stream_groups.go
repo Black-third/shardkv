@@ -677,8 +677,8 @@ func cmdXPending(s *Server, w *resp.Writer, args [][]byte) bool {
 	w.WriteArrayHeader(len(rows))
 	for _, r := range rows {
 		w.WriteArrayHeader(4)
-		w.WriteBulk([]byte(r.ID.String()))
-		w.WriteBulk([]byte(r.Consumer))
+		w.WriteBulkString(r.ID.String())
+		w.WriteBulkString(r.Consumer)
 		w.WriteInt(r.ElapsedMs)
 		w.WriteInt(r.DeliveryCount)
 	}
@@ -697,13 +697,13 @@ func writeXPendingSummary(w *resp.Writer, sum store.StreamPendingSummary) {
 		w.WriteNullArray()
 		return
 	}
-	w.WriteBulk([]byte(sum.Min.String()))
-	w.WriteBulk([]byte(sum.Max.String()))
+	w.WriteBulkString(sum.Min.String())
+	w.WriteBulkString(sum.Max.String())
 	w.WriteArrayHeader(len(sum.Consumers))
 	for _, c := range sum.Consumers {
 		w.WriteArrayHeader(2)
-		w.WriteBulk([]byte(c.Name))
-		w.WriteBulk([]byte(strconv.FormatInt(c.Count, 10)))
+		w.WriteBulkString(c.Name)
+		w.WriteBulkString(strconv.FormatInt(c.Count, 10))
 	}
 }
 
@@ -793,7 +793,7 @@ func writeClaimed(w *resp.Writer, claimed []store.XClaimResult, justID bool) {
 	w.WriteArrayHeader(len(claimed))
 	for _, c := range claimed {
 		if justID {
-			w.WriteBulk([]byte(c.Entry.ID.String()))
+			w.WriteBulkString(c.Entry.ID.String())
 			continue
 		}
 		writeStreamEntry(w, c.Entry)
@@ -878,11 +878,11 @@ func cmdXAutoClaim(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	// what tells a caller that a pending entry's data had been deleted, which is
 	// otherwise invisible.
 	w.WriteArrayHeader(3)
-	w.WriteBulk([]byte(cursor.String()))
+	w.WriteBulkString(cursor.String())
 	writeClaimed(w, claimed, justID)
 	w.WriteArrayHeader(len(deleted))
 	for _, id := range deleted {
-		w.WriteBulk([]byte(id.String()))
+		w.WriteBulkString(id.String())
 	}
 	return claimEffect(args[1], group, consumer, claimed, deleted, store.XClaimOptions{})
 }

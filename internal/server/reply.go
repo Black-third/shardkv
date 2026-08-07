@@ -24,7 +24,7 @@ import "github.com/Black-third/shardkv/internal/resp"
 func writeSet(w *resp.Writer, items []string) {
 	w.WriteSetHeader(len(items))
 	for _, it := range items {
-		w.WriteBulk([]byte(it))
+		w.WriteBulkString(it)
 	}
 }
 
@@ -36,7 +36,7 @@ func writeMapStrings(w *resp.Writer, flat []string) {
 	n := len(flat) / 2
 	w.WriteMapHeader(n)
 	for i := 0; i < n*2; i++ {
-		w.WriteBulk([]byte(flat[i]))
+		w.WriteBulkString(flat[i])
 	}
 }
 

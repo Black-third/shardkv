@@ -442,3 +442,143 @@ func TestProtocolErrorTextOnlyForProtocolErrors(t *testing.T) {
 		t.Errorf("expected-bulk detail = %q", got)
 	}
 }
+
+// byteAtATimeReader hands out one byte per Read, which keeps the reader's buffer empty
+// whenever ReadCommand is entered and so forces the streamed parse path. It is the control
+// TestBufferedAndStreamedParsesAgree needs: without it, a test that supplies its input from
+// a strings.Reader exercises the buffered path only, and the two would be free to disagree.
+type byteAtATimeReader struct {
+	s   string
+	off int
+}
+
+func (r *byteAtATimeReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.s) {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p[0] = r.s[r.off]
+	r.off++
+	return 1, nil
+}
+
+// TestBufferedAndStreamedParsesAgree is what keeps ReadCommand's two paths one parser.
+//
+// A frame that is entirely buffered is walked in place and copied into a single block; one
+// that is still arriving is parsed a line at a time. That is two pieces of code over one
+// grammar, which is the arrangement this project's notes warn about everywhere else -- so it
+// is pinned rather than trusted: every case below is parsed both ways and must produce the
+// same arguments, the same error and the same consumed-byte count. The byte count matters as
+// much as the arguments, because a replica's replication offset is derived from it.
+func TestBufferedAndStreamedParsesAgree(t *testing.T) {
+	cases := []string{
+		"*1\r\n$4\r\nPING\r\n",
+		"*3\r\n$3\r\nSET\r\n$9\r\nkey:12345\r\n$3\r\nxxx\r\n",
+		"*2\r\n$3\r\nGET\r\n$0\r\n\r\n", // an empty argument
+		"*3\r\n$4\r\nMSET\r\n$1\r\na\r\n$300\r\n" + strings.Repeat("v", 300) + "\r\n",
+		"PING hello\r\n",                 // inline
+		"  \r\nPING\r\n",                 // separators only, then a command
+		"\r\n\r\n*1\r\n$4\r\nPING\r\n",   // blank lines first
+		"*-1\r\n*1\r\n$4\r\nPING\r\n",    // the legacy null multibulk
+		"*0\r\n*1\r\n$4\r\nPING\r\n",     // an empty command
+		"*abc\r\n",                       // an unparseable count
+		"*1\r\nfoo\r\n",                  // an element header that is not $
+		"*1\r\n$-5\r\n",                  // a negative bulk length
+		"*1\r\n$9223372036854775806\r\n", // a length that would overflow
+		"*2000000000\r\n",                // beyond MaxMultiBulk
+		"*1\r\n$3\r\nab\r\n",             // a payload shorter than its header
+		"*2\r\n$3\r\nGET\r\n",            // truncated: fewer elements than promised
+		"$5\r\nhello\r\n",                // a reply, not a request
+		"*1\r\n$2\r\n\r\r\n",             // a payload of bare CRs
+	}
+	for _, in := range cases {
+		fast := NewReader(strings.NewReader(in))
+		fastArgs, fastErr := fast.ReadCommand()
+		slow := NewReader(&byteAtATimeReader{s: in})
+		slowArgs, slowErr := slow.ReadCommand()
+
+		if (fastErr == nil) != (slowErr == nil) || (fastErr != nil && fastErr.Error() != slowErr.Error()) {
+			t.Errorf("%q: buffered err = %v, streamed err = %v", in, fastErr, slowErr)
+			continue
+		}
+		if len(fastArgs) != len(slowArgs) {
+			t.Errorf("%q: buffered parsed %d arguments, streamed parsed %d", in, len(fastArgs), len(slowArgs))
+			continue
+		}
+		for i := range fastArgs {
+			if !bytes.Equal(fastArgs[i], slowArgs[i]) {
+				t.Errorf("%q: argument %d = %q buffered, %q streamed", in, i, fastArgs[i], slowArgs[i])
+			}
+			// An argument's capacity is clamped to its length, so appending to one cannot
+			// reach into the argument beside it in the shared block. Only the multibulk path
+			// shares a block; an inline command's arguments are each built by append and are
+			// each their own allocation, so their spare capacity belongs to nobody else.
+			if strings.HasPrefix(in, "*") && cap(fastArgs[i]) != len(fastArgs[i]) {
+				t.Errorf("%q: argument %d has capacity %d for length %d; an append would "+
+					"overwrite the next argument", in, i, cap(fastArgs[i]), len(fastArgs[i]))
+			}
+		}
+		if fast.Consumed() != slow.Consumed() {
+			t.Errorf("%q: buffered consumed %d bytes, streamed consumed %d -- a replica's "+
+				"replication offset is this number", in, fast.Consumed(), slow.Consumed())
+		}
+	}
+}
+
+// TestParseCountMatchesAtoi pins the header-number parser against the strconv.Atoi it
+// replaced, since the whole point of it is to be the same function without the allocation.
+// The one intended difference -- a value too large for an int is refused rather than clamped
+// -- is asserted separately, because it is a decision and not an accident.
+func TestParseCountMatchesAtoi(t *testing.T) {
+	for _, in := range []string{
+		"0", "1", "3", "99", "100", "1024", "-1", "-10", "+3", "007",
+		"", "-", "+", "abc", "1a", "a1", "1 ", " 1", "1.0", "1_0", "--1", "\x00",
+		strconv.Itoa(MaxMultiBulk), strconv.Itoa(MaxBulkLen), "9223372036854775807",
+	} {
+		want, wantErr := strconv.Atoi(in)
+		got, ok := parseCount([]byte(in))
+		if (wantErr == nil) != ok {
+			t.Errorf("parseCount(%q) ok = %v; strconv.Atoi says %v", in, ok, wantErr == nil)
+			continue
+		}
+		if ok && got != want {
+			t.Errorf("parseCount(%q) = %d; strconv.Atoi = %d", in, got, want)
+		}
+	}
+	// Out of range, where the difference is deliberate: Atoi returns the clamped value with
+	// an error, this refuses outright. Every caller treats the error as fatal, and Redis's
+	// own string2ll refuses these too.
+	for _, in := range []string{"9223372036854775808", "-9223372036854775809", "99999999999999999999"} {
+		if _, ok := parseCount([]byte(in)); ok {
+			t.Errorf("parseCount(%q) accepted a value too large for an int", in)
+		}
+	}
+}
+
+// TestReadCommandDoesNotRetainTheReaderBuffer is the hazard readLine's borrowed slice
+// introduces: a parsed argument must be a copy, so that reading the *next* command cannot
+// change the previous one's arguments under a caller still holding them. A write command's
+// arguments are handed to the AOF and to every replica's feed and read after the command
+// returns, so an argument that aliased the reader's buffer would corrupt the replication
+// stream rather than merely confuse a handler.
+func TestReadCommandDoesNotRetainTheReaderBuffer(t *testing.T) {
+	// Two commands in one buffer, so the second parse reuses the bytes the first was read
+	// from.
+	in := "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$3\r\nfoo\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\nbar\r\n"
+	r := NewReader(strings.NewReader(in))
+	first, err := r.ReadCommand()
+	if err != nil {
+		t.Fatalf("first ReadCommand: %v", err)
+	}
+	kept := make([][]byte, len(first))
+	copy(kept, first)
+	if _, err := r.ReadCommand(); err != nil {
+		t.Fatalf("second ReadCommand: %v", err)
+	}
+	if got := string(kept[2]); got != "foo" {
+		t.Errorf("the first command's value became %q after the second was parsed; "+
+			"arguments must not alias the reader's buffer", got)
+	}
+}

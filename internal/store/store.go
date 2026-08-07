@@ -759,15 +759,15 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration) {
 	if ttl > 0 {
 		expireAt = now.Add(ttl)
 	}
-	e := &entry{kind: kindString, str: copyBytes(value), expireAt: expireAt}
-	s.touch(e, now)
-
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
 	defer s.settle(sh, key, charged)
-	sh.data[key] = e
+	// The value is copied under the lock rather than before it, which is where
+	// SetWithOptions -- the path an actual SET command takes -- has always copied it. See
+	// putString for why the entry is reused when there is one to reuse.
+	s.putString(sh, key, value, expireAt, now)
 }
 
 // Incr atomically adds delta to the integer string at key and returns the
@@ -802,9 +802,11 @@ func (s *Store) Incr(key string, delta int64) (int64, error) {
 		return 0, ErrOverflow
 	}
 	n += delta
-	ne := &entry{kind: kindString, str: []byte(strconv.FormatInt(n, 10)), expireAt: expireAt}
-	s.touch(ne, now)
-	sh.data[key] = ne
+	// AppendInt onto a nil slice rather than []byte(FormatInt(...)): the latter allocates
+	// the digits as a string and then copies them into a second allocation, and INCR is one
+	// of the commands the vs-redis benchmark measures. The buffer is this function's own, so
+	// putOwnedString can adopt it without a further copy.
+	s.putOwnedString(sh, key, strconv.AppendInt(nil, n, 10), strWholeValue, expireAt, now)
 	return n, nil
 }
 

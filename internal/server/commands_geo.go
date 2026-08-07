@@ -198,7 +198,7 @@ func cmdGeoDist(s *Server, w *resp.Writer, args [][]byte) bool {
 	d := geoDistance(lons[0], lats[0], lons[1], lats[1]) / unit
 	// Four decimal places, as Redis formats it -- a tenth of a millimetre in metres,
 	// which is far below the model's own error and so is where Redis stops.
-	w.WriteBulk([]byte(strconv.FormatFloat(d, 'f', 4, 64)))
+	w.WriteBulkString(strconv.FormatFloat(d, 'f', 4, 64))
 	return false
 }
 
@@ -217,7 +217,7 @@ func cmdGeoHash(s *Server, w *resp.Writer, args [][]byte) bool {
 			w.WriteNull()
 			continue
 		}
-		w.WriteBulk([]byte(geoHashString(lons[i], lats[i])))
+		w.WriteBulkString(geoHashString(lons[i], lats[i]))
 	}
 	return false
 }
@@ -502,7 +502,7 @@ func writeGeoResults(w *resp.Writer, results []geoResult, o geoSearchOpts) {
 	w.WriteArrayHeader(len(results))
 	for _, r := range results {
 		if !withAny {
-			w.WriteBulk([]byte(r.member))
+			w.WriteBulkString(r.member)
 			continue
 		}
 		n := 1
@@ -516,9 +516,9 @@ func writeGeoResults(w *resp.Writer, results []geoResult, o geoSearchOpts) {
 			n++
 		}
 		w.WriteArrayHeader(n)
-		w.WriteBulk([]byte(r.member))
+		w.WriteBulkString(r.member)
 		if o.withDist {
-			w.WriteBulk([]byte(strconv.FormatFloat(r.dist, 'f', 4, 64)))
+			w.WriteBulkString(strconv.FormatFloat(r.dist, 'f', 4, 64))
 		}
 		if o.withHash {
 			// The raw 52-bit score as an integer, which is what a client uses to do its own

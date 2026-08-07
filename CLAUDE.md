@@ -17,6 +17,8 @@ internal/store     sharded store, typed values, skip-list sorted set, LRU evicti
                    hyperloglog.go (Redis's HYLL format: sparse/dense, murmur64a, tau/sigma)
                    memory.go (the per-key footprint estimate MEMORY USAGE reports)
 internal/resp      RESP protocol reader/writer (+ fuzz target)
+                   resp.go has two request parsers over one grammar: a buffered frame is
+                   walked in place, anything else is read a line at a time. See invariant 16
 internal/server    TCP server, command table + handlers, transactions, replication
                    limits.go (maxclients, the idle reaper, the dirty-change counter)
                    commands_sort.go (SORT/SORT_RO: the data-dependent key set)
@@ -52,9 +54,10 @@ Break one of these and the failure is silent divergence between a master, its
 replicas, and its AOF — not a crash. Every one of them has tests; if you change
 this area, read them first.
 
-The last two are the exceptions to that framing: 14 costs a client a hang and 15 costs the
-whole process a panic. They are here because both were *reached from a client* with no
-special privilege, and because both look like ordinary arithmetic until they are not.
+Three are exceptions to that framing: 14 costs a client a hang and 15 costs the whole
+process a panic. They are here because both were *reached from a client* with no special
+privilege, and because both look like ordinary arithmetic until they are not. And 16 is
+about performance work, which is where the temptation to break invariant 1 comes from.
 
 1. **Writes are totally ordered when propagation is active.** A write holds
    `propMu` across *both* the store mutation and the propagation, so the order
@@ -328,6 +331,31 @@ special privilege, and because both look like ordinary arithmetic until they are
 
     The general rule: an operand that is about to be negated, or added to a length, is
     checked for overflow *before* the arithmetic, not after.
+
+16. **A command's argument slice outlives the command, so it is never pooled and never
+    aliases the reader's buffer.** `shipReplicas` hands the `[][]byte` to each replica's feed
+    channel and the AOF, and another goroutine reads it *after* the handler has returned.
+    Reusing that memory would therefore not corrupt the next command -- it would corrupt the
+    replication stream and the log, silently, and only on a server that has a replica or
+    persistence attached. `toArgs` in `client.go` refuses the same optimization for the same
+    reason, and says so where someone would try it.
+
+    That is the boundary the allocation work has to stay inside, and there is plenty of room
+    inside it: a pipelined `SET` went from 12 allocations and 283 bytes to 5 and 126 without
+    touching it (README, "The pipelined tail"). What made the difference was allocating
+    *fresh* memory more cheaply -- one exactly-sized block for a whole command's payloads
+    instead of a buffer per line, per header and per argument; overwriting a string entry in
+    place instead of allocating a new one; writing a string reply element without converting
+    it to `[]byte` first. What is measured is `allocs/op` and `bytes/op`, because those
+    reproduce on a loaded machine and wall-clock latency does not, and because the tail this
+    is about is paced by bytes: the collector runs 39% less often for the same workload.
+
+    Two rules follow for anything on that path. A `[]byte` handed to the store or to a reply
+    writer must have its capacity clamped to its length (`b[:n:n]`) if it shares a block with
+    another argument, or an `append` reaches into its neighbour. And `readLine` returns a
+    slice into the reader's own buffer, valid only until the next read -- callers finish with
+    it or copy out of it immediately, and `TestReadCommandDoesNotRetainTheReaderBuffer` is
+    what keeps that from quietly becoming an aliased argument.
 
 ## Adding a command
 

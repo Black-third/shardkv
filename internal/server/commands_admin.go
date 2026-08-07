@@ -78,8 +78,8 @@ func cmdPing(s *Server, w *resp.Writer, args [][]byte) bool {
 func cmdTime(s *Server, w *resp.Writer, args [][]byte) bool {
 	now := s.store.Now()
 	w.WriteArrayHeader(2)
-	w.WriteBulk([]byte(strconv.FormatInt(now.Unix(), 10)))
-	w.WriteBulk([]byte(strconv.FormatInt(int64(now.Nanosecond()/1000), 10)))
+	w.WriteBulkString(strconv.FormatInt(now.Unix(), 10))
+	w.WriteBulkString(strconv.FormatInt(int64(now.Nanosecond()/1000), 10))
 	return false
 }
 
@@ -135,11 +135,11 @@ func cmdFunction(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteArrayHeader(0)
 	case "STATS":
 		w.WriteMapHeader(3)
-		w.WriteBulk([]byte("running_script"))
+		w.WriteBulkString("running_script")
 		w.WriteNull()
-		w.WriteBulk([]byte("engines"))
+		w.WriteBulkString("engines")
 		w.WriteMapHeader(0)
-		w.WriteBulk([]byte("cluster_enabled"))
+		w.WriteBulkString("cluster_enabled")
 		w.WriteInt(boolToInt64(s.ClusterEnabled()))
 	case "DUMP":
 		w.WriteBulk(nil)
@@ -707,7 +707,7 @@ func writeCommandInfos(w *resp.Writer, names []string) {
 		}
 		first, last, step := commandKeyRange(name, cmd)
 		w.WriteArrayHeader(6)
-		w.WriteBulk([]byte(cmd.lowerName))
+		w.WriteBulkString(cmd.lowerName)
 		w.WriteInt(int64(cmd.arity))
 		flags := commandFlags(cmd)
 		w.WriteArrayHeader(len(flags))
@@ -734,7 +734,7 @@ func writeCommandDocs(w *resp.Writer, names []string) {
 	w.WriteMapHeader(len(present))
 	for _, name := range present {
 		cmd := commandTable[name]
-		w.WriteBulk([]byte(cmd.lowerName))
+		w.WriteBulkString(cmd.lowerName)
 		// Only fields COMMAND DOCS actually defines, all string-valued.
 		//
 		// This previously emitted "arity" here, which belongs to COMMAND INFO, not DOCS --
@@ -744,12 +744,12 @@ func writeCommandDocs(w *resp.Writer, names []string) {
 		// application's first command. Every field of DOCS is optional, so reporting fewer
 		// honest ones is correct where inventing structure is not.
 		w.WriteMapHeader(3)
-		w.WriteBulk([]byte("summary"))
-		w.WriteBulk([]byte(commandSummary(cmd)))
-		w.WriteBulk([]byte("since"))
-		w.WriteBulk([]byte(commandSince(cmd)))
-		w.WriteBulk([]byte("group"))
-		w.WriteBulk([]byte(commandGroup(name)))
+		w.WriteBulkString("summary")
+		w.WriteBulkString(commandSummary(cmd))
+		w.WriteBulkString("since")
+		w.WriteBulkString(commandSince(cmd))
+		w.WriteBulkString("group")
+		w.WriteBulkString(commandGroup(name))
 	}
 }
 

@@ -208,7 +208,7 @@ func blockingZPop(fromMin bool) blockFunc {
 			m := popped[0]
 			w.WriteArrayHeader(3)
 			w.WriteBulk(k)
-			w.WriteBulk([]byte(m.Member))
+			w.WriteBulkString(m.Member)
 			w.WriteDouble(m.Score)
 			return [][][]byte{{[]byte("ZREM"), k, []byte(m.Member)}}, false
 		}
@@ -367,7 +367,7 @@ func zsetMPop(s *Server, w *resp.Writer, args [][]byte, start int) ([][][]byte, 
 		w.WriteArrayHeader(len(popped))
 		for _, m := range popped {
 			w.WriteArrayHeader(2)
-			w.WriteBulk([]byte(m.Member))
+			w.WriteBulkString(m.Member)
 			w.WriteDouble(m.Score)
 		}
 		return [][][]byte{zremEffect(k, popped)}, false

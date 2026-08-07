@@ -516,9 +516,20 @@ func TestBlockingCommandDoesNotDeadlockInProcess(t *testing.T) {
 	// early push would simply be taken by the pop's own opportunistic first attempt --
 	// which is a pass, not a failure, so retrying makes the test prove the wakeup rather
 	// than the race.
+	//
+	// It goes through pusher and not through db, which is the whole point of pusher
+	// existing: DB embeds its default *Client, and one Client serializes its callers exactly
+	// as one connection does, so db.Int here would queue behind the db.Strings above and
+	// wait out the blocked BLPOP's full five seconds. That made the test a coin flip on
+	// whether the runtime scheduled the pushing goroutine before the popping one -- it
+	// passed when the push won the race and the pop's opportunistic first attempt found the
+	// element already there, which is the one path this half of the test is not about, and
+	// it failed outright (~1 run in 40, both with and without -race) when the pop won. The
+	// wakeup is what is being tested, so the push has to come from a client that is not the
+	// blocked one.
 	deadline := time.After(5 * time.Second)
 	for {
-		if _, err := db.Int("RPUSH", "queue", "job"); err != nil {
+		if _, err := pusher.Int("RPUSH", "queue", "job"); err != nil {
 			t.Fatalf("RPUSH: %v", err)
 		}
 		select {

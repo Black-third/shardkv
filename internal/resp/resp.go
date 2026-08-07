@@ -41,6 +41,7 @@ package resp
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
 	"math"
@@ -185,7 +186,153 @@ func (r *Reader) WaitReadable() error {
 
 // ReadCommand reads one command and returns its arguments. The first element is
 // the command name. It returns io.EOF when the client disconnects.
+//
+// # Two paths over one grammar
+//
+// A command whose bytes are *all* already in the reader's buffer is parsed by
+// readBufferedCommand, which walks the frame in place and copies every payload into a
+// single allocation of exactly the right size. Anything else -- a frame still arriving, an
+// inline command, an argument larger than the buffer, any malformed request -- is parsed by
+// readStreamedCommand, which blocks for the bytes it needs as it goes.
+//
+// The fast path exists for pipelining specifically, which is the shape this server was
+// measured slowest in relative to Redis: 37 of 50 paired `-P 16` comparisons had the worse
+// p99, against 27 of 50 with no pipelining, i.e. nothing (see the README's benchmark
+// section). Pipelining amortises away the syscall pair, so what is left per command is the
+// parse, the dispatch and the garbage they produce -- and a garbage collector's cost lands
+// in the tail rather than the median, which is the shape of that loss. Parsing one
+// `SET key:12345 xxx` cost 8 allocations and 128 bytes before this path existed and costs 2
+// and 88 with it (BenchmarkReadCommandSet), because the per-line buffers, the per-header
+// number strings and the per-argument payload buffers all collapse into one block.
+//
+// Two parsers over one grammar is the risk this arrangement takes, and it is the risk this
+// project's notes warn about in every other form ("two tables drift"). Three things contain
+// it:
+//
+//   - The fast path never *decides* anything unusual. Every count it does not like, every
+//     header that is not a "$", every frame that is not complete makes it fall through, so
+//     the streamed path stays the only code that rejects a request or names an error.
+//   - TestBufferedAndStreamedParsesAgree parses the same bytes both ways -- the second time
+//     through a reader that yields one byte at a time, which keeps the buffer empty and so
+//     forces the streamed path -- and requires identical arguments, identical errors and an
+//     identical Consumed() count. The byte count matters as much as the arguments, because a
+//     replica's replication offset is derived from it.
+//   - FuzzReadCommand does the same for arbitrary input, so a divergence nobody thought to
+//     write a case for is still a failure.
 func (r *Reader) ReadCommand() ([][]byte, error) {
+	if args, ok := r.readBufferedCommand(); ok {
+		return args, nil
+	}
+	if r.r.Buffered() == 0 {
+		// Nothing buffered at all: block for the first byte and try the in-place parse
+		// again. One fill brings whatever the client's last write put on the socket, so
+		// without this retry the in-place path would be reached only *behind* another
+		// command -- the first command of every pipelined batch would take the streamed
+		// path, and a client that does not pipeline at all would never reach the fast path
+		// once. Peek consumes nothing, so the streamed path below can still read the same
+		// bytes if the frame turns out to be incomplete.
+		if _, err := r.r.Peek(1); err != nil {
+			return nil, err
+		}
+		if args, ok := r.readBufferedCommand(); ok {
+			return args, nil
+		}
+	}
+	return r.readStreamedCommand()
+}
+
+// readBufferedCommand parses one complete multibulk frame out of the bytes already
+// buffered, reporting ok=false -- having consumed nothing -- when it will not handle what
+// it finds. See ReadCommand for why that is the only answer it gives to anything unusual.
+func (r *Reader) readBufferedCommand() ([][]byte, bool) {
+	buffered := r.r.Buffered()
+	if buffered == 0 {
+		return nil, false
+	}
+	// Peek of no more than what is buffered cannot read, and cannot fail.
+	frame, err := r.r.Peek(buffered)
+	if err != nil || len(frame) == 0 || frame[0] != '*' {
+		return nil, false // an inline command, or a blank line
+	}
+	hdr, pos, ok := nextLine(frame, 0)
+	if !ok {
+		return nil, false
+	}
+	n, ok := parseCount(hdr[1:])
+	if !ok || n <= 0 || n > MaxMultiBulk {
+		return nil, false // the streamed path owns every count worth reacting to
+	}
+
+	// Two walks rather than one, because the first has to establish the total payload size
+	// before a block can be allocated to hold it, and remembering the spans between the
+	// walks would need the very allocation this is avoiding. Both walks are over bytes that
+	// are already in cache and, for the command shapes a client actually sends, a few dozen
+	// of them.
+	total, end := 0, pos
+	for i := 0; i < n; i++ {
+		length, next, ok := bulkSpan(frame, end)
+		if !ok {
+			return nil, false
+		}
+		total += length
+		end = next
+	}
+
+	// One block for every payload, sized exactly, with each argument's capacity clamped to
+	// its own length: a handler or a store method that appends to an argument must reallocate
+	// rather than write over the argument next to it.
+	blk := make([]byte, total)
+	args := make([][]byte, 0, n)
+	off := 0
+	for i := 0; i < n; i++ {
+		length, next, _ := bulkSpan(frame, pos)
+		start := next - 2 - length // the payload sits just before its CRLF
+		copy(blk[off:], frame[start:start+length])
+		args = append(args, blk[off:off+length:off+length])
+		off += length
+		pos = next
+	}
+
+	// Discard cannot fail here: end bytes are buffered, which is what the walk established.
+	r.r.Discard(end) //nolint:errcheck
+	r.n += int64(end)
+	return args, true
+}
+
+// nextLine returns the CRLF-terminated line beginning at off, trimmed the way readLine
+// trims it, and the offset just past its terminator.
+func nextLine(frame []byte, off int) (line []byte, next int, ok bool) {
+	i := bytes.IndexByte(frame[off:], '\n')
+	if i < 0 {
+		return nil, 0, false
+	}
+	return trimCRLF(frame[off : off+i+1]), off + i + 1, true
+}
+
+// bulkSpan reads one "$<len>\r\n<payload>\r\n" element beginning at off, returning the
+// payload length and the offset just past the element. It reports ok=false when the element
+// is incomplete or is not a well-formed bulk string, which sends the whole frame to the
+// streamed path.
+func bulkSpan(frame []byte, off int) (length, next int, ok bool) {
+	hdr, after, ok := nextLine(frame, off)
+	if !ok || len(hdr) == 0 || hdr[0] != '$' {
+		return 0, 0, false
+	}
+	length, ok = parseCount(hdr[1:])
+	if !ok || length < 0 || length > MaxBulkLen {
+		return 0, 0, false
+	}
+	next = after + length + 2 // payload plus its trailing CRLF
+	if next > len(frame) {
+		return 0, 0, false // the payload has not all arrived
+	}
+	return length, next, true
+}
+
+// readStreamedCommand parses a command whose bytes are not all buffered yet, blocking for
+// the rest as it goes. It is also the authority on every request the buffered path declines
+// to interpret, which is why every rejection lives here.
+func (r *Reader) readStreamedCommand() ([][]byte, error) {
 	line, err := r.readLine()
 	if err != nil {
 		return nil, err
@@ -207,8 +354,8 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 		return args, nil
 	}
 
-	n, err := strconv.Atoi(string(line[1:]))
-	if err != nil || n > MaxMultiBulk {
+	n, ok := parseCount(line[1:])
+	if !ok || n > MaxMultiBulk {
 		return nil, ErrInvalidMultibulk
 	}
 	if n <= 0 {
@@ -231,8 +378,10 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 		if hdr[0] != '$' {
 			return nil, &expectedBulkError{got: hdr[0]}
 		}
-		length, err := strconv.Atoi(string(hdr[1:]))
-		if err != nil || length < 0 || length > MaxBulkLen {
+		// Parsed before the ReadFull below, and it has to be: hdr points into the reader's
+		// own buffer, which that read overwrites. See readLine.
+		length, ok := parseCount(hdr[1:])
+		if !ok || length < 0 || length > MaxBulkLen {
 			return nil, ErrInvalidBulk
 		}
 		buf := make([]byte, length+2) // payload + trailing CRLF
@@ -240,10 +389,54 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 			return nil, err
 		}
 		r.n += int64(len(buf))
-		args = append(args, buf[:length])
+		args = append(args, buf[:length:length])
 	}
 	return args, nil
 }
+
+// parseCount reads the decimal number in a "*<n>" or "$<n>" header without the string
+// allocation strconv.Atoi's argument would cost -- Atoi puts the text it was given into the
+// error it may return, so the conversion escapes and cannot stay on the stack. Two of these
+// are on the path of every GET and four on every SET, which is why it is worth a function.
+//
+// It accepts exactly what Atoi accepts (an optional sign, then at least one digit, and
+// nothing else) with one deliberate difference: a value too large for an int is refused
+// rather than clamped. Atoi returns the clamped value *and* an error, and every caller here
+// treats the error as fatal, so the only reachable difference is which error a caller that
+// tolerates negatives would report -- and Redis rejects an over-long count too (its
+// string2ll fails), so this is the closer answer as well as the simpler one.
+func parseCount(b []byte) (int, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	i, neg := 0, false
+	if b[0] == '+' || b[0] == '-' {
+		neg = b[0] == '-'
+		i = 1
+	}
+	if i == len(b) {
+		return 0, false // a sign and no digits
+	}
+	v := 0
+	for ; i < len(b); i++ {
+		d := int(b[i] - '0')
+		if d < 0 || d > 9 {
+			return 0, false
+		}
+		if v > (maxInt-d)/10 {
+			return 0, false
+		}
+		v = v*10 + d
+	}
+	if neg {
+		return -v, true
+	}
+	return v, true
+}
+
+// maxInt is the largest value an int holds on this platform, which is what parseCount
+// compares against so it overflows exactly where strconv.Atoi does.
+const maxInt = int(^uint(0) >> 1)
 
 // ReadStatus reads a single-line reply and returns its payload. A simple string
 // yields its text; an error reply is returned as a Go error carrying the server's
@@ -294,8 +487,8 @@ func (r *Reader) ReadBulk() ([]byte, error) {
 	default:
 		return nil, ErrProtocol
 	}
-	n, err := strconv.Atoi(string(line[1:]))
-	if err != nil || n < -1 || n > MaxBulkLen {
+	n, ok := parseCount(line[1:])
+	if !ok || n < -1 || n > MaxBulkLen {
 		return nil, ErrProtocol
 	}
 	if n < 0 {
@@ -309,13 +502,41 @@ func (r *Reader) ReadBulk() ([]byte, error) {
 	return buf[:n], nil
 }
 
+// readLine returns the next CRLF-terminated line with its terminator trimmed.
+//
+// The returned slice points into the reader's own buffer and is only valid until the next
+// read on r. That is what makes it free -- a bufio.ReadBytes allocates and copies a fresh
+// buffer for every line, which on a `*3\r\n$3\r\n...` request is four allocations before a
+// single payload byte has been looked at, and those four were 28% of the objects allocated
+// on the whole pipelined SET path (measured with -memprofilerate=1). Every caller either
+// finishes with the line before it reads again (both command parsers) or copies out of it
+// immediately (splitInline, ReadStatus, ReadBulk); none may retain or append to it.
+//
+// A line longer than the buffer is the one case that must copy, since there is nowhere else
+// for it to live. That is an inline command or a reply header, never a bulk payload.
 func (r *Reader) readLine() ([]byte, error) {
-	line, err := r.r.ReadBytes('\n')
+	line, err := r.r.ReadSlice('\n')
 	r.n += int64(len(line)) // counted even on error: those bytes are gone from the stream
-	if err != nil {
+	if err == nil {
+		return trimCRLF(line), nil
+	}
+	if err != bufio.ErrBufferFull {
 		return nil, err
 	}
-	return trimCRLF(line), nil
+	// Longer than the buffer: accumulate the fragments, which is what ReadBytes does for
+	// every line whether it needs to or not.
+	buf := append([]byte(nil), line...)
+	for {
+		line, err = r.r.ReadSlice('\n')
+		r.n += int64(len(line))
+		buf = append(buf, line...)
+		if err == nil {
+			return trimCRLF(buf), nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
+	}
 }
 
 func trimCRLF(b []byte) []byte {
@@ -477,6 +698,20 @@ type Writer struct {
 	// counter before and after running a command and compares. Like proto it is touched
 	// only by the connection's own goroutine.
 	errs int64
+	// num is the scratch every integer this writer emits is formatted into: a length
+	// header, an integer reply, an array count.
+	//
+	// It is here rather than being a local because strconv.FormatInt allocates for any
+	// value it cannot answer from its small-integer table (0..99), and every one of those
+	// allocations is on the path of an ordinary reply -- the length header of any value of
+	// 100 bytes or more, the count of an array of 100 elements or more, every INCR result
+	// past 99, every TTL in milliseconds. A local array would not help: it is handed to
+	// bufio.Write, whose parameter escapes, so the compiler would heap-allocate it per call.
+	//
+	// A field is safe on exactly the terms errs and pushDepth already are: this writer's
+	// methods are serialized, by the connection's own goroutine outside Pub/Sub and by the
+	// session's writer lock once a pump exists. The scratch never outlives one method call.
+	num [24]byte // an int64 is at most 20 characters with its sign
 }
 
 func NewWriter(w io.Writer) *Writer {
@@ -584,9 +819,14 @@ func (w *Writer) WriteError(s string) error {
 // WriteInt writes an integer reply: :<n>\r\n
 func (w *Writer) WriteInt(n int64) error {
 	w.w.WriteByte(':')
-	w.w.WriteString(strconv.FormatInt(n, 10))
+	w.writeDigits(n)
 	_, err := w.w.WriteString("\r\n")
 	return err
+}
+
+// writeDigits writes n in base 10 with no allocation. See the num field.
+func (w *Writer) writeDigits(n int64) {
+	w.w.Write(strconv.AppendInt(w.num[:0], n, 10)) //nolint:errcheck
 }
 
 // WriteBulk writes a bulk string. A nil slice is encoded as the null bulk
@@ -596,9 +836,26 @@ func (w *Writer) WriteBulk(b []byte) error {
 		return w.WriteNull()
 	}
 	w.w.WriteByte('$')
-	w.w.WriteString(strconv.Itoa(len(b)))
+	w.writeDigits(int64(len(b)))
 	w.w.WriteString("\r\n")
 	w.w.Write(b)
+	_, err := w.w.WriteString("\r\n")
+	return err
+}
+
+// WriteBulkString writes a bulk string from a string, without the []byte conversion
+// WriteBulk's caller would otherwise have to make.
+//
+// That conversion is not free: bufio.Write's argument escapes, so `WriteBulk([]byte(s))`
+// copies s onto the heap for the length of one reply. This one hands the string straight to
+// WriteString. It is deliberately a separate method rather than a change to WriteBulk's
+// signature, because nil is meaningful there -- a nil []byte is the null bulk string, and a
+// string cannot be nil, so a caller with a genuinely absent value must still say WriteNull.
+func (w *Writer) WriteBulkString(s string) error {
+	w.w.WriteByte('$')
+	w.writeDigits(int64(len(s)))
+	w.w.WriteString("\r\n")
+	w.w.WriteString(s)
 	_, err := w.w.WriteString("\r\n")
 	return err
 }
@@ -688,7 +945,7 @@ func (w *Writer) WriteAttributeHeader(n int) {
 
 func (w *Writer) writeLen(prefix byte, n int) {
 	w.w.WriteByte(prefix)
-	w.w.WriteString(strconv.Itoa(n))
+	w.writeDigits(int64(n))
 	w.w.WriteString("\r\n")
 }
 
@@ -715,7 +972,7 @@ func (w *Writer) WriteBool(b bool) {
 func (w *Writer) WriteDouble(f float64) {
 	s := FormatDouble(f)
 	if w.proto < ProtoRESP3 {
-		w.WriteBulk([]byte(s))
+		w.WriteBulkString(s)
 		return
 	}
 	w.w.WriteByte(',')
@@ -744,7 +1001,7 @@ func (w *Writer) WriteDouble(f float64) {
 // the same reason WriteBigNumber does not.
 func (w *Writer) WriteDoubleText(text string) {
 	if w.proto < ProtoRESP3 {
-		w.WriteBulk([]byte(text))
+		w.WriteBulkString(text)
 		return
 	}
 	w.w.WriteByte(',')
@@ -759,7 +1016,7 @@ func (w *Writer) WriteDoubleText(text string) {
 // holds in that form.
 func (w *Writer) WriteBigNumber(digits string) {
 	if w.proto < ProtoRESP3 {
-		w.WriteBulk([]byte(digits))
+		w.WriteBulkString(digits)
 		return
 	}
 	w.w.WriteByte('(')
@@ -780,7 +1037,7 @@ func (w *Writer) WriteVerbatim(format string, payload []byte) {
 		return
 	}
 	w.w.WriteByte('=')
-	w.w.WriteString(strconv.Itoa(len(format) + 1 + len(payload)))
+	w.writeDigits(int64(len(format) + 1 + len(payload)))
 	w.w.WriteString("\r\n")
 	w.w.WriteString(format)
 	w.w.WriteByte(':')

@@ -123,7 +123,7 @@ func cmdSPop(s *Server, w *resp.Writer, args [][]byte) [][][]byte {
 	case single && len(members) == 0:
 		w.WriteNull() // no key: a bare SPOP replies with a null, not an empty array
 	case single:
-		w.WriteBulk([]byte(members[0]))
+		w.WriteBulkString(members[0])
 	case !exists:
 		w.WriteSetHeader(0) // SPOP with a count on a missing key is an empty set
 	default:
@@ -160,7 +160,7 @@ func cmdSRandMember(s *Server, w *resp.Writer, args [][]byte) bool {
 			w.WriteNull()
 			return false
 		}
-		w.WriteBulk([]byte(members[0]))
+		w.WriteBulkString(members[0])
 		return false
 	}
 	count, errMsg := parseRandomCount(args[2], false)
@@ -291,6 +291,6 @@ func byteStrings(args [][]byte) []string {
 func writeStrings(w *resp.Writer, items []string) {
 	w.WriteArrayHeader(len(items))
 	for _, it := range items {
-		w.WriteBulk([]byte(it))
+		w.WriteBulkString(it)
 	}
 }

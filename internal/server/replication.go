@@ -73,8 +73,8 @@ func cmdRole(s *Server, w *resp.Writer, args [][]byte) bool {
 			host, port = h, p
 		}
 		w.WriteArrayHeader(5)
-		w.WriteBulk([]byte("slave"))
-		w.WriteBulk([]byte(host))
+		w.WriteBulkString("slave")
+		w.WriteBulkString(host)
 		p, _ := strconv.Atoi(port)
 		w.WriteInt(int64(p))
 		// Redis reports one of "none", "connect", "connecting", "sync" or "connected". This
@@ -84,14 +84,14 @@ func cmdRole(s *Server, w *resp.Writer, args [][]byte) bool {
 		if linkUp {
 			state = "connected"
 		}
-		w.WriteBulk([]byte(state))
+		w.WriteBulkString(state)
 		w.WriteInt(slaveOffset)
 		return false
 	}
 
 	sort.Slice(replicas, func(i, j int) bool { return replicas[i].port < replicas[j].port })
 	w.WriteArrayHeader(3)
-	w.WriteBulk([]byte("master"))
+	w.WriteBulkString("master")
 	w.WriteInt(offset)
 	w.WriteArrayHeader(len(replicas))
 	for _, rc := range replicas {
@@ -100,9 +100,9 @@ func cmdRole(s *Server, w *resp.Writer, args [][]byte) bool {
 			host = h
 		}
 		w.WriteArrayHeader(3)
-		w.WriteBulk([]byte(host))
-		w.WriteBulk([]byte(rc.port))
-		w.WriteBulk([]byte(strconv.FormatInt(rc.ack.Load(), 10)))
+		w.WriteBulkString(host)
+		w.WriteBulkString(rc.port)
+		w.WriteBulkString(strconv.FormatInt(rc.ack.Load(), 10))
 	}
 	return false
 }

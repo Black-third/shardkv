@@ -36,6 +36,11 @@ fuzz: ## Fuzz the RESP parser for $(FUZZTIME).
 bench: ## Run the store benchmarks with allocation counts.
 	$(GO) test -bench=. -benchmem ./internal/store
 
+.PHONY: bench-alloc
+bench-alloc: ## Per-command allocation on the wire path, pipelined 16 deep, and the codec alone.
+	$(GO) test -run='^$$' -bench=Pipelined -benchmem ./internal/server
+	$(GO) test -run='^$$' -bench='ReadCommand|WriteReply' -benchmem ./internal/resp
+
 .PHONY: bench-vs-redis
 bench-vs-redis: ## End-to-end throughput/latency vs a real Redis (docker; reports its own variance).
 	./test/bench/vs-redis.sh

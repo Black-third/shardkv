@@ -304,7 +304,7 @@ func cmdRandomKey(s *Server, w *resp.Writer, args [][]byte) bool {
 		w.WriteNull()
 		return false
 	}
-	w.WriteBulk([]byte(k))
+	w.WriteBulkString(k)
 	return false
 }
 
@@ -371,7 +371,7 @@ func cmdObject(s *Server, w *resp.Writer, args [][]byte) bool {
 			w.WriteNull()
 			return false
 		}
-		w.WriteBulk([]byte(enc))
+		w.WriteBulkString(enc)
 	case "REFCOUNT":
 		raw, ok, err := s.store.GetString(key)
 		if err != nil || !ok {
@@ -515,7 +515,7 @@ func cmdKeys(s *Server, w *resp.Writer, args [][]byte) bool {
 	}
 	w.WriteArrayHeader(len(matched))
 	for _, k := range matched {
-		w.WriteBulk([]byte(k))
+		w.WriteBulkString(k)
 	}
 	return false
 }
