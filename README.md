@@ -2485,11 +2485,15 @@ here is quotable, and the tool exits non-zero saying so.
 
 What did survive, because a paired sign test needs the noise to be common-mode and not
 small: **at 32 connections and above, unpipelined, shardkv's median latency was the lower of
-the two in 29 of 30 paired comparisons — 0.44–0.75x Redis's — and under `-P 16` pipelining
-its p99 was the worse of the two in 37 of 50.** Faster at the median under concurrency,
-worse in the tail under pipelining. Those two sentences are the result; everything else in
-this section is either the evidence for them or the reason the throughput table is not
-evidence for anything.
+the two in 29 of 30 paired comparisons — 0.38–0.72x Redis's, reproduced in a third run on an
+idle host — and under `-P 16` pipelining its p99 was the worse of the two in 37 of 50.**
+Faster at the median under concurrency, worse in the tail under pipelining.
+
+The third run adds the other half of that trade, and it is not flattering: **at 8 connections
+Redis was faster in 5 of 5 repetitions on every operation measured**, p50 0.039 ms against
+0.119 ms. shardkv is slower per operation and better at overlapping them; on this hardware the
+crossover is somewhere between 32 and 128 concurrent clients. One throughput magnitude is
+certifiable — `c=128 GET`, shardkv 1.25x at a ratio CV of 3.7% — and no other.
 
 #### The host these numbers came from
 
@@ -2742,13 +2746,46 @@ one thread can drain it, which is the mechanism the design predicted, and a medi
 statistic least disturbed by a host that stalls everything periodically.
 
 So the defensible summary of the whole exercise is narrower than a throughput table and not
-nothing: **under concurrent unpipelined load shardkv answers a median request in 0.44–0.75x
-the time Redis does (all twelve cell-run pairs at c≥32 fall in that band), and under deep
-pipelining it pays a materially worse p99.** Both survive a paired sign test on a badly
-contended machine. Neither is a throughput claim.
+nothing: **under concurrent unpipelined load shardkv answers a median request in 0.38–0.72x
+the time Redis does, and under deep pipelining it pays a materially worse p99.** Both survive
+a paired sign test. Neither is a throughput claim.
 
-**What is not established** is any throughput magnitude, and — at c=128 and c=512 — not even
-its sign. Nothing in the ratio columns above should be quoted.
+##### A third run, on a host that was actually idle
+
+The two runs above were taken on a machine at load average 276–322, which turned out to be
+partly self-inflicted: leaked CPU spinners from an unrelated experiment were pinning it. A
+third run at load average 9–11 settles several things, and one of them is a correction.
+
+**The p50 result reproduces, a third time, in all six cells at c≥32** — and the margins are
+wider than published, which is why the band above now reads 0.38–0.72x rather than
+0.44–0.75x:
+
+| conns | test | shardkv p50 | redis p50 | ratio |
+| --- | --- | --- | --- | --- |
+| 32 | SET | 0.143 ms | 0.199 ms | 0.72x |
+| 32 | GET | 0.111 ms | 0.199 ms | 0.56x |
+| 128 | SET | 0.303 ms | 0.783 ms | 0.39x |
+| 128 | GET | 0.287 ms | 0.751 ms | 0.38x |
+| 512 | SET | 1.367 ms | 3.327 ms | 0.41x |
+| 512 | GET | 1.263 ms | 3.207 ms | 0.39x |
+
+**One throughput magnitude is now certifiable**, which is one more than before: `sweep c=128
+P=1 GET`, **shardkv 1.25x**, at a ratio CV of 3.7% and unanimous across 5 of 5 paired
+repetitions. `c=512 GET` is also unanimous in shardkv's favour with its magnitude still
+withheld at 13.3%. Everything else in the ratio columns remains unquotable — an idle load
+average is not enough on macOS, where both servers run inside a VM and, in this run, shared a
+Docker daemon with 11 other containers.
+
+**And the per-operation path is slower, unanimously.** This is the clearest new result and it
+is not in shardkv's favour: at 8 connections Redis was faster in 5 of 5 repetitions on *every*
+collection operation measured — `INCR`, `LPUSH`, `LPOP`, `SADD`, `HSET` — and on `SET`/`GET`
+in the sweep, with p50 0.039 ms against 0.119 ms. Also `ZADD` at c=128. A single-threaded C
+server with a hand-tuned object model beats this one per operation by roughly 3x, and the
+crossover where concurrency pays for that deficit sits nearer **c=128** than the c=32 implied
+above: at c=32 the direction is genuinely split on throughput even though the p50 is not.
+
+The honest shape of it: shardkv is slower per operation and better at overlapping operations.
+On this hardware that trade starts paying somewhere between 32 and 128 concurrent clients.
 
 #### The pipelined tail: tested, then attacked
 
