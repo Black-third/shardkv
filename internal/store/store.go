@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"math/rand"
 	"slices"
 	"strconv"
 	"sync"
@@ -150,24 +149,59 @@ type entry struct {
 	stream    *stream
 	expireAt  time.Time    // zero means the key never expires
 	atime     atomic.Int64 // last-access time (unix nanos) for LRU eviction
+
+	// elemBytes is the maintained payload size of a hash or a set -- both bare Go maps
+	// with no wrapper that could carry the count -- and the last measured payload size
+	// of a stream. The list and sorted-set types keep their own (deque.bytes,
+	// zset.bytes) and a string's is its buffer's capacity. It is guarded by the shard's
+	// write lock, like the value it describes. See memtrack.go.
+	elemBytes int64
+
+	// freq is the LFU access counter and the minute it was last decayed, packed as
+	// Redis packs them. Atomic for the same reason atime is: it is written from the read
+	// path, which holds only the shard's shared lock. See evict.go.
+	freq atomic.Uint32
 }
 
 func (e *entry) expired(now time.Time) bool {
 	return !e.expireAt.IsZero() && !now.Before(e.expireAt)
 }
 
-// touch records a key's access time for LRU eviction. It is a no-op when
-// eviction is disabled, so the default (unbounded) configuration keeps the read
-// path free of the extra atomic write.
+// touch records what the eviction sampler needs to rank this key: an access instant
+// under an LRU policy, or a decaying access counter under an LFU one.
+//
+// It is one atomic load and a branch when nothing is configured to evict, which is the
+// default: no cap, no byte budget, so nothing would ever read the value and the read path
+// does not pay to write it. That gate is refreshTracking's job, so that "which of the
+// three settings is in force" is decided when one of them changes rather than on every
+// read.
 func (s *Store) touch(e *entry, now time.Time) {
-	if s.maxKeys.Load() > 0 {
+	switch accessTracking(s.access.Load()) {
+	case trackAccessTime:
 		e.atime.Store(now.UnixNano())
+	case trackFrequency:
+		e.freq.Store(lfuAccess(e.freq.Load(), lfuMinute(now),
+			s.lfuDecayTime.Load(), s.lfuLogFactor.Load()))
 	}
 }
 
 type shard struct {
 	mu   sync.RWMutex
 	data map[string]*entry
+
+	// mem is the sum of entryCharge over this shard's entries, guarded by mu. It is a
+	// plain integer because every path that changes it already holds the write lock, and
+	// it exists so one shard can be reconciled against the store's total while the other
+	// shards keep taking writes. See memtrack.go.
+	mem int64
+
+	// volatile is how many of this shard's entries carry a deadline, maintained by the
+	// same settle that maintains mem. It exists for the eviction sampler: a volatile-*
+	// policy may only evict a key with a TTL, and without a count it could not tell "this
+	// shard has no candidates" from "I did not sample far enough" -- so it would refuse
+	// writes while candidates existed, or scan hopeless shards forever looking for them.
+	// See shard.pickVictim.
+	volatile int
 }
 
 // Store is a sharded data store safe for concurrent use by many goroutines.
@@ -178,6 +212,36 @@ type Store struct {
 
 	maxKeys atomic.Int64 // 0 = unbounded; else the approximate live-key cap (global)
 	evicted atomic.Int64
+
+	// memTrack gates the whole byte accounting. While it is false, every mutation pays one
+	// atomic load and nothing else -- no map lookup, no arithmetic, no counter -- which is
+	// what keeps the default configuration (no byte budget, nobody asking) exactly as fast
+	// as it was before any of this existed. It is raised by SetMaxMemory or by the first
+	// reader of UsedMemory, either of which also derives the totals from the dataset so the
+	// counter never starts from a partial history. See Store.TrackMemory.
+	memTrack atomic.Bool
+
+	// mem is the running byte total behind used_memory and the maxmemory budget: the sum
+	// of every shard's mem. It is a single atomic rather than 256 integers summed on
+	// demand because of which side is hot -- the total is read before every write once a
+	// budget is configured, where summing the shards would be 256 loads per command,
+	// against one uncontended atomic add per mutation on a path that has already taken a
+	// mutex. See memtrack.go for what it counts.
+	mem atomic.Int64
+
+	// The eviction configuration. maxMemory is the server-wide byte budget as this
+	// database was told it (see SetMaxMemory for why every database holds the same copy),
+	// policy is Redis's maxmemory-policy and policySet whether anything chose it
+	// explicitly. evictSamples is Redis's maxmemory-samples, and lfuLogFactor /
+	// lfuDecayTime its lfu-log-factor / lfu-decay-time. access caches what the read path
+	// must record under all of that, so touch decides with one atomic load. See evict.go.
+	maxMemory    atomic.Int64
+	policy       atomic.Int32
+	policySet    atomic.Bool
+	evictSamples atomic.Int64
+	lfuLogFactor atomic.Int64
+	lfuDecayTime atomic.Int64
+	access       atomic.Int32
 
 	// activeExpire gates the janitor's expiry sweep. It defaults to on; see
 	// SetActiveExpire for why anything would turn it off.
@@ -220,6 +284,9 @@ func New(numShards int) *Store {
 	}
 	s.activeExpire.Store(true)
 	s.encoding.reset()
+	s.evictSamples.Store(EvictionSamples)
+	s.lfuLogFactor.Store(defaultLFULogFactor)
+	s.lfuDecayTime.Store(defaultLFUDecayTime)
 	return s
 }
 
@@ -231,6 +298,7 @@ func (s *Store) SetMaxKeys(maxKeys int) {
 		maxKeys = 0
 	}
 	s.maxKeys.Store(int64(maxKeys))
+	s.refreshTracking()
 }
 
 // MaxKeys reports the configured eviction cap (0 = unbounded), for CONFIG GET.
@@ -395,28 +463,43 @@ func copyBytes(b []byte) []byte {
 	return out
 }
 
-// EvictionSamples is how many keys the eviction sampler looks at in the shard it picked
-// before choosing the least recently used of them. It is Redis's maxmemory-samples: the
-// same "approximated LRU" trade-off, where a larger sample is a better choice for more
-// work. CONFIG GET reports it under that name, so the number a client reads is the number
-// the sampler actually uses rather than Redis's default of 5.
+// EvictionSamples is the default sample size: how many keys the eviction sampler looks
+// at in the shard it picked before choosing the best victim among them. It is Redis's
+// maxmemory-samples, the same "approximated LRU" trade-off where a larger sample is a
+// better choice for more work, and it is settable at runtime -- see
+// Store.SetEvictionSamples, and note that CONFIG GET must report what the sampler
+// actually uses rather than a constant.
+//
+// The default is 16 rather than Redis's 5 because a sample here is drawn from one shard
+// rather than from one global table, so it sees 1/256th of the keyspace and a wider
+// sample buys back some of that narrowness.
 const EvictionSamples = 16
 
-// EvictToLimit removes approximate-LRU keys until the store is within maxKeys.
-// It is invoked by the janitor; it locks one shard at a time (never two at
-// once), so it composes safely with concurrent operations.
+// EvictToLimit removes keys until the store is within maxKeys. It is invoked by the
+// janitor; it locks one shard at a time (never two at once), so it composes safely with
+// concurrent operations.
 //
 // The excess is measured with approxLen rather than Len: the janitor calls this
 // on every tick, and an O(live keys) scan per tick is a real cost on a large
 // store, whereas the cap is documented as approximate anyway.
+//
+// The key cap is a separate mechanism from the byte budget, and it evicts under its own
+// terms: it uses the configured policy's victim selection when that policy evicts at all,
+// and approximate LRU when the policy is noeviction. A cap is an instruction to bound the
+// keyspace, so answering it with OOM errors -- which is what noeviction means for
+// maxmemory -- would silently retire a documented feature.
 func (s *Store) EvictToLimit() {
 	maxKeys := int(s.maxKeys.Load())
 	if maxKeys <= 0 {
 		return
 	}
+	policy := s.EvictionPolicy()
+	if !policy.Evicts() {
+		policy = PolicyAllKeysLRU
+	}
 	excess := s.approxLen() - maxKeys
 	for i := 0; i < excess; i++ {
-		if !s.evictOneLRU() {
+		if !s.EvictOne(policy) {
 			break
 		}
 	}
@@ -437,38 +520,6 @@ func (s *Store) approxLen() int {
 	return total
 }
 
-// evictOneLRU removes a single key: it picks a random non-empty shard, samples
-// up to 16 of its keys, and evicts the one with the oldest access time. Sampling
-// is Redis's approach to approximate LRU without maintaining a global ordering.
-func (s *Store) evictOneLRU() bool {
-	for try := 0; try < 2*len(s.shards); try++ {
-		sh := s.shards[rand.Intn(len(s.shards))]
-		sh.mu.Lock()
-		if len(sh.data) == 0 {
-			sh.mu.Unlock()
-			continue
-		}
-		var victim string
-		var oldest int64 = math.MaxInt64
-		sampled := 0
-		for k, e := range sh.data {
-			if a := e.atime.Load(); a < oldest {
-				oldest = a
-				victim = k
-			}
-			if sampled++; sampled >= EvictionSamples {
-				break
-			}
-		}
-		delete(sh.data, victim)
-		sh.mu.Unlock()
-		s.evicted.Add(1)
-		s.notifyRemoved(victim, true) // eviction: outside the shard lock
-		return true
-	}
-	return false
-}
-
 // --- generic key operations (any type) ---------------------------------------
 
 // Del removes key and reports whether a live key was actually removed.
@@ -484,6 +535,7 @@ func (s *Store) Del(key string) bool {
 	e, found := sh.data[key]
 	if found {
 		delete(sh.data, key)
+		s.uncharge(sh, key, e)
 	}
 	sh.mu.Unlock()
 
@@ -648,6 +700,9 @@ func (s *Store) FlushAll() {
 	for _, sh := range s.shards {
 		sh.mu.Lock()
 		sh.data = make(map[string]*entry)
+		s.mem.Add(-sh.mem)
+		sh.mem = 0
+		sh.volatile = 0
 		sh.mu.Unlock()
 	}
 }
@@ -709,8 +764,10 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration) {
 
 	sh := s.getShard(key)
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
+	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	sh.data[key] = e
-	sh.mu.Unlock()
 }
 
 // Incr atomically adds delta to the integer string at key and returns the
@@ -720,7 +777,9 @@ func (s *Store) Incr(key string, delta int64) (int64, error) {
 	now := s.clock()
 
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
@@ -754,6 +813,7 @@ func (s *Store) dropIfExpired(sh *shard, key string) {
 	removed := false
 	if e, ok := sh.data[key]; ok && e.expired(s.clock()) {
 		delete(sh.data, key)
+		s.uncharge(sh, key, e)
 		removed = true
 	}
 	sh.mu.Unlock()
@@ -775,9 +835,12 @@ func (s *Store) Janitor(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if s.activeExpire.Load() {
-				s.sweep()
-			}
+			// One walk, two jobs: reclaim what has expired (unless the sweep is turned
+			// off) and refresh the byte accounting for the values this package cannot
+			// track incrementally. They share the walk because both are O(live keys) over
+			// exactly the same entries, and doing them separately would double a cost the
+			// janitor pays on every tick.
+			s.maintain(s.activeExpire.Load())
 			s.EvictToLimit()
 		}
 	}
@@ -797,16 +860,54 @@ func (s *Store) SetActiveExpire(on bool) { s.activeExpire.Store(on) }
 // ActiveExpire reports whether the janitor's sweep is enabled.
 func (s *Store) ActiveExpire() bool { return s.activeExpire.Load() }
 
-func (s *Store) sweep() {
+func (s *Store) sweep() { s.maintain(true) }
+
+// maintain walks every shard once. When expire is set it removes the entries whose
+// deadline has passed, uncharging each from the byte accounting; either way it refreshes
+// the measured payload of every value whose size the mutation paths in this package
+// cannot maintain themselves.
+//
+// That second job is the stream type and only the stream type: its mutations live in
+// stream.go, so a stream's payload is re-measured here instead of at the moment it
+// changes. The consequence is bounded and stated: used_memory lags a stream-only write
+// burst by at most one sweep interval and converges exactly, where every other type is
+// exact at every instant.
+//
+// The shard's total is then re-derived from the per-entry charges rather than adjusted by
+// a delta. It costs one addition per entry on a walk that was already O(live keys), and
+// it is what makes the pass self-healing at the map level too: a stream key created or
+// deleted by a path that does not report it is corrected here, not carried forever.
+func (s *Store) maintain(expire bool) {
 	now := s.clock()
+	tracking := s.memTrack.Load()
 	var removed []string
 	for _, sh := range s.shards {
 		sh.mu.Lock()
+		var total int64
+		volatile := 0
 		for k, e := range sh.data {
-			if e.expired(now) {
+			if expire && e.expired(now) {
 				delete(sh.data, k)
 				removed = append(removed, k)
+				continue
 			}
+			if !tracking {
+				continue // nothing is counting, so there is nothing to reconcile
+			}
+			if e.kind == kindStream {
+				e.elemBytes = e.stream.memorySize()
+			}
+			total += entryCharge(k, e)
+			if !e.expireAt.IsZero() {
+				volatile++
+			}
+		}
+		if tracking {
+			if d := total - sh.mem; d != 0 {
+				sh.mem = total
+				s.mem.Add(d)
+			}
+			sh.volatile = volatile
 		}
 		sh.mu.Unlock()
 	}

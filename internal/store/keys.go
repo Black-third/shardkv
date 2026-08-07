@@ -37,7 +37,9 @@ func (s *Store) ExpireAtCond(key string, deadline time.Time, cond ExpireCond) bo
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -120,7 +122,7 @@ func (s *Store) Copy(src, dst string, replace bool) (bool, error) {
 	}
 	now := s.clock()
 	unlock := s.lockKeys(src, dst)
-	defer unlock()
+	defer s.trackedKeys(unlock, src, dst)()
 
 	ssh, dsh := s.getShard(src), s.getShard(dst)
 	e := ssh.liveEntry(src, now)
@@ -145,7 +147,7 @@ func (s *Store) Copy(src, dst string, replace bool) (bool, error) {
 func (s *Store) RenameNX(src, dst string) (renamed, srcFound bool) {
 	now := s.clock()
 	unlock := s.lockKeys(src, dst)
-	defer unlock()
+	defer s.trackedKeys(unlock, src, dst)()
 
 	ssh, dsh := s.getShard(src), s.getShard(dst)
 	e := ssh.liveEntry(src, now)
@@ -347,12 +349,15 @@ func (e *entry) clone() *entry {
 	case kindHash:
 		ne.dict = make(map[string][]byte, len(e.dict))
 		for f, v := range e.dict {
-			ne.dict[f] = copyBytes(v)
+			// Through hashPut, not a raw map write: the copy's buffers have their own
+			// capacities, so the clone's byte count has to be built from them rather
+			// than copied from the original's.
+			hashPut(ne, f, copyBytes(v))
 		}
 	case kindSet:
 		ne.set = make(map[string]struct{}, len(e.set))
 		for m := range e.set {
-			ne.set[m] = struct{}{}
+			setPut(ne, m)
 		}
 	case kindZSet:
 		ne.zset = newZSet()

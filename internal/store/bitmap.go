@@ -91,7 +91,9 @@ func (s *Store) SetBit(key string, offset int64, on bool) (old int, changed bool
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, created, err := s.stringForWrite(sh, key, now)
 	if err != nil {
@@ -329,7 +331,7 @@ func (s *Store) BitOp(op BitOpKind, dst string, srcs []string) (int, error) {
 	keys = append(keys, dst)
 	keys = append(keys, srcs...)
 	unlock := s.lockKeys(keys...)
-	defer unlock()
+	defer s.trackedKeys(unlock, dst)()
 
 	now := s.clock()
 	values := make([][]byte, 0, len(srcs))
@@ -485,7 +487,9 @@ func (s *Store) BitField(key string, ops []BitFieldOp) (results []BitFieldResult
 	}
 
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	e, created, err := s.stringForWrite(sh, key, now)
 	if err != nil {
 		return nil, false, err

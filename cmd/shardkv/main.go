@@ -8,6 +8,7 @@
 //	        [-cluster-announce-ip host] [-cluster-announce-port n]
 //	        [-aof dump.aof] [-aofsync everysec|always|no]
 //	        [-aof-rewrite-min-size bytes] [-aof-rewrite-percentage n]
+//	        [-snapshot dump.skv] [-save "<seconds> <changes> ..."]
 //	        [-replicaof host:port] [-repl-backlog-size bytes]
 //	        [-requirepass secret] [-masterauth secret]
 //	        [-tls-cert f] [-tls-key f] [-tls-ca f] [-tls-replication]
@@ -72,6 +73,11 @@ func run() error {
 		"smallest AOF size that may trigger an automatic rewrite, in bytes")
 	aofRewritePerc := flag.Int("aof-rewrite-percentage", 100,
 		"growth over the size after the last rewrite that triggers one (0 disables)")
+	snapPath := flag.String("snapshot", "",
+		"point-in-time snapshot file for SAVE/BGSAVE (empty disables it; not an RDB file)")
+	saveSpec := flag.String("save", "3600 1 300 100 60 10000",
+		"automatic snapshot schedule as <seconds> <changes> pairs (empty disables it; "+
+			"requires -snapshot)")
 	slowlogSlower := flag.Int64("slowlog-log-slower-than", 10000,
 		"microseconds a command must take to be recorded in the slow log (negative disables, 0 logs all)")
 	slowlogMaxLen := flag.Int64("slowlog-max-len", 128, "how many entries the slow log retains")
@@ -92,6 +98,19 @@ func run() error {
 		"address other nodes and redirected clients should use (empty = 127.0.0.1)")
 	clusterAnnouncePort := flag.Int("cluster-announce-port", 0,
 		"port other nodes and redirected clients should use (0 = the listening port)")
+	// The maxmemory family takes strings so a flag accepts exactly what CONFIG SET accepts,
+	// units included, and is refused with the same sentence. The defaults shown here are
+	// descriptions rather than values applied: an unpassed flag is not applied at all (see
+	// below), because -maxmemory-policy's real default is derived from -maxkeys.
+	flag.String("maxmemory", "0",
+		"memory budget for the dataset before eviction begins; a byte count or a size with a "+
+			"unit (100mb, 1gb, 512kb), 0 = unbounded")
+	flag.String("maxmemory-policy", "derived from -maxkeys",
+		"what happens at the budget: noeviction|allkeys-lru|allkeys-lfu|allkeys-random|"+
+			"volatile-lru|volatile-lfu|volatile-random|volatile-ttl")
+	flag.String("maxmemory-samples", "16",
+		"keys the eviction sampler examines before choosing the victim among them (16 rather "+
+			"than Redis's 5: a sample here comes from one shard, so it sees 1/256th of the keyspace)")
 	flag.Parse()
 
 	st := store.New(*shards)
@@ -119,6 +138,27 @@ func run() error {
 	}
 	if err := srv.SetDatabases(*databases); err != nil {
 		return fmt.Errorf("invalid -databases %d: %w", *databases, err)
+	}
+	// The maxmemory family, applied through the same table CONFIG SET uses (Server.ConfigSet)
+	// so a startup flag and a runtime change cannot come to mean different things.
+	//
+	// Only flags the operator actually passed are applied, which is what flag.Visit reports.
+	// A flat default would not be harmless here: -maxmemory-policy's default is *derived*
+	// (see maxmemory.go's evictionPolicy), so a server started with -maxkeys and no policy
+	// evicts by allkeys-lru -- and unconditionally applying a "noeviction" default would turn
+	// eviction off for every existing -maxkeys deployment, silently, on upgrade.
+	//
+	// After SetDatabases, because -maxmemory-samples applies to every database.
+	passed := make(map[string]string)
+	flag.Visit(func(f *flag.Flag) { passed[f.Name] = f.Value.String() })
+	for _, name := range []string{"maxmemory", "maxmemory-policy", "maxmemory-samples"} {
+		value, ok := passed[name]
+		if !ok {
+			continue
+		}
+		if err := srv.ConfigSet(name, value); err != nil {
+			return fmt.Errorf("invalid -%s %q: %w", name, value, err)
+		}
 	}
 	srv.SetRequirePass(*requirePass)
 	srv.SetMasterAuth(*masterAuth)
@@ -153,16 +193,35 @@ func run() error {
 		}
 	}
 
-	// Persistence: replay an existing AOF, then attach the log for new writes.
+	// Snapshots. The path and schedule are configured before anything is loaded, because
+	// LoadSnapshot reads the path from the server and because an invalid schedule should
+	// fail the process before it has touched the dataset.
+	srv.SetSnapshotPath(*snapPath)
+	if !srv.SetSaveSchedule(*saveSpec) {
+		return fmt.Errorf("invalid -save %q: use whitespace-separated <seconds> <changes> pairs "+
+			"(both non-negative), or \"\" to disable", *saveSpec)
+	}
+
+	// Persistence: restore the dataset, then attach the AOF for new writes.
+	//
+	// Precedence when both a snapshot and an AOF exist: the AOF wins, which is Redis's rule
+	// (its loadDataFromDisk loads the AOF when appendonly is on and the RDB only otherwise)
+	// and the right one -- the AOF records every write up to the crash, while the snapshot
+	// records only up to the last save, so the AOF is by construction the more recent of the
+	// two. Loading the snapshot as well would double-apply everything the AOF also holds.
+	//
+	// The one case that is *not* Redis's: an AOF that is configured but empty, next to a
+	// snapshot that is not. Redis starts empty there and the operator loses the dataset by
+	// enabling a durability feature. Here the snapshot is loaded and the AOF is then
+	// rewritten from it immediately, before any client can connect, so the log describes the
+	// whole dataset from its first byte. A failure of that rewrite is fatal: continuing would
+	// leave an AOF that is authoritative on the next restart and describes only part of what
+	// is in memory.
+	fromSnapshot, err := restoreDataset(srv, *aofPath)
+	if err != nil {
+		return err
+	}
 	if *aofPath != "" {
-		cmds, err := aof.Load(*aofPath)
-		if err != nil {
-			return fmt.Errorf("loading AOF: %w", err)
-		}
-		if len(cmds) > 0 {
-			srv.ReplayCommands(cmds)
-			log.Printf("shardkv: replayed %d commands from %s", len(cmds), *aofPath)
-		}
 		policy, ok := aof.ParseSyncPolicy(*aofSync)
 		if !ok {
 			return fmt.Errorf("invalid -aofsync %q: use always, everysec or no", *aofSync)
@@ -180,7 +239,21 @@ func run() error {
 			}
 		}()
 		srv.AttachAOF(logf)
+		if fromSnapshot {
+			// The dataset came from the snapshot, so the log that is now the authority on the
+			// next restart knows nothing about it yet.
+			if err := srv.RewriteAOF(); err != nil {
+				return fmt.Errorf("writing the loaded snapshot into the empty AOF at %s: %w", *aofPath, err)
+			}
+			log.Printf("shardkv: wrote the loaded snapshot into the empty AOF at %s", *aofPath)
+		}
 	}
+
+	// The automatic snapshot schedule, alongside the expiry janitors below and for the same
+	// reason: it is a background pass whose lifetime is the process's, and starting it where
+	// the flag is read keeps "was this asked for" in one place. It is inert -- two atomic
+	// loads a second -- with no snapshot path or an empty schedule.
+	go srv.SnapshotScheduler(ctx)
 
 	// Start background expiration/eviction now that the removal hooks are wired. Each
 	// database is an independent keyspace with its own shards, so each gets its own
@@ -219,4 +292,49 @@ func run() error {
 	}
 
 	return srv.Serve(ctx)
+}
+
+// restoreDataset rebuilds the dataset from whichever of the two records exists, and reports
+// whether it came from the snapshot (in which case the caller has an empty AOF to seed).
+//
+// The precedence, and why: an AOF is a history and a snapshot is a state, so where both hold
+// data the AOF is by construction at least as recent -- it recorded every write up to the
+// crash, while the snapshot stopped at the last save. Redis takes the same view
+// (loadDataFromDisk loads the AOF when appendonly is on and the RDB only otherwise) and
+// applying both would double-apply every write the snapshot already describes: harmless for
+// SET, wrong for RPUSH, LPUSH, SADD's counts, XADD and every other command whose replay is
+// not idempotent.
+//
+// A malformed snapshot fails the process. That is deliberate and it is the opposite of the
+// AOF's behaviour, which stops at a torn record and serves what it read: the AOF's tail is
+// the expected shape of a crash, whereas a snapshot is written to a temporary file and
+// renamed, so it is whole or absent and anything else has been damaged after the fact.
+// Serving part of it would present a subset of the dataset as the whole of it, and the next
+// save would then write that subset over the good copy.
+func restoreDataset(srv *server.Server, aofPath string) (fromSnapshot bool, err error) {
+	if aofPath != "" {
+		cmds, err := aof.Load(aofPath)
+		if err != nil {
+			return false, fmt.Errorf("loading AOF: %w", err)
+		}
+		if len(cmds) > 0 {
+			srv.ReplayCommands(cmds)
+			log.Printf("shardkv: replayed %d commands from %s", len(cmds), aofPath)
+			if srv.SnapshotPath() != "" {
+				log.Printf("shardkv: ignoring the snapshot at %s: the AOF is the more recent record",
+					srv.SnapshotPath())
+			}
+			return false, nil
+		}
+	}
+	keys, savedAt, err := srv.LoadSnapshot()
+	if err != nil {
+		return false, fmt.Errorf("loading snapshot %s: %w", srv.SnapshotPath(), err)
+	}
+	if keys == 0 {
+		return false, nil
+	}
+	log.Printf("shardkv: loaded %d keys from the snapshot at %s, taken %s",
+		keys, srv.SnapshotPath(), savedAt.Format(time.RFC3339))
+	return true, nil
 }

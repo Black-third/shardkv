@@ -3,6 +3,7 @@ package store
 import (
 	"slices"
 	"strconv"
+	"time"
 )
 
 // dumpChunkElems bounds how many collection elements a single command emitted by
@@ -28,20 +29,61 @@ func (s *Store) Dump() [][][]byte {
 
 	for _, sh := range s.shards {
 		sh.mu.RLock()
-		for k, e := range sh.data {
-			if e.expired(now) {
-				continue
-			}
-			key := []byte(k)
-			cmds = appendValueCommands(cmds, key, e)
-			// Preserve the TTL as an absolute deadline so a rewrite/replica seed
-			// does not silently make a volatile key permanent.
-			if !e.expireAt.IsZero() {
-				ms := strconv.FormatInt(e.expireAt.UnixMilli(), 10)
-				cmds = append(cmds, [][]byte{[]byte("PEXPIREAT"), key, []byte(ms)})
-			}
-		}
+		cmds = appendShardCommands(cmds, sh, now)
 		sh.mu.RUnlock()
+	}
+	return cmds
+}
+
+// RLockAll takes every shard's read lock and returns the function that releases them.
+//
+// It is what a point-in-time snapshot spanning several stores needs and Dump cannot give:
+// Dump locks one shard at a time, so a write to a shard it has already passed lands in a
+// file that describes a state the store was never in. Holding all of them at once makes
+// the whole keyspace one instant. The price is that every writer in every shard is blocked
+// for the walk, which is why this is the snapshot path and not Dump's.
+//
+// The locks are taken in shard-index order, which is the order Store.lockKeys uses for a
+// multi-key write (invariant 8), so a snapshot can never be half of a deadlock with one.
+// Ordering by anything else -- key name, map order -- would not have that property.
+func (s *Store) RLockAll() func() {
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+	}
+	return func() {
+		for i := len(s.shards) - 1; i >= 0; i-- {
+			s.shards[i].mu.RUnlock()
+		}
+	}
+}
+
+// DumpLocked is Dump for a caller that already holds every shard's read lock (see
+// RLockAll). Sharing appendShardCommands with Dump is the point: there is one encoder per
+// type for the whole snapshot surface, so invariant 5 cannot hold on one path and not the
+// other.
+func (s *Store) DumpLocked() [][][]byte {
+	now := s.clock()
+	var cmds [][][]byte
+	for _, sh := range s.shards {
+		cmds = appendShardCommands(cmds, sh, now)
+	}
+	return cmds
+}
+
+// appendShardCommands renders one shard's live entries. The caller holds sh.mu for reading.
+func appendShardCommands(cmds [][][]byte, sh *shard, now time.Time) [][][]byte {
+	for k, e := range sh.data {
+		if e.expired(now) {
+			continue
+		}
+		key := []byte(k)
+		cmds = appendValueCommands(cmds, key, e)
+		// Preserve the TTL as an absolute deadline so a rewrite/replica seed
+		// does not silently make a volatile key permanent.
+		if !e.expireAt.IsZero() {
+			ms := strconv.FormatInt(e.expireAt.UnixMilli(), 10)
+			cmds = append(cmds, [][]byte{[]byte("PEXPIREAT"), key, []byte(ms)})
+		}
 	}
 	return cmds
 }
@@ -137,6 +179,7 @@ func appendValueCommands(cmds [][][]byte, key []byte, e *entry) [][][]byte {
 // report. So the sequence is, per stream:
 //
 //	XADD key <id> field value ...     one per entry, in id order
+//	XADD key MAXLEN 0 0-1 x y         instead, when the stream has no entries left
 //	XSETID key <last-id> ENTRIESADDED <n> MAXDELETEDID <id>
 //	XGROUP CREATE key <group> <last-delivered-id> ENTRIESREAD <n>
 //	XGROUP CREATECONSUMER key <group> <consumer>
@@ -146,6 +189,17 @@ func appendValueCommands(cmds [][][]byte, key []byte, e *entry) [][][]byte {
 // them, because it is refused for an id below the top entry; the groups follow that,
 // because XGROUP CREATE needs the key; and each group's consumers precede its PEL
 // entries, so a consumer with nothing outstanding still survives the trip.
+//
+// The second line is why an *empty* stream is a case of its own rather than a shorter one of
+// the same. A stream all of whose entries have been XDELed or trimmed away is still a key,
+// with a type, a last-generated id, an entries-added count and possibly consumer groups --
+// and every command in the sequence above needs the key to already exist. XSETID in
+// particular answers "no such key", so a snapshot that opened with it silently dropped the
+// key: measured, a stream emptied by XDEL came back from a round trip as TYPE none. So an
+// entry is added and trimmed away in the same command, which is exactly the trick Redis's
+// own rewriteStreamObject uses (its comment calls it "the XADD MAXLEN 0 trick"), and for
+// exactly this reason. The id is 0-1 -- the smallest legal id -- so the XSETID that follows
+// is never refused for naming an id below the top entry.
 //
 // Chunking: one XADD per entry and one XCLAIM per pending entry, so no emitted command
 // can approach resp.MaxMultiBulk -- an entry's own field count is already bounded by
@@ -166,6 +220,15 @@ func appendStreamCommands(cmds [][][]byte, key []byte, st *stream) [][][]byte {
 			cmd = append(cmd, copyBytes(f))
 		}
 		cmds = append(cmds, cmd)
+	}
+	if len(st.entries) == 0 {
+		// Nothing above created the key, and everything below needs it to exist. See the doc
+		// comment: this adds one entry and trims it away in the same command, which is the
+		// only way to make an empty stream out of commands that all presuppose a stream.
+		cmds = append(cmds, [][]byte{
+			[]byte("XADD"), key, []byte("MAXLEN"), []byte("0"), []byte("0-1"),
+			[]byte("x"), []byte("y"),
+		})
 	}
 	// Always emitted, even for an empty stream: an XSETID is the only way to restore a
 	// stream that has entries-added history but no entries left, and it is what stops a

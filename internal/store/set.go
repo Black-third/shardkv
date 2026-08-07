@@ -16,7 +16,9 @@ func (s *Store) SPop(key string, count int) (members []string, ok bool, err erro
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -40,7 +42,7 @@ func (s *Store) SPop(key string, count int) (members []string, ok bool, err erro
 		}
 	}
 	for _, m := range members {
-		delete(e.set, m)
+		setDrop(e, m)
 	}
 	if len(e.set) == 0 {
 		delete(sh.data, key)
@@ -109,7 +111,7 @@ func (s *Store) SMIsMember(key string, members ...string) ([]bool, error) {
 func (s *Store) SMove(src, dst, member string) (bool, error) {
 	now := s.clock()
 	unlock := s.lockKeys(src, dst)
-	defer unlock()
+	defer s.trackedKeys(unlock, src, dst)()
 
 	ssh, dsh := s.getShard(src), s.getShard(dst)
 	se := ssh.liveEntry(src, now)
@@ -133,7 +135,7 @@ func (s *Store) SMove(src, dst, member string) (bool, error) {
 		return true, nil
 	}
 
-	delete(se.set, member)
+	setDrop(se, member)
 	if len(se.set) == 0 {
 		delete(ssh.data, src)
 	} else {
@@ -143,7 +145,7 @@ func (s *Store) SMove(src, dst, member string) (bool, error) {
 		de = &entry{kind: kindSet, set: make(map[string]struct{})}
 		dsh.data[dst] = de
 	}
-	de.set[member] = struct{}{}
+	setPut(de, member)
 	s.touch(de, now)
 	return true, nil
 }
@@ -258,7 +260,7 @@ func (s *Store) combineLocked(op SetOp, limit int, now time.Time, keys []string)
 func (s *Store) SCombineStore(op SetOp, dst string, keys ...string) (n int, changed bool, err error) {
 	now := s.clock()
 	unlock := s.lockKeys(append([]string{dst}, keys...)...)
-	defer unlock()
+	defer s.trackedKeys(unlock, dst)()
 
 	members, err := s.combineLocked(op, 0, now, keys)
 	if err != nil {
@@ -272,7 +274,7 @@ func (s *Store) SCombineStore(op SetOp, dst string, keys ...string) (n int, chan
 	}
 	ne := &entry{kind: kindSet, set: make(map[string]struct{}, len(members))}
 	for _, m := range members {
-		ne.set[m] = struct{}{}
+		setPut(ne, m)
 	}
 	s.touch(ne, now)
 	dsh.data[dst] = ne

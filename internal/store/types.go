@@ -4,21 +4,41 @@ import "container/list"
 
 // deque is a double-ended queue of byte slices backing the list type. It wraps
 // container/list so pushes and pops at both ends are O(1).
-type deque struct{ l *list.List }
+//
+// bytes is the deque's contribution to the memory accounting, maintained by the methods
+// below so that asking a million-element list how large it is costs nothing. Every
+// mutation of the list goes through one of them for exactly that reason -- see
+// memtrack.go.
+type deque struct {
+	l     *list.List
+	bytes int64
+}
 
 func newDeque() *deque { return &deque{l: list.New()} }
 
 func (d *deque) len() int { return d.l.Len() }
 
-func (d *deque) lpush(v []byte) { d.l.PushFront(v) }
-func (d *deque) rpush(v []byte) { d.l.PushBack(v) }
+// elemBytes is what one element costs the estimate: the container/list element plus the
+// value's own bytes. It must stay the formula entrySize uses, or the maintained count and
+// the measured one would disagree.
+func elemBytes(v []byte) int64 { return memListElem + int64(len(v)) }
+
+func (d *deque) lpush(v []byte) {
+	d.bytes += elemBytes(v)
+	d.l.PushFront(v)
+}
+
+func (d *deque) rpush(v []byte) {
+	d.bytes += elemBytes(v)
+	d.l.PushBack(v)
+}
 
 func (d *deque) lpop() ([]byte, bool) {
 	el := d.l.Front()
 	if el == nil {
 		return nil, false
 	}
-	d.l.Remove(el)
+	d.remove(el)
 	return el.Value.([]byte), true
 }
 
@@ -27,8 +47,21 @@ func (d *deque) rpop() ([]byte, bool) {
 	if el == nil {
 		return nil, false
 	}
-	d.l.Remove(el)
+	d.remove(el)
 	return el.Value.([]byte), true
+}
+
+// remove is the one place an element leaves the deque, so the byte count cannot be
+// forgotten by a caller that removes one.
+func (d *deque) remove(el *list.Element) {
+	d.bytes -= elemBytes(el.Value.([]byte))
+	d.l.Remove(el)
+}
+
+// setValue replaces an element's value in place, which is what LSET does.
+func (d *deque) setValue(el *list.Element, v []byte) {
+	d.bytes += int64(len(v)) - int64(len(el.Value.([]byte)))
+	el.Value = v
 }
 
 // rangeIdx returns elements in the inclusive index range [start, stop] using
@@ -102,7 +135,9 @@ func (s *Store) listPushMaybe(key string, left bool, vals [][]byte, requireExist
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
@@ -140,7 +175,9 @@ func (s *Store) listPop(key string, left bool) ([]byte, bool, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	if !found || e.expired(now) {
@@ -206,7 +243,9 @@ func (s *Store) HSet(key string, pairs ...[2][]byte) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
@@ -223,7 +262,7 @@ func (s *Store) HSet(key string, pairs ...[2][]byte) (int, error) {
 		if _, ok := e.dict[field]; !ok {
 			created++
 		}
-		e.dict[field] = copyBytes(p[1])
+		hashPut(e, field, copyBytes(p[1]))
 	}
 	s.touch(e, now)
 	return created, nil
@@ -256,7 +295,9 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	if !found || e.expired(now) {
@@ -267,8 +308,7 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 	}
 	removed := 0
 	for _, f := range fields {
-		if _, ok := e.dict[f]; ok {
-			delete(e.dict, f)
+		if hashDrop(e, f) {
 			removed++
 		}
 	}
@@ -327,7 +367,9 @@ func (s *Store) SAdd(key string, members ...string) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
@@ -340,8 +382,7 @@ func (s *Store) SAdd(key string, members ...string) (int, error) {
 	}
 	added := 0
 	for _, m := range members {
-		if _, ok := e.set[m]; !ok {
-			e.set[m] = struct{}{}
+		if setPut(e, m) {
 			added++
 		}
 	}
@@ -354,7 +395,9 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	if !found || e.expired(now) {
@@ -365,8 +408,7 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 	}
 	removed := 0
 	for _, m := range members {
-		if _, ok := e.set[m]; ok {
-			delete(e.set, m)
+		if setDrop(e, m) {
 			removed++
 		}
 	}

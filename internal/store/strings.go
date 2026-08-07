@@ -38,7 +38,9 @@ func (s *Store) SetWithOptions(key string, val []byte, o SetOptions) (old []byte
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && o.Get {
@@ -76,7 +78,9 @@ func (s *Store) GetEx(key string, deadline time.Time, apply bool) (val []byte, o
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -115,7 +119,9 @@ func (s *Store) SetRange(key string, offset int, val []byte) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindString {
@@ -201,7 +207,9 @@ func (s *Store) IncrByFloat(key string, delta LongDouble) (string, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindString {

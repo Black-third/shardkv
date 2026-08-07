@@ -12,9 +12,14 @@ var zsetSeed atomic.Int64
 
 // zset is a sorted set: a member->score map for O(1) score lookup plus a skip
 // list ordered by (score, member) for O(log n) rank and range queries.
+//
+// bytes is the set's contribution to the memory accounting, maintained by add and remove
+// -- the only two methods that change the membership -- so that the byte total can be
+// read in O(1) instead of walked. See memtrack.go.
 type zset struct {
-	dict map[string]float64
-	sl   *skipList
+	dict  map[string]float64
+	sl    *skipList
+	bytes int64
 }
 
 func newZSet() *zset {
@@ -23,6 +28,14 @@ func newZSet() *zset {
 		dict: make(map[string]float64),
 		sl:   newSkipList(rand.New(rand.NewSource(seed))),
 	}
+}
+
+// memberBytes is what one member costs the estimate. It counts the member twice because
+// it really is stored twice -- once in the dict, once in the skip list -- which is
+// exactly why a sorted set costs more per member than a set does. It must stay the
+// formula entrySize uses.
+func memberBytes(member string) int64 {
+	return memMapSlot + memSkipNode + 2*int64(len(member))
 }
 
 // add inserts or updates member. added is true only for a newly-created member
@@ -40,6 +53,7 @@ func (z *zset) add(member string, score float64) (added, changed bool) {
 	}
 	z.dict[member] = score
 	z.sl.insert(member, score)
+	z.bytes += memberBytes(member)
 	return true, true
 }
 
@@ -50,6 +64,7 @@ func (z *zset) remove(member string) bool {
 	}
 	delete(z.dict, member)
 	z.sl.delete(member, old)
+	z.bytes -= memberBytes(member)
 	return true
 }
 
@@ -87,7 +102,9 @@ func (s *Store) ZRem(key, member string) (bool, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, found := sh.data[key]
 	if !found || e.expired(now) {

@@ -251,7 +251,7 @@ func (s *Store) ZCombineStore(dest string, kind ZCombineKind, ops []ZSetOp, agg 
 	}
 	now := s.clock()
 	unlock := s.lockKeys(keys...)
-	defer unlock()
+	defer s.trackedKeys(unlock, dest)()
 
 	acc, err := s.zcombineLocked(kind, ops, agg, now)
 	if err != nil {
@@ -428,7 +428,7 @@ const (
 func (s *Store) ZRangeStore(dest, src string, sel ZRangeSelector) (int, error) {
 	now := s.clock()
 	unlock := s.lockKeys(dest, src)
-	defer unlock()
+	defer s.trackedKeys(unlock, dest)()
 
 	e := s.getShard(src).liveEntry(src, now)
 	if e != nil && e.kind != kindZSet {
@@ -562,7 +562,9 @@ func (s *Store) ReplaceList(key string, vals [][]byte) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	if len(vals) == 0 {
 		delete(sh.data, key)

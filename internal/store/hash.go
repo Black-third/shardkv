@@ -112,7 +112,9 @@ func (s *Store) HSetNX(key, field string, val []byte) (bool, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindHash {
@@ -125,7 +127,7 @@ func (s *Store) HSetNX(key, field string, val []byte) (bool, error) {
 	if _, exists := e.dict[field]; exists {
 		return false, nil
 	}
-	e.dict[field] = copyBytes(val)
+	hashPut(e, field, copyBytes(val))
 	s.touch(e, now)
 	return true, nil
 }
@@ -138,7 +140,9 @@ func (s *Store) HIncrBy(key, field string, delta int64) (int64, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, err := s.hashForWrite(sh, key, now)
 	if err != nil {
@@ -156,7 +160,7 @@ func (s *Store) HIncrBy(key, field string, delta int64) (int64, error) {
 		return 0, ErrOverflow
 	}
 	n += delta
-	e.dict[field] = []byte(strconv.FormatInt(n, 10))
+	hashPut(e, field, []byte(strconv.FormatInt(n, 10)))
 	s.touch(e, now)
 	return n, nil
 }
@@ -172,7 +176,9 @@ func (s *Store) HIncrByFloat(key, field string, delta LongDouble) (string, error
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e, err := s.hashForWrite(sh, key, now)
 	if err != nil {
@@ -191,7 +197,7 @@ func (s *Store) HIncrByFloat(key, field string, delta LongDouble) (string, error
 		return "", ErrNaN
 	}
 	text := sum.Text()
-	e.dict[field] = []byte(text)
+	hashPut(e, field, []byte(text))
 	s.touch(e, now)
 	return text, nil
 }

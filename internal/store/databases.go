@@ -35,8 +35,12 @@ func TransferKey(src, dst *Store, key string, remove, replace bool) bool {
 	ssh, dsh := src.getShard(key), dst.getShard(key)
 	ssh.mu.Lock()
 	defer ssh.mu.Unlock()
+	schargedIn := src.charge(ssh, key)
+	defer src.settle(ssh, key, schargedIn)
 	dsh.mu.Lock()
 	defer dsh.mu.Unlock()
+	dchargedIn := dst.charge(dsh, key)
+	defer dst.settle(dsh, key, dchargedIn)
 
 	e := ssh.liveEntry(key, now)
 	if e == nil {
@@ -86,8 +90,12 @@ func AdoptKey(dst, src *Store, key string, replace bool) bool {
 	dsh, ssh := dst.getShard(key), src.getShard(key)
 	dsh.mu.Lock()
 	defer dsh.mu.Unlock()
+	dchargedIn := dst.charge(dsh, key)
+	defer dst.settle(dsh, key, dchargedIn)
 	ssh.mu.Lock()
 	defer ssh.mu.Unlock()
+	schargedIn := src.charge(ssh, key)
+	defer src.settle(ssh, key, schargedIn)
 
 	e, staged := ssh.data[key]
 	if !staged {
@@ -120,6 +128,15 @@ func SwapData(a, b *Store) {
 		sa.mu.Lock()
 		sb.mu.Lock()
 		sa.data, sb.data = sb.data, sa.data
+		// The byte accounting follows the data, whole shard at a time. Settling key by key
+		// would mean walking both shards; a swap moves every key at once, so the two
+		// totals simply exchange places and each store's grand total moves by the
+		// difference.
+		wasA, wasB := sa.mem, sb.mem
+		sa.mem, sb.mem = wasB, wasA
+		sa.volatile, sb.volatile = sb.volatile, sa.volatile
+		a.mem.Add(wasB - wasA)
+		b.mem.Add(wasA - wasB)
 		sb.mu.Unlock()
 		sa.mu.Unlock()
 	}

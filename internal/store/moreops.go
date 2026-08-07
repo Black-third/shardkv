@@ -14,8 +14,10 @@ func (s *Store) SetDeadline(key string, val []byte, deadline time.Time) {
 	s.touch(e, now)
 	sh := s.getShard(key)
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
+	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	sh.data[key] = e
-	sh.mu.Unlock()
 }
 
 // SetNX sets key to val only if it does not already exist. Reports whether it
@@ -24,7 +26,9 @@ func (s *Store) SetNX(key string, val []byte) bool {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	if e, found := sh.data[key]; found && !e.expired(now) {
 		return false
 	}
@@ -49,7 +53,7 @@ func (s *Store) MSetNX(pairs [][2][]byte) bool {
 		keys[i] = string(p[0])
 	}
 	unlock := s.lockKeys(keys...)
-	defer unlock()
+	defer s.trackedKeys(unlock, keys...)()
 
 	now := s.clock()
 	for _, key := range keys {
@@ -73,7 +77,9 @@ func (s *Store) GetSet(key string, val []byte) (old []byte, oldOK bool, err erro
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	if e, found := sh.data[key]; found && !e.expired(now) {
 		if e.kind != kindString {
 			return nil, false, ErrWrongType
@@ -92,7 +98,9 @@ func (s *Store) GetDel(key string) (val []byte, ok bool, err error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	e, found := sh.data[key]
 	if !found || e.expired(now) {
 		return nil, false, nil
@@ -111,7 +119,9 @@ func (s *Store) Append(key string, suffix []byte) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	e, found := sh.data[key]
 	live := found && !e.expired(now)
 	if live && e.kind != kindString {
@@ -174,7 +184,9 @@ func (s *Store) Persist(key string) bool {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 	e, found := sh.data[key]
 	if !found || e.expired(now) || e.expireAt.IsZero() {
 		return false
@@ -190,9 +202,12 @@ func (s *Store) Rename(src, dst string) bool {
 	ssh, dsh := s.shards[si], s.shards[di]
 	now := s.clock()
 
+	// Both keys are settled, and both have to be: the entry moves, so src stops costing
+	// what it cost and dst starts costing the same payload under a key of a different
+	// length.
 	if si == di {
 		ssh.mu.Lock()
-		defer ssh.mu.Unlock()
+		defer s.trackedKeys(ssh.mu.Unlock, src, dst)()
 		e, ok := ssh.data[src]
 		if !ok || e.expired(now) {
 			return false
@@ -210,8 +225,8 @@ func (s *Store) Rename(src, dst string) bool {
 		dsh.mu.Lock()
 		ssh.mu.Lock()
 	}
-	defer ssh.mu.Unlock()
-	defer dsh.mu.Unlock()
+	unlock := func() { ssh.mu.Unlock(); dsh.mu.Unlock() }
+	defer s.trackedKeys(unlock, src, dst)()
 
 	e, ok := ssh.data[src]
 	if !ok || e.expired(now) {

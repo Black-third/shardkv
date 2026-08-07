@@ -10,17 +10,25 @@ package server
 // number that changes no behaviour.
 //
 // Parameter names are Redis's wherever the setting is Redis's, because tools match on
-// them. Where the setting is this server's own (maxkeys, which bounds keys rather than
-// bytes) the name is its own too, rather than pretending to be maxmemory and reporting
-// a byte count it does not enforce.
+// them. Where the setting is this server's own -- maxkeys, which bounds the *number* of
+// keys -- the name is its own too, rather than borrowing maxmemory's.
 //
-// The maxmemory family is reported all the same, and reading its entries below is the
-// clearest statement of where that line falls: `maxmemory 0` is the true answer to "what
-// byte limit is enforced", every member of the family is read-only because nothing here
-// could act on a value it was given, and the eviction policy is reported from the same
-// accessor INFO reports it from so the two can never disagree.
+// The maxmemory family used to be reported read-only, with 0 as the honest answer to "what
+// byte limit is enforced", because nothing here measured bytes. Bytes are measured now (see
+// internal/store/memtrack.go), so every member of the family that this server can act on is
+// settable and enforced: maxmemory is a real budget, maxmemory-policy really selects between
+// Redis's eight policies, and maxmemory-samples really changes how many keys the sampler
+// looks at. maxkeys stays beside them as a separate, simpler cap -- it is a documented
+// feature and a key count is what some deployments actually want to bound.
+//
+// The members that remain read-only are the ones where there is still nothing to act on,
+// and each says so where it is defined. The eviction policy is reported from the same
+// accessor INFO reports it from, so the two can never disagree.
 
 import (
+	"errors"
+	"math"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -46,6 +54,24 @@ type configParam struct {
 	// the setting that made it, and a caller that is told the wrong reason looks in the
 	// wrong place.
 	setErr string
+	// setErrFn replaces setErr for a parameter whose refusal depends on *how* the value was
+	// wrong. Redis distinguishes the two cases for its bounded integer settings -- `CONFIG
+	// SET maxmemory-samples abc` says "argument couldn't be parsed into an integer" while
+	// `... 0` says "argument must be between 1 and 2147483647 inclusive" -- and collapsing
+	// them tells an operator who typed a letter that their number was out of range.
+	setErrFn func(v string) string
+}
+
+// boundedIntErr is Redis's pair of refusals for a bounded integer setting, chosen by which
+// kind of wrong the value was. Both strings are measured on redis 7.2.
+func boundedIntErr(lo, hi int64) func(string) string {
+	return func(v string) string {
+		if _, err := strconv.ParseInt(v, 10, 64); err != nil {
+			return "argument couldn't be parsed into an integer"
+		}
+		return "argument must be between " + strconv.FormatInt(lo, 10) + " and " +
+			strconv.FormatInt(hi, 10) + " inclusive"
+	}
 }
 
 var configParams = []configParam{
@@ -136,6 +162,13 @@ var configParams = []configParam{
 		// database is an independent keyspace with its own eviction pass. CONFIG SET
 		// therefore applies it to all of them, and CONFIG GET reads database 0, so the
 		// value reported is always the value in force everywhere.
+		//
+		// It is a different mechanism from maxmemory below and stays one: a byte budget is
+		// enforced on the write path and can refuse a command, while a key cap is enforced
+		// by the janitor and only ever evicts. Answering a key cap with OOM errors -- which
+		// is what noeviction means for maxmemory -- would silently retire a documented
+		// feature, so a cap evicts by the configured policy when that policy evicts at all
+		// and by approximate LRU when it does not. See Store.EvictToLimit.
 		name: "maxkeys",
 		get:  func(s *Server) string { return strconv.Itoa(s.DB(0).MaxKeys()) },
 		set: func(s *Server, v string) bool {
@@ -150,55 +183,112 @@ var configParams = []configParam{
 		},
 	},
 	{
-		// The maxmemory family. It is reported -- and every member of it is read-only --
-		// for one reason: a client library that asks `CONFIG GET maxmemory*` while warming
-		// up needs an answer, and an empty reply is not the same statement as "no byte
-		// limit". Half the drivers in the ecosystem send exactly that pattern, and several
-		// treat the absence of `maxmemory` as "cannot determine" rather than as "unlimited".
+		// The byte budget the whole dataset is held within, 0 for unbounded -- which is
+		// still the default, so an existing deployment behaves exactly as it did.
 		//
-		// 0 is the truth here, not a placeholder: nothing in this server enforces a byte
-		// budget. What it enforces is `maxkeys`, which is why that parameter keeps its own
-		// name a few entries above rather than masquerading as this one.
+		// It is a real limit now: used_memory is maintained as values are written, and a
+		// write that would leave the dataset over the budget triggers eviction or, under a
+		// policy that cannot evict, the OOM refusal. See maxmemory.go.
+		//
+		// The value is accepted in the forms Redis accepts, suffixes included, and reported
+		// back as a plain byte count exactly as Redis reports it -- `CONFIG SET maxmemory
+		// 100mb` reads back `104857600`, not `100mb`. A client that round-trips the value
+		// gets the same limit it set, which is the only property that makes the pair useful.
 		name: "maxmemory",
-		get:  func(s *Server) string { return "0" },
-		// Read-only, deliberately, and this is the choice worth stating: CONFIG SET
-		// maxmemory could be accepted and remembered, and CONFIG GET would then read back
-		// whatever it was told -- which is precisely the "tune a number that changes no
-		// behaviour" this table exists to refuse. Nothing measures bytes here, so nothing
-		// could act on the value. An operator who wants a bound wants `maxkeys`, and being
-		// refused here is what tells them so. Redis's own message for an unsettable
-		// parameter is what configSet emits.
+		get:  func(s *Server) string { return strconv.FormatInt(s.MaxMemory(), 10) },
+		set: func(s *Server, v string) bool {
+			n, ok := parseMemorySize(v)
+			if !ok {
+				return false
+			}
+			s.SetMaxMemory(n)
+			return true
+		},
+		// Redis words this refusal for the setting rather than reusing its generic integer
+		// message, and a caller told the wrong reason looks in the wrong place. Measured on
+		// redis 7.2 for `CONFIG SET maxmemory -1`, `abc`, `1.5mb` and `100mbb`.
+		setErr: "argument must be a memory value",
 	},
 	{
-		// What eviction *does* when the keyspace is over its cap: sample keys and evict the
-		// least recently used of them, over all keys rather than only volatile ones. That is
-		// allkeys-lru, and with no cap configured nothing is evicted at all, which is
-		// noeviction.
+		// Which of Redis's eight policies decides what happens when the budget is reached.
+		// All eight are implemented, including the LFU pair -- see internal/store/evict.go
+		// for the sampler and for the logarithmic counter LFU ranks by.
 		//
-		// The policy and the trigger are separate facts and only the policy is reported
-		// here. What triggers this eviction is the maxkeys cap (see Store.EvictToLimit),
-		// not a byte budget -- which is exactly why `maxmemory` above reads 0 while this
-		// can read allkeys-lru. A client that reads the pair as "unlimited memory, LRU
-		// eviction" has read it correctly.
+		// Its default is derived rather than flatly noeviction: a server with a maxkeys cap
+		// and no policy of its own evicts by approximate LRU over all keys, which is what
+		// this parameter answered before it became settable. An explicit CONFIG SET always
+		// wins over that, so the parameter can never read back as something other than what
+		// it was set to.
 		//
 		// It shares maxmemoryPolicy() with INFO's maxmemory_policy on purpose: two
 		// spellings of one fact drift, and a client that compared them would find the
 		// server disagreeing with itself.
 		name: "maxmemory-policy",
 		get:  func(s *Server) string { return s.maxmemoryPolicy() },
-		// Read-only for the same reason as maxmemory: the policy is derived from whether
-		// maxkeys is set, so accepting `volatile-ttl` here would change nothing and then
-		// report itself back as though it had.
+		set: func(s *Server, v string) bool {
+			p, ok := store.ParseEvictionPolicy(v)
+			if !ok {
+				return false
+			}
+			s.SetEvictionPolicy(p)
+			return true
+		},
+		setErr: "argument(s) must be one of the following: volatile-lru, volatile-lfu, " +
+			"volatile-random, volatile-ttl, allkeys-lru, allkeys-lfu, allkeys-random, noeviction",
 	},
 	{
-		// How many keys the sampler examines before evicting the least recently used of
-		// them. Reported as the number this server's sampler actually uses, which is 16 --
-		// not Redis's default of 5. Reporting 5 would have been the easy way to look
-		// familiar and would have described nothing that happens here.
+		// How many keys the sampler examines before choosing a victim among them.
+		//
+		// Its default is 16 rather than Redis's 5, and that is a real difference rather than
+		// a cosmetic one: a sample here is drawn from a single shard, so it sees 1/256th of
+		// the keyspace, and a wider sample buys back some of that narrowness. Reporting 5 to
+		// look familiar would have described nothing that happens here.
+		//
+		// It is settable, and the number it reports is the number pickVictim actually reads
+		// -- that being the whole point. A knob that reported a value the sampler ignored
+		// would be worse than no knob, because an operator would tune it and measure no
+		// change. Redis bounds it to 1..64 and so does this: the reply to an out-of-range
+		// value is its own message rather than silent clamping.
 		name: "maxmemory-samples",
-		get:  func(s *Server) string { return strconv.Itoa(store.EvictionSamples) },
-		// Read-only: the sample size is a compile-time constant (store.EvictionSamples),
-		// not a knob.
+		get:  func(s *Server) string { return strconv.Itoa(s.DB(0).EvictionSampleCount()) },
+		set: func(s *Server, v string) bool {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > math.MaxInt32 {
+				return false
+			}
+			for i := 0; i < s.Databases(); i++ {
+				s.DB(i).SetEvictionSamples(n)
+			}
+			return true
+		},
+		// Measured on redis 7.2: the bound really is 1..2147483647, not the 1..64 the
+		// documentation implies -- `CONFIG SET maxmemory-samples 1000` is accepted -- and 0
+		// and -1 are refused as out of range while `abc` is refused as unparseable.
+		setErrFn: boundedIntErr(1, math.MaxInt32),
+	},
+	{
+		// How slowly the LFU access counter grows. Larger means more accesses are needed to
+		// tell two hot keys apart; 0 makes the counter linear in the access count. Redis's
+		// default is 10.
+		name: "lfu-log-factor",
+		get: func(s *Server) string {
+			f, _ := s.DB(0).LFUParams()
+			return strconv.FormatInt(f, 10)
+		},
+		set:      func(s *Server, v string) bool { return s.setLFUParam(v, true) },
+		setErrFn: boundedIntErr(0, math.MaxInt32),
+	},
+	{
+		// How many idle minutes cost the LFU counter one point. 0 disables the decay
+		// entirely, which makes the counter a lifetime total rather than a recent-frequency
+		// estimate. Redis's default is 1.
+		name: "lfu-decay-time",
+		get: func(s *Server) string {
+			_, d := s.DB(0).LFUParams()
+			return strconv.FormatInt(d, 10)
+		},
+		set:      func(s *Server, v string) bool { return s.setLFUParam(v, false) },
+		setErrFn: boundedIntErr(0, math.MaxInt32),
 	},
 	{
 		// The share of maxmemory that client buffers may occupy before clients are evicted
@@ -329,21 +419,47 @@ var configParams = []configParam{
 		},
 	},
 	{
-		// The RDB snapshot schedule. There is no RDB here -- persistence is the AOF and
-		// nothing else -- so the schedule reads as empty, which is not a placeholder but the
-		// literal truth: no periodic dataset write is configured, and none would run.
-		// (A real Redis started with `--save ''` reads the same empty string.)
+		// The snapshot schedule: <seconds> <changes> pairs, Redis's spelling. It used to read
+		// as an empty string and refuse any non-empty value, because there was no snapshot
+		// mechanism and a schedule would have been a durability promise the server could not
+		// keep. There is one now (see snapshot.go), so the schedule is real -- and it only
+		// ever fires on a server that was given a snapshot path, since without one there is
+		// nowhere to write to and the schedule is inert.
 		//
-		// It is settable, but only to a schedule that asks for nothing. "Turn snapshots
-		// off" is a state this server is genuinely in and can genuinely be asked for; any
-		// non-empty schedule is a durability promise it cannot keep, and accepting one
-		// would be exactly the "tune a number that changes no behaviour" this table exists
-		// to refuse. So the empty schedule succeeds and a non-empty one is rejected with
-		// Redis's own message for a schedule it will not take.
+		// An invalid spec is refused rather than partly applied: half a schedule is a
+		// durability setting that does not do what the operator wrote down. Measured on redis
+		// 7.2, `900` alone, `abc 1` and `900 -1` are all refused with this message, while the
+		// empty string is accepted and means "no snapshots".
 		name:   "save",
-		get:    func(s *Server) string { return "" },
-		set:    func(s *Server, v string) bool { return strings.TrimSpace(v) == "" },
+		get:    func(s *Server) string { return s.SaveSchedule() },
+		set:    func(s *Server, v string) bool { return s.SetSaveSchedule(v) },
 		setErr: "Invalid save parameters",
+	},
+	{
+		// The snapshot file's name and directory, split the way Redis splits them because
+		// backup tooling reads them separately in order to reassemble the path.
+		//
+		// Both read empty when no snapshot path was configured, rather than the "." that
+		// filepath.Base and filepath.Dir return for an empty string. "." is a real relative
+		// directory, so reporting it would name a file this server has no intention of
+		// writing -- and a backup script that joined the two would go looking for ./. Empty
+		// is how this table already reports an unconfigured file (see tls-cert-file).
+		name: "dbfilename",
+		get: func(s *Server) string {
+			if path := s.SnapshotPath(); path != "" {
+				return filepath.Base(path)
+			}
+			return ""
+		},
+	},
+	{
+		name: "dir",
+		get: func(s *Server) string {
+			if path := s.SnapshotPath(); path != "" {
+				return filepath.Dir(path)
+			}
+			return ""
+		},
 	},
 	{
 		// How many quicklist nodes at each end of a list are left uncompressed. This store
@@ -439,6 +555,26 @@ func init() {
 	}
 }
 
+// setLFUParam applies one of the two LFU tuning parameters to every database, leaving the
+// other as it is. They are set as a pair in the store because the decay and the growth rate
+// are read together on every access, so one call keeps them consistent.
+func (s *Server) setLFUParam(v string, logFactor bool) bool {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || n > math.MaxInt32 {
+		return false
+	}
+	for i := 0; i < s.Databases(); i++ {
+		f, d := s.DB(i).LFUParams()
+		if logFactor {
+			f = n
+		} else {
+			d = n
+		}
+		s.DB(i).SetLFUParams(f, d)
+	}
+	return true
+}
+
 func yesNo(b bool) string {
 	if b {
 		return "yes"
@@ -494,7 +630,10 @@ func configGet(s *Server, w *resp.Writer, patterns [][]byte) {
 	var out []string
 	for _, p := range configParams {
 		for _, pattern := range patterns {
-			if globMatch(strings.ToLower(string(pattern)), p.name) {
+			// Folded on both sides rather than by lower-casing the pattern: every parameter
+			// name here is already lower case, so the two are equivalent today, and folding
+			// is the form that stays correct if one ever is not.
+			if globMatchFold(string(pattern), p.name) {
 				out = append(out, p.name, p.get(s))
 				break // one entry per parameter even if several patterns match it
 			}
@@ -515,18 +654,56 @@ func configSet(s *Server, w *resp.Writer, name, value string) {
 			return
 		}
 		if !p.set(s, value) {
-			detail := "argument couldn't be parsed into an integer, or is out of range"
-			if p.setErr != "" {
-				detail = p.setErr
-			}
 			w.WriteError("ERR CONFIG SET failed (possibly related to argument '" + name +
-				"') - " + detail)
+				"') - " + configSetDetail(p, value))
 			return
 		}
 		w.WriteSimple("OK")
 		return
 	}
 	w.WriteError("ERR Unknown option or number of arguments for CONFIG SET - '" + name + "'")
+}
+
+// configSetDetail is the reason a value was refused, in Redis's words for that setting.
+// Shared by the client path and by ConfigSet so an operator who mistypes a startup flag
+// reads the same sentence a client would have been sent.
+func configSetDetail(p configParam, value string) string {
+	switch {
+	case p.setErrFn != nil:
+		return p.setErrFn(value)
+	case p.setErr != "":
+		return p.setErr
+	}
+	return "argument couldn't be parsed into an integer, or is out of range"
+}
+
+// ConfigSet applies a setting from outside a client connection, which is what a command-line
+// flag is.
+//
+// It goes through the same table, the same parsing and the same refusal text CONFIG SET uses
+// -- deliberately. A flag that parsed its own value would be a second parser for the same
+// setting, and the two would drift in exactly the way invariant 7 describes for key
+// extraction: `-maxmemory 100mb` and `CONFIG SET maxmemory 100mb` would eventually mean
+// different numbers, and nothing would report it. The value is a string for the same reason,
+// so a unit suffix means at startup what it means at runtime.
+//
+// The error is plain rather than RESP-prefixed, since its reader is an operator looking at a
+// process that would not start.
+func (s *Server) ConfigSet(name, value string) error {
+	name = strings.ToLower(name)
+	for _, p := range configParams {
+		if p.name != name {
+			continue
+		}
+		if p.set == nil {
+			return errors.New("can't set immutable config")
+		}
+		if !p.set(s, value) {
+			return errors.New(configSetDetail(p, value))
+		}
+		return nil
+	}
+	return errors.New("unknown config parameter")
 }
 
 // resetStat clears the counters INFO reports, which is what CONFIG RESETSTAT is for:

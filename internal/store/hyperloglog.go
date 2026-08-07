@@ -465,7 +465,9 @@ func (s *Store) PFAdd(key string, elements [][]byte) (updated bool, err error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindString {
@@ -564,7 +566,7 @@ func (s *Store) PFMerge(dst string, srcs []string) (changed bool, err error) {
 	keys = append(keys, dst)
 	keys = append(keys, srcs...)
 	unlock := s.lockKeys(keys...)
-	defer unlock()
+	defer s.trackedKeys(unlock, dst)()
 
 	now := s.clock()
 	merged := make([]uint8, hllRegisters)
@@ -660,7 +662,9 @@ func (s *Store) PFToDense(key string) (changed, ok bool, err error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {

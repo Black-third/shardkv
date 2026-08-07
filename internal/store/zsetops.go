@@ -42,7 +42,9 @@ func (s *Store) ZAddMulti(key string, o ZAddOptions, members []ZMember) (added, 
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindZSet {
@@ -103,7 +105,9 @@ func (s *Store) ZIncrBy(key, member string, delta float64, o ZAddOptions) (score
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e != nil && e.kind != kindZSet {
@@ -139,7 +143,9 @@ func (s *Store) ZRemMulti(key string, members ...string) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -279,7 +285,9 @@ func (s *Store) ZPop(key string, count int, fromMin bool) ([]ZMember, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -349,7 +357,9 @@ func (s *Store) zRemRange(key string, pick func(*zset) []string) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {

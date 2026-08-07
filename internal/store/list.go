@@ -61,6 +61,7 @@ func (d *deque) insertAt(pivot, val []byte, before bool) int {
 		if !bytes.Equal(el.Value.([]byte), pivot) {
 			continue
 		}
+		d.bytes += elemBytes(val)
 		if before {
 			d.l.InsertBefore(val, el)
 		} else {
@@ -90,7 +91,7 @@ func (d *deque) removeVal(count int, val []byte) int {
 			next = el.Prev()
 		}
 		if bytes.Equal(el.Value.([]byte), val) {
-			d.l.Remove(el)
+			d.remove(el)
 			removed++
 			if count != 0 && removed == limit {
 				break
@@ -106,16 +107,17 @@ func (d *deque) trim(start, stop int) {
 	from, to, ok := normalizeRange(d.l.Len(), start, stop)
 	if !ok {
 		d.l.Init()
+		d.bytes = 0
 		return
 	}
 	for i, el := 0, d.l.Front(); i < from && el != nil; i++ {
 		next := el.Next()
-		d.l.Remove(el)
+		d.remove(el)
 		el = next
 	}
 	for i, el := d.l.Len()-1, d.l.Back(); i > to-from && el != nil; i-- {
 		prev := el.Prev()
-		d.l.Remove(el)
+		d.remove(el)
 		el = prev
 	}
 }
@@ -193,7 +195,9 @@ func (s *Store) LSet(key string, index int, val []byte) error {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -206,7 +210,7 @@ func (s *Store) LSet(key string, index int, val []byte) error {
 	if !ok {
 		return ErrIndexOutOfRange
 	}
-	el.Value = copyBytes(val)
+	e.list.setValue(el, copyBytes(val))
 	s.touch(e, now)
 	return nil
 }
@@ -218,7 +222,9 @@ func (s *Store) LInsert(key string, before bool, pivot, val []byte) (int, error)
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -241,7 +247,9 @@ func (s *Store) LRem(key string, count int, val []byte) (int, error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -267,7 +275,9 @@ func (s *Store) LTrim(key string, start, stop int) (changed bool, err error) {
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -315,7 +325,9 @@ func (s *Store) LPopCount(key string, n int, left bool) (vals [][]byte, ok bool,
 	sh := s.getShard(key)
 	now := s.clock()
 	sh.mu.Lock()
+	charged := s.charge(sh, key)
 	defer sh.mu.Unlock()
+	defer s.settle(sh, key, charged)
 
 	e := sh.liveEntry(key, now)
 	if e == nil {
@@ -354,7 +366,7 @@ func (s *Store) LPopCount(key string, n int, left bool) (vals [][]byte, ok bool,
 func (s *Store) LMove(src, dst string, srcLeft, dstLeft bool) (val []byte, ok bool, err error) {
 	now := s.clock()
 	unlock := s.lockKeys(src, dst)
-	defer unlock()
+	defer s.trackedKeys(unlock, src, dst)()
 
 	ssh, dsh := s.getShard(src), s.getShard(dst)
 	se := ssh.liveEntry(src, now)
