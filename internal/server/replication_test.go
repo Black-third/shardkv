@@ -34,15 +34,38 @@ func req(t *testing.T, conn net.Conn, br *bufio.Reader, cmd string) string {
 	return readReply(t, br)
 }
 
+// waitFor polls cond until it holds, and fails the test if it never does.
+//
+// The deadline is deliberately far larger than anything being waited on here needs. It is a
+// *failure* deadline, not a performance assertion: a replica attaching, an AOF rewrite
+// finishing or a subscriber receiving takes single-digit milliseconds when it works, so
+// nothing is measured by making the bound generous -- the call returns on the first poll that
+// succeeds. What a tight bound does buy is a test that fails because the machine was busy.
+//
+// It was 3 seconds (300 polls of 10ms), and that is exactly how
+// TestReplicaConvergesOnNonDeterministicWrites failed in CI: "timed out waiting for: the
+// replica to attach" after 3.07s, on a two-core runner, under the race detector, behind a
+// test that had just deliberately overrun a subscriber's buffer. Nothing was wrong with the
+// replication -- the assertion was about the runner. This tree has been here before with two
+// timing tests (commit 64653df, "stop two tests measuring the machine"), and the glob
+// matcher's bounds are asserted in charged work rather than milliseconds for the same reason.
+//
+// 30 seconds, still well inside the package's own runtime, and shared by all 74 call sites so
+// the whole class is fixed at once. A test that genuinely hangs still fails, with its message.
+const waitForTimeout = 30 * time.Second
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	for i := 0; i < 300; i++ {
+	deadline := time.Now().Add(waitForTimeout)
+	for {
 		if cond() {
 			return
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for: %s", waitForTimeout, what)
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for: %s", what)
 }
 
 func TestReplicaHandlesUnreachableMaster(t *testing.T) {

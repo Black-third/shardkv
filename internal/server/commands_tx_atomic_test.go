@@ -77,7 +77,11 @@ func TestTransactionReadOnExpiredKeyNoDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second)) // fail fast if EXEC deadlocks
+	// A deadlock guard, so the test reports a hung EXEC by name rather than by taking the
+	// package's timeout down with it. waitForTimeout rather than a few seconds for the reason
+	// documented there: what is being caught is "never", and a bound tight enough to also
+	// catch "slow runner" catches the runner instead.
+	conn.SetDeadline(time.Now().Add(waitForTimeout))
 	br := bufio.NewReader(conn)
 	send := func(s string) string {
 		conn.Write([]byte(s + "\r\n"))
