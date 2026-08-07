@@ -120,6 +120,44 @@ mkdir -p "$out" "$results"
 for suite in "${suites[@]}"; do
 	rm -f "$results/$suite".*.tsv
 done
+# Pull the base images explicitly, with retries, before anything depends on them.
+#
+# They used to be pulled implicitly by the first `docker run` that needed one, and under
+# `set -e` a transient registry failure therefore killed the whole run at that line --
+# before any suite had written a .tsv, so $results stayed empty and CI's artifact upload
+# reported "No files were found with the provided path". That is the exact shape of the
+# intermittent failure this job had: 4 runs in 10, uncorrelated with any code change, and
+# never reproducible on a developer machine -- because a developer machine already holds
+# both images and so never pulls at all. Docker Hub rate-limits anonymous pulls per
+# address and CI runners share addresses heavily, which is the likeliest reason a pull
+# fails there and not here.
+#
+# Retried rather than only reported, because a rate limit is transient by definition, and
+# named in the failure, because "exit code 1" three jobs deep is what made this take four
+# attempts to find.
+pull_image() {
+	local image=$1 attempt
+	if docker image inspect "$image" >/dev/null 2>&1; then
+		return 0
+	fi
+	for attempt in 1 2 3; do
+		if docker pull -q "$image" >/dev/null 2>&1; then
+			return 0
+		fi
+		warn "pulling $image failed (attempt $attempt of 3); retrying in $((attempt * 5))s"
+		sleep $((attempt * 5))
+	done
+	warn "could not pull $image after 3 attempts."
+	warn "In CI the likeliest cause is a Docker Hub rate limit on the runner's shared"
+	warn "address rather than anything in this repository. Authenticate the pull, or point"
+	warn "REDIS_IMAGE / SHARDKV_IMAGE at a mirror."
+	return 1
+}
+
+log "checking the base images are present"
+pull_image "$SHARDKV_IMAGE"
+pull_image "$REDIS_IMAGE"
+
 if [ "${NOBUILD:-0}" = "1" ] && [ -x "$out/shardkv" ]; then
 	warn "NOBUILD=1: reusing the binary already in $out"
 else

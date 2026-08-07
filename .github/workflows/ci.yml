@@ -142,11 +142,14 @@ jobs:
       # and ran it. CI would then be testing code that is not in the tree, disagree with a
       # local run, and report neither fact. Hashing the sources makes an edited check a cache
       # miss, which is what it has to be.
+      #
+      # run.sh is in the key too, because it names the base image tags that are cached
+      # alongside the client images below -- changing REDIS_IMAGE has to miss.
       - name: Cache the client images
         uses: actions/cache@v5
         with:
           path: /tmp/compat-images
-          key: compat-images-${{ hashFiles('test/compat/*/*') }}
+          key: compat-images-${{ hashFiles('test/compat/*/*', 'test/compat/run.sh') }}
 
       # A load that fails is reported, not swallowed. `|| true` is still there -- a missing
       # or corrupt tar must fall back to building the image, not fail the job -- but it used
@@ -211,6 +214,15 @@ jobs:
           for suite in python ioredis noderedis goredis; do
             docker image inspect "skcompat-$suite" >/dev/null 2>&1 \
               && docker save -o "/tmp/compat-images/$suite.tar" "skcompat-$suite"
+          done
+          # The base images too, so a cache hit needs no registry at all. This job failed
+          # in 4 of 10 runs by dying on the implicit pull of one of these before any check
+          # had run; run.sh now retries a pull, and caching them means the retry is rarely
+          # reached. Named by tag with the separator replaced, since a tar name cannot
+          # carry a colon or a slash.
+          for image in redis:7-alpine alpine:3.21; do
+            docker image inspect "$image" >/dev/null 2>&1 \
+              && docker save -o "/tmp/compat-images/base-$(echo "$image" | tr ':/' '--').tar" "$image"
           done
 
       # The matrix and every suite's raw log, so a failure can be diagnosed from
