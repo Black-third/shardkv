@@ -2509,6 +2509,17 @@ invocation — the suite aborts a whole file on the first unsupported command, s
 runs turn "one missing command" into one lost file instead of one lost run — and the same
 files run against a real Redis so the assertion counts have a baseline to sit beside.
 
+It runs on a **nightly schedule** (and on demand) rather than on every push, in its own
+workflow. Measured, it takes 194 minutes, and the seven jobs that actually gate a merge finish
+in under two — so keeping it in the push path meant a CI run reported `in_progress` for over
+three hours after the gate was already green, and the branch badge went on showing whatever
+completed before it. That is a cost paid in signal, not in runner minutes: it is why the badge
+here once read `failing` from a run cancelled the day before while every gating job was
+passing. Bounding it with a timeout was the obvious alternative and is worse — the bound fires
+every time, so the assertion count gets truncated somewhere that moves with runner speed, and
+a count that cannot be compared with last night's is the one thing this suite exists to
+produce.
+
 Four bugs came out of that suite that none of this project's own tests had found, and the
 first was the serious one:
 

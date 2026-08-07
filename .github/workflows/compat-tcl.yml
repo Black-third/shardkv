@@ -1,0 +1,58 @@
+name: redis tcl suite
+
+# Nightly and on demand, not on every push.
+#
+# This is Redis's own test suite in external mode, and it is the highest-authority signal
+# available to a Redis-compatible server: assertions written by the people who define the
+# behaviour, with no idea they are not talking to Redis. It is also, measured, a **194-minute**
+# job -- and it used to sit in the CI workflow alongside seven other jobs that finish in under two
+# minutes.
+#
+# That combination cost the signal rather than the runner minutes. A CI run stayed
+# `in_progress` for over three hours after everything that gates a merge had already passed,
+# so "has CI passed on main" could not be answered by looking at it, and the branch badge went
+# on reporting whichever run completed before it. Both of those happened here: the badge read
+# `failing` from a run cancelled the previous day while the actual run was green in all seven
+# gating jobs.
+#
+# The alternative considered and rejected was a timeout on the step. At any bound short of the
+# full run the timeout fires every time, so the assertion count is truncated at a point that
+# moves with runner speed -- and the count is the entire output of this suite (see below), so
+# a number that cannot be compared with last night's number is not worth collecting. Keeping
+# the run whole and moving it off the push path preserves it.
+on:
+  schedule:
+    # 04:00 UTC daily. Nothing here depends on the hour; it is simply away from the times a
+    # push is likely, so the two do not contend for a runner.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  # continue-on-error: this suite reaches well past what shardkv claims to implement (there is
+  # no Lua, no RDB, no cluster bus), so a red mark here would mean "not identical to Redis",
+  # which is already known and documented. The number of assertions passing is the thing to
+  # watch, and it is in the artifact -- which is why the upload is `if: always()` and why the
+  # job must not be cancelled out from under it.
+  compat-tcl:
+    runs-on: ubuntu-latest
+    name: redis tcl suite (external mode)
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Redis's unit tests against shardkv and against Redis
+        run: ./test/compat/run.sh tcl
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-tcl-results
+          path: test/compat/.results/
+          retention-days: 14

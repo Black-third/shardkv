@@ -117,40 +117,6 @@ jobs:
           path: test/compat/.results/
           retention-days: 14
 
-  # Redis's own test suite, in external mode. It is the highest-authority signal
-  # available to a Redis-compatible server -- assertions written by the people who
-  # define the behaviour, with no idea they are not talking to Redis -- and it is a
-  # separate job because it is the slowest thing here and because its result is
-  # reported as a count of assertions rather than as a pass or a fail.
-  #
-  # continue-on-error: this suite reaches well past what shardkv claims to
-  # implement (there is no Lua, no RDB, no cluster bus), so a red mark here would
-  # mean "not identical to Redis", which is already known and documented. The
-  # number of assertions passing is the thing to watch, and it is in the artifact.
-  compat-tcl:
-    runs-on: ubuntu-latest
-    name: redis tcl suite (external mode)
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          cache: true
-
-      - name: Run Redis's unit tests against shardkv and against Redis
-        run: ./test/compat/run.sh tcl
-
-      - name: Upload the results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compat-tcl-results
-          path: test/compat/.results/
-          retention-days: 14
-
   # golangci-lint is part of the gate the project holds itself to (make lint), so CI
   # has to run it: a linter that only runs when someone remembers is a linter whose
   # findings accumulate. It is a job of its own rather than a step in the matrix
